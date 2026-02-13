@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+
+# Environment variables
+.env
+**/.env.live
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+
+# 클론해 둔 open-trading-api의 Git 메타데이터 (파일만 커밋)
+open-trading-api/.git
+open-trading-api/.git.bak

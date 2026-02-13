@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 서비스 식별자 -->
+    <key>Label</key>
+    <string>com.kis.trading-bot</string>
+
+    <!-- 실행할 명령 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/heesoo/msg/venv/bin/python</string>
+        <string>/Users/heesoo/msg/run_bot.py</string>
+    </array>
+
+    <!-- 작업 디렉토리 -->
+    <key>WorkingDirectory</key>
+    <string>/Users/heesoo/msg</string>
+
+    <!-- 로그인 시 자동 시작 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 크래시 시 자동 재시작 -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- 재시작 간격 (초) — 크래시 후 30초 뒤 재시작 -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- 로그 파일 -->
+    <key>StandardOutPath</key>
+    <string>/Users/heesoo/msg/logs/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/heesoo/msg/logs/launchd_stderr.log</string>
+
+    <!-- 환경 변수 (PATH에 homebrew 포함) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

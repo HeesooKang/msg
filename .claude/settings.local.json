@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/opt/homebrew/bin/python3.12:*)",
+      "Bash(python3 -m venv:*)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(unzip:*)",
+      "Bash(/Users/heesoo/msg/venv/bin/pip list:*)",
+      "Bash(/Users/heesoo/msg/venv/bin/pip install:*)",
+      "Bash(/Users/heesoo/msg/venv/bin/python:*)",
+      "Bash(python3.13:*)",
+      "Bash(venv/bin/python tests/test_api_connection.py)",
+      "mcp__kis-trade-mcp__domestic_stock",
+      "Bash(chmod:*)",
+      "Bash(./bot_ctl.sh restart:*)",
+      "Bash(./bot_ctl.sh status:*)",
+      "Bash(/Users/heesoo/msg/venv/bin/python3:*)",
+      "Bash(find:*)",
+      "Bash(./venv/bin/python:*)",
+      "Bash(python3:*)",
+      "Bash(venv/bin/python3:*)",
+      "mcp__kis-trade-mcp__auth",
+      "Bash(ls -la ~/KIS/config/kis_devlp*)"
+    ]
+  }
+}
