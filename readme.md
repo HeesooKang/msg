@@ -20,8 +20,9 @@
 
 ```
 .
-├── run_bot.py          # 자동매매 봇 실행 (실전/모의)
+├── run_bot.py          # 자동매매 봇 진입점 (스케줄러가 실행)
 ├── run_backtest.py     # 백테스트 실행
+├── bot_ctl.sh          # 봇 스케줄러 관리 (launchd 설치/시작/중지 등)
 ├── src/
 │   ├── config.py       # 설정 로드
 │   ├── auth.py         # KIS 토큰 관리
@@ -64,13 +65,21 @@ pip install -r requirements.txt
 - `.env` 또는 설정 파일에 KIS API 앱 키, 시크릿, 계좌번호 등을 설정합니다.
 - `src/config.py`에서 로드하는 방식을 확인하세요.
 
-### 자동매매 봇 실행
+### 자동매매 봇 실행 (스케줄러)
+
+이 봇은 **스케줄러(launchd)**에 의해 실행됩니다. 봇의 설치·시작·중지 등은 **`bot_ctl.sh`**로 관리합니다.
 
 ```bash
-python run_bot.py
+./bot_ctl.sh install   # launchd에 등록 (최초 1회, 로그인 시 자동 시작)
+./bot_ctl.sh start     # 봇 시작
+./bot_ctl.sh stop      # 봇 중지
+./bot_ctl.sh restart   # 봇 재시작
+./bot_ctl.sh status    # 상태 확인
+./bot_ctl.sh logs      # 로그 실시간 확인
+./bot_ctl.sh uninstall # launchd에서 제거
 ```
 
-- 10초 간격 스케줄로 전략이 동작합니다.
+- 스케줄러가 `run_bot.py`를 실행하며, 봇 내부에서는 10초 간격으로 전략이 동작합니다.
 - macOS에서는 `caffeinate`으로 절전 방지를 시도합니다.
 
 ### 백테스트 실행
