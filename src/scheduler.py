@@ -56,7 +56,10 @@ class TradingScheduler:
                 now = datetime.now()
 
                 if self._is_trading_time(now):
-                    self._run_trading_session(tick_interval)
+                    halted_for_day = self._run_trading_session(tick_interval)
+                    if halted_for_day and not self._shutdown:
+                        logger.info("당일 하드스탑 감지: 다음 장 준비 시각까지 대기합니다.")
+                        self._sleep_until_preopen()
                 else:
                     wait = self._seconds_until_preopen(now)
                     if wait > 0:
@@ -111,6 +114,15 @@ class TradingScheduler:
         while time.time() < end and not self._shutdown:
             time.sleep(1)
 
+    def _sleep_until_preopen(self):
+        """다음 장 준비 시각까지 대기한다."""
+        while not self._shutdown:
+            now = datetime.now()
+            wait = self._seconds_until_preopen(now)
+            if wait <= 0:
+                return
+            self._interruptible_sleep(min(wait, 300))
+
     def _run_trading_session(self, tick_interval: int) -> bool:
         """장 시간 동안 전략을 실행한다.
 
@@ -123,7 +135,7 @@ class TradingScheduler:
         if not self.market_data.is_market_open():
             logger.info("오늘은 휴장일입니다.")
             self._interruptible_sleep(3600)  # 1시간 뒤 재확인
-            return
+            return False
 
         # 전략이 스케줄러와 같은 client를 쓰도록 주입 (rate limit 공유)
         if hasattr(self.strategy, 'market_data'):
@@ -143,10 +155,13 @@ class TradingScheduler:
                 len(balance.positions),
             )
 
+        halted_for_day = False
+
         # 틱 루프
         while not self._shutdown and self._is_trading_time(datetime.now()):
             if not self.strategy.should_continue():
                 logger.info("전략이 종료를 요청했습니다.")
+                halted_for_day = True
                 break
 
             # 동적 watchlist 갱신
@@ -186,3 +201,4 @@ class TradingScheduler:
                 f"{balance.total_eval_amount:,}",
                 f"{balance.total_profit_loss:,}",
             )
+        return halted_for_day

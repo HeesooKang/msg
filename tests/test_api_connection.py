@@ -1,9 +1,9 @@
 """KIS API 연결 테스트.
 
 사용법:
-    python -m pytest tests/test_api_connection.py -v -s
+    ./dev test tests/test_api_connection.py -v -s
     또는
-    python tests/test_api_connection.py
+    ./dev py tests/test_api_connection.py
 """
 
 import sys

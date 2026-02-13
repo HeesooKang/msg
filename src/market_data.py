@@ -15,6 +15,8 @@ class MarketDataAPI:
 
     def __init__(self, client: KISClient):
         self.client = client
+        self._market_open_cache: dict[str, bool] = {}
+        self._holiday_warned_dates: set[str] = set()
 
     def get_current_price(self, symbol: str) -> Optional[Quote]:
         """주식 현재가를 조회한다.
@@ -272,6 +274,8 @@ class MarketDataAPI:
         """오늘(또는 지정일)이 거래일인지 확인한다."""
         if date is None:
             date = datetime.today().strftime("%Y%m%d")
+        if date in self._market_open_cache:
+            return self._market_open_cache[date]
 
         res = self.client.get(
             api_url="/uapi/domestic-stock/v1/quotations/chk-holiday",
@@ -283,12 +287,33 @@ class MarketDataAPI:
             },
         )
         if not res.success:
-            logger.warning("휴장일 조회 실패, 거래일로 간주: %s", res.error_message)
-            return True
+            is_open = self._weekday_fallback_open(date)
+            if res.error_code == "OPSQ0002":
+                if date not in self._holiday_warned_dates:
+                    logger.warning(
+                        "휴장일 조회 미지원(OPSQ0002): 주중 fallback 사용 (date=%s)",
+                        date,
+                    )
+                    self._holiday_warned_dates.add(date)
+            else:
+                logger.warning("휴장일 조회 실패, 주중 fallback 사용: %s", res.error_message)
+            self._market_open_cache[date] = is_open
+            return is_open
 
         output = res.output
         if isinstance(output, list) and len(output) > 0:
             # opnd_yn == "Y"이면 거래일
             today_info = output[0]
-            return today_info.get("opnd_yn", "Y") == "Y"
-        return True
+            is_open = today_info.get("opnd_yn", "Y") == "Y"
+            self._market_open_cache[date] = is_open
+            return is_open
+
+        is_open = self._weekday_fallback_open(date)
+        self._market_open_cache[date] = is_open
+        return is_open
+
+    def _weekday_fallback_open(self, date: str) -> bool:
+        try:
+            return datetime.strptime(date, "%Y%m%d").weekday() < 5
+        except ValueError:
+            return datetime.today().weekday() < 5

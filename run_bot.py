@@ -2,7 +2,7 @@
 """KIS 자동매매 봇 실행 스크립트.
 
 사용법:
-    직접 실행:   python run_bot.py
+    직접 실행:   ./dev py run_bot.py
     launchd:     자동 실행됨
 """
 

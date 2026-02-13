@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PY="$ROOT/venv/bin/python"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./dev py <python args...>      # run venv python
+  ./dev test [pytest args...]    # run pytest via venv python
+  ./dev unit [unittest args...]  # run unittest via venv python
+  ./dev shell                    # open shell with venv activated
+EOF
+}
+
+ensure_venv() {
+  if [[ ! -x "$VENV_PY" ]]; then
+    cat <<EOF >&2
+[ERROR] venv python not found: $VENV_PY
+Create it with:
+  python3 -m venv venv
+  ./venv/bin/pip install -r requirements.txt
+EOF
+    exit 1
+  fi
+}
+
+cmd="${1:-}"
+if [[ -z "$cmd" ]]; then
+  usage
+  exit 1
+fi
+shift || true
+
+case "$cmd" in
+  py)
+    ensure_venv
+    exec "$VENV_PY" "$@"
+    ;;
+  test)
+    ensure_venv
+    exec "$VENV_PY" -m pytest "$@"
+    ;;
+  unit)
+    ensure_venv
+    exec "$VENV_PY" -m unittest "$@"
+    ;;
+  shell)
+    ensure_venv
+    # shellcheck source=/dev/null
+    source "$ROOT/venv/bin/activate"
+    exec "${SHELL:-/bin/bash}" -l
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

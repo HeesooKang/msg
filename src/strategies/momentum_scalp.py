@@ -3,14 +3,14 @@
 매수: 모멘텀 점수(시가대비 상승, 등락률, 고가근접도, 거래량폭발) 기반
       + 시장 레짐 필터(KOSPI MA20)
 매도: 익절(+1.5%) / 개별 손절(금액 기준 -5천원) / 추적손절(고점 -0.7%) / 장마감 청산
-관리: 일일 목표 도달(총손익 ≥ +1만원) → 전량 청산 후 거래 중지
-      일일 최대손실(총손익 ≤ -5천원) → 전량 청산 후 거래 중지
+관리: 일일 목표 도달(순실현손익 ≥ +1만원) → 전량 청산 후 거래 중지
+      일일 최대손실(순실현손익 ≤ -5천원) → 전량 청산 후 거래 중지
 인버스: 약세 점수 ≥ 2일 때 인버스 ETF 매수 (공매도 효과)
 """
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -71,10 +71,16 @@ class MomentumScalpConfig:
     seed_money: int = 1_000_000
     max_position_count: int = 5
     per_stock_amount: int = 200_000      # 종목당 기본 할당액
+    max_per_stock_amount: int = 400_000  # 종목당 최대 노출 (피라미딩 상한)
+    enable_pyramiding: bool = True
+    scale_in_min_profit_pct: float = 0.3
+    scale_in_score_bonus: float = 0.8
 
-    # 일일 서킷 브레이커 (실현손익 기준)
+    # 일일 서킷 브레이커 (순실현손익 기준)
     daily_profit_target: int = 10_000    # 일일 목표 +1만원
     daily_loss_limit: int = -5_000       # 일일 최대손실 -5천원
+    enable_unrealized_loss_guard: bool = True  # 미실현 포함 보조 손실컷 활성화
+    daily_total_loss_limit: Optional[int] = None  # None이면 daily_loss_limit 사용
 
     # 개별 포지션 손절 (금액 기준)
     per_position_stop_loss: int = -5_000  # 포지션당 -5천원 즉시 청산
@@ -124,10 +130,13 @@ class PositionState:
     symbol: str
     buy_price: int
     quantity: int
+    invested_amount: int = 0
     buy_time: datetime = field(default_factory=datetime.now)
     high_since_buy: int = 0
 
     def __post_init__(self):
+        if self.invested_amount <= 0:
+            self.invested_amount = self.buy_price * self.quantity
         if self.high_since_buy == 0:
             self.high_since_buy = self.buy_price
 
@@ -135,12 +144,20 @@ class PositionState:
 @dataclass
 class DailyPnL:
     """일일 손익 추적."""
-    realized_pnl: int = 0
+    realized_gross_pnl: int = 0
+    realized_net_pnl: int = 0
+    fees_paid: int = 0
+    taxes_paid: int = 0
     trade_count: int = 0
 
     @property
+    def realized_pnl(self) -> int:
+        """하위 호환용 alias: 순실현손익."""
+        return self.realized_net_pnl
+
+    @property
     def total_pnl(self) -> int:
-        return self.realized_pnl
+        return self.realized_net_pnl
 
 
 class MomentumScalpStrategy(BaseStrategy):
@@ -167,13 +184,22 @@ class MomentumScalpStrategy(BaseStrategy):
         self._bear_score: int = 0
         self._bear_market = False
         self._inverse_symbols: set = set(self.cfg.inverse_etfs)
+        self._halt_date: Optional[date] = None
+        self._current_day: Optional[date] = None
 
     def initialize(self):
-        self.daily_pnl = DailyPnL()
-        self._halted = False
-        self._sell_cooldown = {}
+        today = datetime.now().date()
+        if self._current_day != today:
+            self.daily_pnl = DailyPnL()
+            self._halted = False
+            self._halt_date = None
+            self._sell_cooldown = {}
+            self._current_day = today
         self._build_pool()
         self._check_market_regime()
+
+        if self._halted and self._halt_date == today:
+            logger.info("당일 하드스탑 상태 유지: 신규 거래 중지")
 
         logger.info("전략 초기화: 모멘텀 스캘핑")
         logger.info("  시드: %s원, 종목당: %s원",
@@ -182,9 +208,16 @@ class MomentumScalpStrategy(BaseStrategy):
                      self.cfg.take_profit_pct,
                      f"{self.cfg.per_position_stop_loss:,}",
                      self.cfg.trailing_stop_pct)
-        logger.info("  일일 목표: +%s원, 최대손실: %s원",
+        logger.info("  일일 목표(순실현): +%s원, 최대손실(순실현): %s원",
                      f"{self.cfg.daily_profit_target:,}",
                      f"{self.cfg.daily_loss_limit:,}")
+        if self.cfg.enable_unrealized_loss_guard:
+            total_loss_limit = (
+                self.cfg.daily_total_loss_limit
+                if self.cfg.daily_total_loss_limit is not None
+                else self.cfg.daily_loss_limit
+            )
+            logger.info("  보조손실컷(순손익추정): %s원", f"{total_loss_limit:,}")
         logger.info("  시장 레짐: 약세점수=%d (모드: %s)",
                      self._bear_score, self.cfg.bear_market_mode)
         if self.cfg.inverse_enabled:
@@ -210,11 +243,17 @@ class MomentumScalpStrategy(BaseStrategy):
             order = self._evaluate_sell(quote)
             if order:
                 orders.append(order)
+            else:
+                scale_in = self._evaluate_buy(quote)
+                if scale_in:
+                    orders.append(scale_in)
 
-        elif len(self.positions) < self.cfg.max_position_count:
-            order = self._evaluate_buy(quote)
-            if order:
-                orders.append(order)
+        else:
+            long_count = sum(1 for s in self.positions if s not in self._inverse_symbols)
+            if long_count < self.cfg.max_position_count:
+                order = self._evaluate_buy(quote)
+                if order:
+                    orders.append(order)
 
         return orders
 
@@ -228,42 +267,64 @@ class MomentumScalpStrategy(BaseStrategy):
             return []
 
         # 미실현 손익 업데이트 + 고가 추적
-        unrealized = 0
         for sym, pos in self.positions.items():
             q = self._quotes_cache.get(sym)
             if q:
                 if q.current_price > pos.high_since_buy:
                     pos.high_since_buy = q.current_price
-                unrealized += (q.current_price - pos.buy_price) * pos.quantity
 
         # 장마감 청산 (15:15 이후) — 반드시 halt 설정 (실거래 모드만)
         if self.market_data is not None:
             now = datetime.now()
             if now.hour >= 15 and now.minute >= 15:
                 self._halted = True
+                self._halt_date = now.date()
                 if self.positions:
                     logger.info("장마감 임박 → 전량 청산")
                     return self._liquidate_all()
                 return []
 
-        # 서킷 브레이커: 실현손익 기준으로 판단
-        realized = self.daily_pnl.realized_pnl
+        # 서킷 브레이커: 순실현손익 기준으로 판단
+        realized_net = self.daily_pnl.realized_net_pnl
 
-        if realized <= self.cfg.daily_loss_limit:
+        if realized_net <= self.cfg.daily_loss_limit:
             logger.warning(
-                "일일 손실한도 도달! (실현: %s원) → 전량 청산 후 거래 중지",
-                f"{realized:,}",
+                "일일 손실한도 도달! (순실현: %s원) → 전량 청산 후 거래 중지",
+                f"{realized_net:,}",
             )
             self._halted = True
+            self._halt_date = datetime.now().date()
             return self._liquidate_all()
 
-        if realized >= self.cfg.daily_profit_target:
+        if realized_net >= self.cfg.daily_profit_target:
             logger.info(
-                "일일 목표 달성! (실현: %s원) → 전량 청산 후 거래 중지",
-                f"{realized:,}",
+                "일일 목표 달성! (순실현: %s원) → 전량 청산 후 거래 중지",
+                f"{realized_net:,}",
             )
             self._halted = True
+            self._halt_date = datetime.now().date()
             return self._liquidate_all()
+
+        # 보조 손실컷: 순손익 추정(순실현 + 미실현 추정) 기준
+        if self.cfg.enable_unrealized_loss_guard:
+            total_loss_limit = (
+                self.cfg.daily_total_loss_limit
+                if self.cfg.daily_total_loss_limit is not None
+                else self.cfg.daily_loss_limit
+            )
+            unrealized_net = self._estimate_unrealized_net_pnl()
+            total_net = realized_net + unrealized_net
+            if total_net <= total_loss_limit:
+                logger.warning(
+                    "보조 손실컷 도달! (순실현: %s원, 미실현추정: %s원, 합계: %s원) "
+                    "→ 전량 청산 후 거래 중지",
+                    f"{realized_net:,}",
+                    f"{unrealized_net:,}",
+                    f"{total_net:,}",
+                )
+                self._halted = True
+                self._halt_date = datetime.now().date()
+                return self._liquidate_all()
 
         # 백테스트 모드: 배치 시세에서 약세 점수 추정
         if self.market_data is None:
@@ -291,14 +352,18 @@ class MomentumScalpStrategy(BaseStrategy):
             )
             pending_long = sum(
                 1 for o in orders
-                if o.side == OrderSide.BUY and o.symbol not in self._inverse_symbols
+                if (
+                    o.side == OrderSide.BUY and
+                    o.symbol not in self._inverse_symbols and
+                    o.symbol not in self.positions
+                )
             )
-            if long_count + pending_long >= self.cfg.max_position_count:
-                break
-            if q.symbol not in self.positions:
-                order = self._evaluate_buy(q)
-                if order:
-                    orders.append(order)
+            if q.symbol not in self.positions and long_count + pending_long >= self.cfg.max_position_count:
+                continue
+
+            order = self._evaluate_buy(q, pending_orders=orders)
+            if order:
+                orders.append(order)
 
         # 3) 인버스 매수 (인버스 포지션 카운트 기준)
         if self.cfg.inverse_enabled and self._bear_score >= self.cfg.bearish_threshold:
@@ -315,7 +380,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 if inv_count + pending_inv >= self.cfg.inverse_max_positions:
                     break
                 if q.symbol not in self.positions:
-                    order = self._evaluate_inverse_buy(q)
+                    order = self._evaluate_inverse_buy(q, pending_orders=orders)
                     if order:
                         orders.append(order)
 
@@ -330,11 +395,42 @@ class MomentumScalpStrategy(BaseStrategy):
             if fill_price <= 0:
                 cached = self._quotes_cache.get(result.symbol)
                 fill_price = cached.current_price if cached else 0
+            if fill_price <= 0:
+                return
+
+            buy_notional = fill_price * result.quantity
+            buy_fee = self._calc_commission_cost(buy_notional)
+            if buy_fee > 0:
+                self.daily_pnl.fees_paid += buy_fee
+                # 매수 수수료는 체결 시점에 확정 비용으로 반영
+                self.daily_pnl.realized_net_pnl -= buy_fee
+
+            existing = self.positions.get(result.symbol)
+            if existing:
+                total_qty = existing.quantity + result.quantity
+                total_invested = existing.invested_amount + (fill_price * result.quantity)
+                existing.quantity = total_qty
+                existing.invested_amount = total_invested
+                existing.buy_price = int(round(total_invested / total_qty))
+                if fill_price > existing.high_since_buy:
+                    existing.high_since_buy = fill_price
+                tag = "[INV] " if result.symbol in self._inverse_symbols else ""
+                logger.info(
+                    "%s추가매수 체결: %s +%d주 @ %s원 (평단 %s원, 총 %d주)",
+                    tag,
+                    result.symbol,
+                    result.quantity,
+                    f"{fill_price:,}",
+                    f"{existing.buy_price:,}",
+                    existing.quantity,
+                )
+                return
 
             self.positions[result.symbol] = PositionState(
                 symbol=result.symbol,
                 buy_price=fill_price,
                 quantity=result.quantity,
+                invested_amount=fill_price * result.quantity,
             )
             tag = "[INV] " if result.symbol in self._inverse_symbols else ""
             logger.info("%s매수 체결: %s %d주 @ %s원",
@@ -342,7 +438,8 @@ class MomentumScalpStrategy(BaseStrategy):
 
         elif result.side == OrderSide.SELL:
             if not result.success:
-                self.positions.pop(result.symbol, None)
+                # 매도 실패 시 실제 보유는 유지되므로 포지션을 제거하면 안 된다.
+                logger.warning("매도 실패(포지션 유지): %s", result.symbol)
                 return
 
             pos = self.positions.pop(result.symbol, None)
@@ -352,17 +449,26 @@ class MomentumScalpStrategy(BaseStrategy):
                     cached = self._quotes_cache.get(result.symbol)
                     sell_price = cached.current_price if cached else pos.buy_price
 
-                pnl = (sell_price - pos.buy_price) * result.quantity
-                self.daily_pnl.realized_pnl += pnl
+                gross_pnl = (sell_price - pos.buy_price) * pos.quantity
+                sell_notional = sell_price * pos.quantity
+                sell_fee = self._calc_commission_cost(sell_notional)
+                sell_tax_slippage = self._calc_sell_tax_slippage_cost(sell_notional)
+                net_pnl = gross_pnl - sell_fee - sell_tax_slippage
+
+                self.daily_pnl.realized_gross_pnl += gross_pnl
+                self.daily_pnl.realized_net_pnl += net_pnl
+                self.daily_pnl.fees_paid += sell_fee
+                self.daily_pnl.taxes_paid += sell_tax_slippage
                 self.daily_pnl.trade_count += 1
 
                 self._sell_cooldown[result.symbol] = datetime.now()
 
                 tag = "[INV] " if result.symbol in self._inverse_symbols else ""
                 logger.info(
-                    "%s매도 체결: %s %d주 @ %s원 (손익: %s원, 누적: %s원)",
+                    "%s매도 체결: %s %d주 @ %s원 "
+                    "(총손익: %s원, 순손익: %s원, 누적순손익: %s원)",
                     tag, result.symbol, result.quantity, f"{sell_price:,}",
-                    f"{pnl:,}", f"{self.daily_pnl.realized_pnl:,}",
+                    f"{gross_pnl:,}", f"{net_pnl:,}", f"{self.daily_pnl.realized_net_pnl:,}",
                 )
 
     def should_continue(self) -> bool:
@@ -492,7 +598,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._bear_score = score
         self._bear_market = score >= 1
 
-    def _evaluate_buy(self, quote: Quote) -> Optional[Order]:
+    def _evaluate_buy(self, quote: Quote, pending_orders: Optional[List[Order]] = None) -> Optional[Order]:
         """모멘텀 점수 기반 매수 판단 (일반 주식)."""
         # 인버스 ETF는 별도 로직
         if quote.symbol in self._inverse_symbols:
@@ -503,10 +609,6 @@ class MomentumScalpStrategy(BaseStrategy):
         if quote.current_price < self.cfg.min_price:
             return None
 
-        # 약세장 보수 모드(B): 신규 롱 진입 금지
-        if self._bear_market and self.cfg.bear_market_mode == 'B':
-            return None
-
         # 쿨다운 체크
         last_sold = self._sell_cooldown.get(quote.symbol)
         if last_sold:
@@ -514,21 +616,56 @@ class MomentumScalpStrategy(BaseStrategy):
             if elapsed < self.cfg.cooldown_seconds:
                 return None
 
-        score = self._calc_momentum_score(quote)
-        if score < self.cfg.min_momentum_score:
+        position = self.positions.get(quote.symbol)
+        is_scale_in = position is not None
+
+        # 약세장 보수 모드(B): 신규 롱 진입 금지
+        if not is_scale_in and self._bear_market and self.cfg.bear_market_mode == 'B':
             return None
 
-        if quote.current_price > self.cfg.per_stock_amount:
-            quantity = 1
+        score = self._calc_momentum_score(quote)
+        if is_scale_in:
+            if not self.cfg.enable_pyramiding:
+                return None
+            pnl_pct = (quote.current_price - position.buy_price) / position.buy_price * 100
+            if pnl_pct < self.cfg.scale_in_min_profit_pct:
+                return None
+            if score < (self.cfg.min_momentum_score + self.cfg.scale_in_score_bonus):
+                return None
         else:
-            quantity = self.cfg.per_stock_amount // quote.current_price
+            if score < self.cfg.min_momentum_score:
+                return None
+
+        alloc = self._compute_buy_allocation(
+            symbol=quote.symbol,
+            current_price=quote.current_price,
+            pending_orders=pending_orders,
+        )
+        quantity = alloc // quote.current_price
 
         if quantity <= 0:
             return None
 
-        logger.info("매수 신호: %s(%s) 점수=%.1f, %d주 @ %s원",
-                     quote.name, quote.symbol, score, quantity,
-                     f"{quote.current_price:,}")
+        if is_scale_in:
+            logger.info(
+                "추가매수 신호: %s(%s) 점수=%.1f, %d주 @ %s원 (할당 %s원)",
+                quote.name,
+                quote.symbol,
+                score,
+                quantity,
+                f"{quote.current_price:,}",
+                f"{alloc:,}",
+            )
+        else:
+            logger.info(
+                "매수 신호: %s(%s) 점수=%.1f, %d주 @ %s원 (할당 %s원)",
+                quote.name,
+                quote.symbol,
+                score,
+                quantity,
+                f"{quote.current_price:,}",
+                f"{alloc:,}",
+            )
 
         return Order(
             symbol=quote.symbol,
@@ -538,7 +675,7 @@ class MomentumScalpStrategy(BaseStrategy):
             price=0,
         )
 
-    def _evaluate_inverse_buy(self, quote: Quote) -> Optional[Order]:
+    def _evaluate_inverse_buy(self, quote: Quote, pending_orders: Optional[List[Order]] = None) -> Optional[Order]:
         """인버스 ETF 매수 판단.
 
         약세 점수 >= bearish_threshold일 때만 진입.
@@ -562,7 +699,12 @@ class MomentumScalpStrategy(BaseStrategy):
         if score < self.cfg.inverse_min_momentum:
             return None
 
-        quantity = self.cfg.per_stock_amount // quote.current_price
+        alloc = self._compute_buy_allocation(
+            symbol=quote.symbol,
+            current_price=quote.current_price,
+            pending_orders=pending_orders,
+        )
+        quantity = alloc // quote.current_price
         if quantity <= 0:
             return None
 
@@ -577,6 +719,44 @@ class MomentumScalpStrategy(BaseStrategy):
             quantity=quantity,
             price=0,
         )
+
+    def _compute_buy_allocation(
+        self,
+        symbol: str,
+        current_price: int,
+        pending_orders: Optional[List[Order]] = None,
+    ) -> int:
+        total_exposure = self._get_total_exposure()
+        stock_exposure = self._get_stock_exposure(symbol)
+
+        pending_total = 0
+        pending_stock = 0
+        for order in pending_orders or []:
+            if order.side != OrderSide.BUY:
+                continue
+            q = self._quotes_cache.get(order.symbol)
+            if q is None or q.current_price <= 0:
+                continue
+            amount = q.current_price * order.quantity
+            pending_total += amount
+            if order.symbol == symbol:
+                pending_stock += amount
+
+        total_room = self.cfg.seed_money - (total_exposure + pending_total)
+        stock_room = self.cfg.max_per_stock_amount - (stock_exposure + pending_stock)
+        alloc = min(self.cfg.per_stock_amount, total_room, stock_room)
+        if alloc <= 0 or current_price <= 0:
+            return 0
+        return alloc
+
+    def _get_total_exposure(self) -> int:
+        return sum(pos.buy_price * pos.quantity for pos in self.positions.values())
+
+    def _get_stock_exposure(self, symbol: str) -> int:
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return 0
+        return pos.buy_price * pos.quantity
 
     def _evaluate_sell(self, quote: Quote) -> Optional[Order]:
         """익절/손절/추적손절 판단 (일반 주식)."""
@@ -710,6 +890,31 @@ class MomentumScalpStrategy(BaseStrategy):
             quantity=pos.quantity,
             price=0,
         )
+
+    def _calc_commission_cost(self, notional: int) -> int:
+        if notional <= 0:
+            return 0
+        return int(round(notional * self.cfg.commission_rate))
+
+    def _calc_sell_tax_slippage_cost(self, sell_notional: int) -> int:
+        if sell_notional <= 0:
+            return 0
+        return int(round(sell_notional * self.cfg.tax_slippage_rate))
+
+    def _estimate_unrealized_net_pnl(self) -> int:
+        total = 0
+        for sym, pos in self.positions.items():
+            q = self._quotes_cache.get(sym)
+            if not q or q.current_price <= 0:
+                continue
+            gross = (q.current_price - pos.buy_price) * pos.quantity
+            sell_notional = q.current_price * pos.quantity
+            exit_cost = (
+                self._calc_commission_cost(sell_notional) +
+                self._calc_sell_tax_slippage_cost(sell_notional)
+            )
+            total += (gross - exit_cost)
+        return total
 
     def _liquidate_all(self) -> List[Order]:
         """전 포지션 청산 (일반 + 인버스 모두)."""

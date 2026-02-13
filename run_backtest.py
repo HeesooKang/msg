@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""백테스트 실행 스크립트."""
+"""백테스트 실행 스크립트.
+
+권장 실행:
+    ./dev py run_backtest.py
+"""
 
 import sys
 import os

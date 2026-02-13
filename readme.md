@@ -60,6 +60,17 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+### 개발 명령 (venv 자동 고정)
+
+`activate`를 매번 하지 않도록, 프로젝트에서는 `./dev`를 기본 실행 진입점으로 사용합니다.
+
+```bash
+./dev py run_backtest.py
+./dev test -q --maxfail=1 tests
+./dev unit tests/test_api_connection.py
+./dev shell
+```
+
 ### 설정
 
 - `.env` 또는 설정 파일에 KIS API 앱 키, 시크릿, 계좌번호 등을 설정합니다.
@@ -75,6 +86,7 @@ pip install -r requirements.txt
 ./bot_ctl.sh stop      # 봇 중지
 ./bot_ctl.sh restart   # 봇 재시작
 ./bot_ctl.sh status    # 상태 확인
+./bot_ctl.sh today     # 오늘 손익 + 실행 상태 간단 확인
 ./bot_ctl.sh logs      # 로그 실시간 확인
 ./bot_ctl.sh uninstall # launchd에서 제거
 ```
@@ -82,10 +94,19 @@ pip install -r requirements.txt
 - 스케줄러가 `run_bot.py`를 실행하며, 봇 내부에서는 10초 간격으로 전략이 동작합니다.
 - macOS에서는 `caffeinate`으로 절전 방지를 시도합니다.
 
+### 오늘 손익/실행 여부 빠르게 확인
+
+```bash
+./bot_ctl.sh today
+```
+
+- `실행 중/실행 안 됨` 상태와 함께, 오늘 기준 최신 `최종 잔고` 로그에서 손익을 보여줍니다.
+- 아직 집계 로그가 없으면 `오늘 손익 로그가 아직 없습니다.`로 표시됩니다.
+
 ### 백테스트 실행
 
 ```bash
-python run_backtest.py
+./dev py run_backtest.py
 ```
 
 - 시총 상위 30종목 + 인버스 ETF 기준, 최근 약 2개월 데이터로 백테스트를 수행합니다.

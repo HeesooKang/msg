@@ -70,7 +70,8 @@ class KISClient:
     def _build_headers(self, tr_id: str, tr_cont: str = "") -> dict:
         """API 호출에 필요한 공통 헤더를 구성한다."""
         # 모의투자: T/J/C로 시작하는 TR ID를 V로 변환
-        if self.config.is_paper and tr_id[0] in ("T", "J", "C"):
+        # 단, CTCA0903R(국내휴장일조회)는 변환 시 미지원 오류가 발생할 수 있어 예외 처리
+        if self.config.is_paper and tr_id and tr_id[0] in ("T", "J", "C") and tr_id != "CTCA0903R":
             tr_id = "V" + tr_id[1:]
 
         token = self.token_manager.get_token()
