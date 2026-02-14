@@ -1,5 +1,7 @@
 import logging
-from typing import List, Optional
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.api_client import KISClient
 from src.models import Order, OrderResult, OrderSide, OrderType
@@ -41,14 +43,16 @@ class TradingAPI:
 
         if res.success:
             output = res.output or {}
+            order_no = output.get("ODNO", "")
+            fill_qty, fill_price = self._resolve_fill(order, order_no)
             result = OrderResult(
                 success=True,
-                order_no=output.get("ODNO", ""),
+                order_no=order_no,
                 message=res.error_message,
                 symbol=order.symbol,
                 side=order.side,
-                quantity=order.quantity,
-                price=order.price,
+                quantity=fill_qty if fill_qty > 0 else order.quantity,
+                price=fill_price if fill_price > 0 else order.price,
             )
             logger.info(
                 "주문 성공: %s %s %s %d주 @ %s",
@@ -68,6 +72,85 @@ class TradingAPI:
             logger.error("주문 실패 [%s]: %s", order.symbol, result.message)
 
         return result
+
+    def _resolve_fill(self, order: Order, order_no: str) -> Tuple[int, int]:
+        """주문 직후 체결내역에서 실제 체결수량/평균체결가를 조회한다.
+
+        시장가 체결의 경우 실제 체결가를 전략 손익 계산에 반영하기 위함.
+        조회 실패/미체결이면 (0, 0)을 반환하고 상위에서 기존 값을 사용한다.
+        """
+        if not order_no:
+            return 0, 0
+
+        start_date = datetime.now().strftime("%Y%m%d")
+        side_code = "02" if order.side == OrderSide.BUY else "01"
+
+        # 시장가는 체결 확정에 약간의 지연이 있을 수 있어 짧게 재조회
+        for _ in range(5):
+            row = self._fetch_fill_row(
+                order_no=order_no,
+                symbol=order.symbol,
+                side_code=side_code,
+                start_date=start_date,
+            )
+            if row:
+                qty = self._to_int(row.get("tot_ccld_qty", 0))
+                avg_price = self._to_int(row.get("avg_prvs", 0))
+                if qty > 0 and avg_price <= 0:
+                    total_amt = self._to_int(row.get("tot_ccld_amt", 0))
+                    if total_amt > 0:
+                        avg_price = int(round(total_amt / qty))
+                if qty > 0 and avg_price > 0:
+                    return qty, avg_price
+            time.sleep(0.2)
+
+        return 0, 0
+
+    def _fetch_fill_row(
+        self,
+        order_no: str,
+        symbol: str,
+        side_code: str,
+        start_date: str,
+    ) -> Optional[Dict[str, Any]]:
+        params = {
+            "CANO": "",
+            "ACNT_PRDT_CD": "",
+            "INQR_STRT_DT": start_date,
+            "INQR_END_DT": start_date,
+            "SLL_BUY_DVSN_CD": side_code,
+            "PDNO": symbol,
+            "CCLD_DVSN": "00",
+            "INQR_DVSN": "00",
+            "INQR_DVSN_3": "00",
+            "ORD_GNO_BRNO": "",
+            "ODNO": order_no,
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+            "EXCG_ID_DVSN_CD": "KRX",
+        }
+
+        res = self.client.get(
+            api_url="/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            tr_id="TTTC0081R",
+            params=params,
+        )
+        if not res.success:
+            return None
+
+        rows = res.output1 or []
+        for row in rows:
+            if row.get("odno", "") == order_no and row.get("pdno", "") == symbol:
+                return row
+        return None
+
+    @staticmethod
+    def _to_int(value: Any) -> int:
+        try:
+            return int(float(str(value).replace(",", "").strip()))
+        except (TypeError, ValueError):
+            return 0
 
     def buy(
         self,

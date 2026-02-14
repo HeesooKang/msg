@@ -25,7 +25,9 @@ class TokenManager:
 
     @property
     def _token_file(self) -> str:
-        return os.path.join(TOKEN_DIR, f"KIS{datetime.today().strftime('%Y%m%d')}")
+        mode = "paper" if self.config.is_paper else "real"
+        date_str = datetime.today().strftime("%Y%m%d")
+        return os.path.join(TOKEN_DIR, f"KIS_{mode}_{date_str}")
 
     def get_token(self) -> str:
         """유효한 토큰을 반환한다. 만료됐으면 자동 갱신."""

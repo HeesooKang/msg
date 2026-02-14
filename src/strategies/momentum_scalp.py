@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.market_data import MarketDataAPI
 from src.models import Order, OrderResult, OrderSide, OrderType, Quote
+from src.notifications import AlertManager
 from src.strategy import BaseStrategy
 
 logger = logging.getLogger("kis_trader.strategy.momentum")
@@ -186,6 +187,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._inverse_symbols: set = set(self.cfg.inverse_etfs)
         self._halt_date: Optional[date] = None
         self._current_day: Optional[date] = None
+        self._alerts = AlertManager()
 
     def initialize(self):
         today = datetime.now().date()
@@ -281,6 +283,13 @@ class MomentumScalpStrategy(BaseStrategy):
                 self._halt_date = now.date()
                 if self.positions:
                     logger.info("장마감 임박 → 전량 청산")
+                    self._alerts.send(
+                        event_key="market_close_liquidation",
+                        title="장마감 전량 청산",
+                        message="15:15 이후 장마감 규칙에 따라 보유 포지션 전량 청산을 수행합니다.",
+                        level="warning",
+                        cooldown_seconds=1800,
+                    )
                     return self._liquidate_all()
                 return []
 
@@ -292,6 +301,13 @@ class MomentumScalpStrategy(BaseStrategy):
                 "일일 손실한도 도달! (순실현: %s원) → 전량 청산 후 거래 중지",
                 f"{realized_net:,}",
             )
+            self._alerts.send(
+                event_key="daily_loss_limit_hit",
+                title="일일 손실한도 도달",
+                message=f"순실현손익 {realized_net:,}원으로 손실한도에 도달했습니다. 전량 청산 후 거래를 중지합니다.",
+                level="error",
+                cooldown_seconds=1800,
+            )
             self._halted = True
             self._halt_date = datetime.now().date()
             return self._liquidate_all()
@@ -300,6 +316,13 @@ class MomentumScalpStrategy(BaseStrategy):
             logger.info(
                 "일일 목표 달성! (순실현: %s원) → 전량 청산 후 거래 중지",
                 f"{realized_net:,}",
+            )
+            self._alerts.send(
+                event_key="daily_profit_target_hit",
+                title="일일 목표 달성",
+                message=f"순실현손익 {realized_net:,}원으로 목표를 달성했습니다. 전량 청산 후 거래를 중지합니다.",
+                level="info",
+                cooldown_seconds=1800,
             )
             self._halted = True
             self._halt_date = datetime.now().date()
@@ -321,6 +344,16 @@ class MomentumScalpStrategy(BaseStrategy):
                     f"{realized_net:,}",
                     f"{unrealized_net:,}",
                     f"{total_net:,}",
+                )
+                self._alerts.send(
+                    event_key="daily_total_loss_limit_hit",
+                    title="보조 손실컷 도달",
+                    message=(
+                        f"순실현 {realized_net:,}원, 미실현추정 {unrealized_net:,}원, "
+                        f"합계 {total_net:,}원으로 보조 손실컷에 도달했습니다."
+                    ),
+                    level="error",
+                    cooldown_seconds=1800,
                 )
                 self._halted = True
                 self._halt_date = datetime.now().date()
@@ -440,6 +473,13 @@ class MomentumScalpStrategy(BaseStrategy):
             if not result.success:
                 # 매도 실패 시 실제 보유는 유지되므로 포지션을 제거하면 안 된다.
                 logger.warning("매도 실패(포지션 유지): %s", result.symbol)
+                self._alerts.send(
+                    event_key=f"sell_failed_{result.symbol}",
+                    title="매도 실패 (포지션 유지)",
+                    message=f"{result.symbol} 매도 주문이 실패했습니다. 포지션은 유지됩니다.",
+                    level="warning",
+                    cooldown_seconds=300,
+                )
                 return
 
             pos = self.positions.pop(result.symbol, None)

@@ -23,6 +23,7 @@
 ├── run_bot.py          # 자동매매 봇 진입점 (스케줄러가 실행)
 ├── run_backtest.py     # 백테스트 실행
 ├── bot_ctl.sh          # 봇 스케줄러 관리 (launchd 설치/시작/중지 등)
+├── docs/               # 운영/전환/알림 관련 문서
 ├── src/
 │   ├── config.py       # 설정 로드
 │   ├── auth.py         # KIS 토큰 관리
@@ -35,6 +36,14 @@
 ├── open-trading-api/   # 한국투자증권 샘플 레포 (MCP용, 아래 참고)
 └── requirements.txt
 ```
+
+## `docs/` 폴더 안내
+
+운영/전환/알림 설정 시 사람이 바로 참고할 체크리스트 문서를 모아둔 디렉터리입니다.
+
+- `docs/live-trading-checklist.md`: 모의(`paper`) → 실전(`real`) 전환 체크리스트
+- `docs/slack-alert-setup.md`: 슬랙 Incoming Webhook 알림 설정 가이드
+- `docs/slack-setup-checklist.md`: 슬랙 설정 절차 요약 체크리스트
 
 ## `open-trading-api/` 폴더 안내
 
@@ -75,6 +84,8 @@ pip install -r requirements.txt
 
 - `.env` 또는 설정 파일에 KIS API 앱 키, 시크릿, 계좌번호 등을 설정합니다.
 - `src/config.py`에서 로드하는 방식을 확인하세요.
+- 실전 전환 절차는 `docs/live-trading-checklist.md`를 참고하세요.
+- 슬랙 알림 설정은 `docs/slack-alert-setup.md`를 참고하세요.
 
 ### 자동매매 봇 실행 (스케줄러)
 

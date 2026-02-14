@@ -38,6 +38,7 @@ def get_strategy():
         per_stock_amount=200_000,         # 종목당 20만원 (고가주는 1주)
         daily_profit_target=10_000,       # 일일 목표 +1만원 (총손익 기준)
         daily_loss_limit=-5_000,          # 일일 손실한도 -5천원
+        daily_total_loss_limit=-7_000,    # 보조 손실컷(순실현+미실현 추정): -7천원
         per_position_stop_loss=-5_000,    # 포지션당 손절 -5천원
         take_profit_pct=1.5,              # 익절 +1.5%
         trailing_stop_pct=-0.7,           # 추적손절 -0.7%
