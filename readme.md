@@ -84,6 +84,7 @@ pip install -r requirements.txt
 
 - `.env` 또는 설정 파일에 KIS API 앱 키, 시크릿, 계좌번호 등을 설정합니다.
 - `src/config.py`에서 로드하는 방식을 확인하세요.
+- 장외 체크 주기를 줄이려면 `OFF_HOURS_CHECK_INTERVAL_SECONDS` 값을 늘리세요. (예: `1800`)
 - 실전 전환 절차는 `docs/live-trading-checklist.md`를 참고하세요.
 - 슬랙 알림 설정은 `docs/slack-alert-setup.md`를 참고하세요.
 

@@ -49,6 +49,7 @@ class TradingScheduler:
         logger.info("=" * 50)
         logger.info("스케줄러 시작 [%s 모드]", self.config.trading_mode.upper())
         logger.info("틱 간격: %d초", tick_interval)
+        logger.info("장외 체크 간격: %d초", self.config.off_hours_check_interval)
         logger.info("=" * 50)
 
         try:
@@ -69,12 +70,11 @@ class TradingScheduler:
                             next_open.strftime("%H:%M"),
                             wait // 60,
                         )
-                        # 긴 대기 시간은 60초 단위로 쪼개서 shutdown 체크
-                        self._interruptible_sleep(min(wait, 300))
+                        self._interruptible_sleep(min(wait, self.config.off_hours_check_interval))
                     else:
                         # 오늘 장 끝남, 내일까지 대기
                         logger.info("오늘 장이 종료되었습니다. 내일까지 대기합니다.")
-                        self._interruptible_sleep(60)
+                        self._interruptible_sleep(self.config.off_hours_check_interval)
 
         except KeyboardInterrupt:
             logger.info("Ctrl+C — 스케줄러를 종료합니다.")
@@ -121,7 +121,7 @@ class TradingScheduler:
             wait = self._seconds_until_preopen(now)
             if wait <= 0:
                 return
-            self._interruptible_sleep(min(wait, 300))
+            self._interruptible_sleep(min(wait, self.config.off_hours_check_interval))
 
     def _run_trading_session(self, tick_interval: int) -> bool:
         """장 시간 동안 전략을 실행한다.

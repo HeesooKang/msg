@@ -28,6 +28,7 @@ class Config:
 
     # 로깅
     log_level: str
+    off_hours_check_interval: int = 1800  # 초, 장외 체크 주기
 
     @classmethod
     def load(cls, env_path: str = None) -> "Config":
@@ -58,6 +59,7 @@ class Config:
         account_product_code = os.getenv("ACCOUNT_PRODUCT_CODE", "01")
         hts_id = os.getenv("HTS_ID", "")
         log_level = os.getenv("LOG_LEVEL", "INFO")
+        off_hours_check_interval = int(os.getenv("OFF_HOURS_CHECK_INTERVAL_SECONDS", "1800"))
 
         config = cls(
             trading_mode=trading_mode,
@@ -71,6 +73,7 @@ class Config:
             ws_url=ws_url,
             rate_limit_interval=rate_limit_interval,
             log_level=log_level,
+            off_hours_check_interval=max(60, off_hours_check_interval),
         )
         config.validate()
         return config
