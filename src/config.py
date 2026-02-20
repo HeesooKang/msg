@@ -1,8 +1,10 @@
 import os
 from dataclasses import dataclass
+import logging
 
 from dotenv import load_dotenv
 
+logger = logging.getLogger("kis_trader.config")
 
 @dataclass
 class Config:
@@ -56,8 +58,11 @@ class Config:
             ws_url = "ws://ops.koreainvestment.com:21000"
             rate_limit_interval = 0.05
 
-        account_product_code = os.getenv("ACCOUNT_PRODUCT_CODE", "01")
-        hts_id = os.getenv("HTS_ID", "")
+        account_number = account_number.strip()
+        api_key = api_key.strip()
+        api_secret = api_secret.strip()
+        account_product_code = os.getenv("ACCOUNT_PRODUCT_CODE", "01").strip()
+        hts_id = os.getenv("HTS_ID", "").strip()
         log_level = os.getenv("LOG_LEVEL", "INFO")
         off_hours_check_interval = int(os.getenv("OFF_HOURS_CHECK_INTERVAL_SECONDS", "1800"))
 
@@ -76,6 +81,13 @@ class Config:
             off_hours_check_interval=max(60, off_hours_check_interval),
         )
         config.validate()
+        logger.info(
+            "설정 로드: mode=%s, account=%s, product=%s, hts_id=%s",
+            config.trading_mode.upper(),
+            config.account_number[:-3] + "***" if len(config.account_number) >= 3 else "***",
+            config.account_product_code,
+            config.hts_id,
+        )
         return config
 
     def validate(self):
@@ -85,3 +97,7 @@ class Config:
             raise ValueError("API_SECRET이 설정되지 않았습니다. .env 파일을 확인하세요.")
         if not self.account_number:
             raise ValueError("ACCOUNT_NUMBER가 설정되지 않았습니다. .env 파일을 확인하세요.")
+        if not self.account_number.isdigit() or len(self.account_number) != 8:
+            raise ValueError("ACCOUNT_NUMBER는 8자리 숫자여야 합니다. .env 파일을 확인하세요.")
+        if not self.account_product_code.isdigit() or len(self.account_product_code) != 2:
+            raise ValueError("ACCOUNT_PRODUCT_CODE는 2자리 숫자여야 합니다. (예: 01)")

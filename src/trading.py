@@ -79,6 +79,11 @@ class TradingAPI:
         시장가 체결의 경우 실제 체결가를 전략 손익 계산에 반영하기 위함.
         조회 실패/미체결이면 (0, 0)을 반환하고 상위에서 기존 값을 사용한다.
         """
+        cfg = getattr(self.client, "config", None)
+        if getattr(cfg, "is_paper", False):
+            # 모의투자에서는 체결내역 조회 TR 미지원 케이스(OPSQ0002)가 잦아 생략한다.
+            return 0, 0
+
         if not order_no:
             return 0, 0
 

@@ -4,7 +4,7 @@ from unittest.mock import patch
 from src.api_client import KISClient
 from src.config import Config
 from src.market_data import MarketDataAPI
-from src.models import OrderResult, OrderSide, Quote
+from src.models import OrderResult, OrderSide, Position, Quote
 from src.strategies.momentum_scalp import (
     MomentumScalpConfig,
     MomentumScalpStrategy,
@@ -182,6 +182,29 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0].symbol, "005930")
         self.assertEqual(orders[0].side, OrderSide.SELL)
+
+    def test_momentum_sync_positions_from_account(self):
+        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
+        account_positions = [
+            Position(
+                symbol="005930",
+                name="삼성전자",
+                quantity=3,
+                avg_price=71234.0,
+                current_price=71900,
+                eval_amount=0,
+                profit_loss=0,
+                profit_rate=0.0,
+            )
+        ]
+
+        strategy.sync_positions_from_account(account_positions)
+
+        self.assertIn("005930", strategy.positions)
+        pos = strategy.positions["005930"]
+        self.assertEqual(pos.quantity, 3)
+        self.assertEqual(pos.buy_price, 71234)
+        self.assertEqual(pos.invested_amount, 213702)
 
 
 if __name__ == "__main__":

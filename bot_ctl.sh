@@ -37,6 +37,14 @@ print_today_pnl() {
     fi
 }
 
+load_service() {
+    if [ ! -f "$PLIST_DST" ]; then
+        echo "❌ 실행 파일이 없습니다: $PLIST_DST"
+        return 1
+    fi
+    launchctl load -w "$PLIST_DST" >/dev/null 2>&1
+}
+
 case "$1" in
     install)
         cp "$PLIST_SRC" "$PLIST_DST"
@@ -45,6 +53,7 @@ case "$1" in
         echo "  → 지금 바로 시작하려면: ./bot_ctl.sh start"
         ;;
     start)
+        load_service
         launchctl load "$PLIST_DST" 2>/dev/null
         launchctl start "$PLIST_NAME"
         echo "✓ 봇 시작됨"
@@ -54,6 +63,7 @@ case "$1" in
         echo "✓ 봇 중지됨"
         ;;
     restart)
+        load_service
         launchctl stop "$PLIST_NAME" 2>/dev/null
         sleep 2
         launchctl start "$PLIST_NAME"

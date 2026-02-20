@@ -49,18 +49,31 @@ def main():
     # 4. 전략 설정 (백테스트 모드)
     strategy_config = MomentumScalpConfig(
         seed_money=1_000_000,
-        max_position_count=5,
-        per_stock_amount=200_000,
+        max_position_count=3,
+        per_stock_amount=180_000,
+        max_per_stock_amount=350_000,
         daily_profit_target=10_000,
         daily_loss_limit=-5_000,
+        daily_total_loss_limit=-7_000,
         per_position_stop_loss=-5_000,
-        take_profit_pct=1.5,
-        trailing_stop_pct=-0.7,
+        take_profit_pct=2.0,
+        trailing_stop_pct=-0.5,
+        min_momentum_score=3.0,
+        min_change_rate=1.2,
+        min_volume=250_000,
+        min_price=2_000,
+        enable_expected_net_filter=True,
+        expected_move_pct=1.8,
+        min_expected_net_profit=2_000,
+        min_expected_rr_ratio=0.5,
         static_watchlist=list(data.keys()),
         # 인버스 ETF 활성화
         inverse_enabled=True,
-        inverse_max_positions=2,
+        inverse_max_positions=1,
         bearish_threshold=2,
+        inverse_min_momentum=2.0,
+        cooldown_seconds=900,
+        bear_market_mode='B',
     )
 
     strategy = MomentumScalpStrategy(

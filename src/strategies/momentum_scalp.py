@@ -9,6 +9,7 @@
 """
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
@@ -16,13 +17,13 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from src.market_data import MarketDataAPI
-from src.models import Order, OrderResult, OrderSide, OrderType, Quote
+from src.models import Order, OrderResult, OrderSide, OrderType, Position, Quote
 from src.notifications import AlertManager
 from src.strategy import BaseStrategy
 
 logger = logging.getLogger("kis_trader.strategy.momentum")
 
-# 시가총액 상위 30종목 (하드코딩)
+# 시가총액 상위 30종목 + 한국시장 추종 ETF (하드코딩)
 DEFAULT_STATIC_WATCHLIST = [
     "005930",  # 삼성전자
     "000660",  # SK하이닉스
@@ -54,6 +55,8 @@ DEFAULT_STATIC_WATCHLIST = [
     "011200",  # HMM
     "138930",  # BNK금융지주
     "024110",  # 기업은행
+    "152100",  # PLUS 200 (KOSPI 200 추종)
+    "292190",  # KODEX KRX300 (코스피·코스닥 전반 추종)
 ]
 
 # 인버스 ETF 유니버스
@@ -70,28 +73,28 @@ class MomentumScalpConfig:
     """모멘텀 스캘핑 전략 설정."""
 
     seed_money: int = 1_000_000
-    max_position_count: int = 5
-    per_stock_amount: int = 200_000      # 종목당 기본 할당액
-    max_per_stock_amount: int = 400_000  # 종목당 최대 노출 (피라미딩 상한)
+    max_position_count: int = 3
+    per_stock_amount: int = 180_000      # 종목당 기본 할당액
+    max_per_stock_amount: int = 350_000  # 종목당 최대 노출 (피라미딩 상한)
     enable_pyramiding: bool = True
     scale_in_min_profit_pct: float = 0.3
     scale_in_score_bonus: float = 0.8
 
     # 일일 서킷 브레이커 (순실현손익 기준)
     daily_profit_target: int = 10_000    # 일일 목표 +1만원
-    daily_loss_limit: int = -5_000       # 일일 최대손실 -5천원
+    daily_loss_limit: int = -6_000       # 일일 최대손실 -6천원
     enable_unrealized_loss_guard: bool = True  # 미실현 포함 보조 손실컷 활성화
     daily_total_loss_limit: Optional[int] = None  # None이면 daily_loss_limit 사용
 
     # 개별 포지션 손절 (금액 기준)
-    per_position_stop_loss: int = -5_000  # 포지션당 -5천원 즉시 청산
+    per_position_stop_loss: int = -6_000  # 포지션당 -6천원 즉시 청산
 
     # 익절 / 추적손절 (비율 기준)
     take_profit_pct: float = 1.5         # 익절 +1.5%
     trailing_stop_pct: float = -0.7      # 고점 대비 추적손절
 
     # 시장 레짐 필터 (KOSPI MA20 기반)
-    bear_market_mode: str = 'A'          # 'A'=공격적(상대강도 종목만), 'B'=보수적(진입금지)
+    bear_market_mode: str = 'B'          # 'A'=공격적(상대강도 종목만), 'B'=보수적(신규 롱 진입 중단)
 
     # 거래 비용
     commission_rate: float = 0.00015     # 0.015% 수수료
@@ -99,19 +102,40 @@ class MomentumScalpConfig:
 
     # 종목 풀
     static_watchlist: List[str] = field(default_factory=lambda: DEFAULT_STATIC_WATCHLIST)
-    dynamic_pool_size: int = 20
+    dynamic_pool_size: int = 15
     pool_refresh_interval: int = 300     # 초
 
     # 필터
-    min_change_rate: float = 0.5
+    min_change_rate: float = 1.2
     max_change_rate: float = 10.0
-    min_volume: int = 100_000
-    min_price: int = 1_000
+    min_volume: int = 250_000
+    min_price: int = 2_000
 
-    min_momentum_score: float = 2.0
+    enable_volume_spike_filter: bool = True
+    volume_spike_min_history: int = 3
+    volume_spike_ratio: float = 1.6
+    volume_spike_abs_min: int = 3_000
+
+    min_momentum_score: float = 3.0
+    enable_expected_net_filter: bool = True
+    expected_move_pct: float = 1.8
+    min_expected_net_profit: int = 2_000
+    min_expected_rr_ratio: float = 0.5
+    # 진입 보강
+    enable_entry_confirmation: bool = True          # 1차 후보 후 재확인 대기
+    entry_confirmation_ticks: int = 2               # 신규 진입 최소 확인 틱 수
+    scale_in_confirmation_ticks: int = 1            # 스케일인 최소 확인 틱 수
+    entry_confirmation_window_seconds: int = 240     # 확인 후보 유효 시간(초)
+    entry_confirmation_min_score_tolerance: float = 0.2
+    entry_confirmation_max_pullback_pct: float = -0.6
+    overheated_jump_change_pct: float = 3.5
+    overheated_retrace_ratio: float = 0.9
+    enable_pool_persistence_gate: bool = True
+    momentum_pool_persistence_window: int = 3
+    momentum_pool_min_appearances: int = 2
 
     # 재매수 쿨다운
-    cooldown_seconds: int = 600          # 10분
+    cooldown_seconds: int = 900          # 15분
 
     # === 인버스 ETF 설정 ===
     inverse_enabled: bool = True
@@ -122,7 +146,7 @@ class MomentumScalpConfig:
     inverse_trailing_stop_pct: float = -0.3  # 인버스 추적손절 (고점 -0.3%)
     inverse_max_hold_minutes: int = 120      # 최대 2시간 보유 (음의 복리 방지)
     bearish_threshold: int = 2               # 이 점수 이상일 때 인버스 진입
-    inverse_min_momentum: float = 1.5        # 인버스 매수 최소 모멘텀 점수
+    inverse_min_momentum: float = 2.0        # 인버스 매수 최소 모멘텀 점수
 
 
 @dataclass
@@ -140,6 +164,17 @@ class PositionState:
             self.invested_amount = self.buy_price * self.quantity
         if self.high_since_buy == 0:
             self.high_since_buy = self.buy_price
+
+
+@dataclass
+class MomentumEntrySignal:
+    """진입 재확인 후보 상태."""
+
+    streak: int
+    first_price: int
+    best_score: float
+    started_at: datetime
+    last_seen_at: datetime
 
 
 @dataclass
@@ -178,6 +213,12 @@ class MomentumScalpStrategy(BaseStrategy):
         self.daily_pnl = DailyPnL()
         self._pool: List[str] = []
         self._last_pool_refresh: Optional[datetime] = None
+        self._pool_build_epoch = 0
+        self._pool_appearance: Dict[str, deque] = {}
+        self._entry_signals: Dict[str, MomentumEntrySignal] = {}
+        self._last_cumulative_volumes: Dict[str, int] = {}
+        self._recent_tick_volumes: Dict[str, deque] = {}
+        self._latest_tick_volumes: Dict[str, int] = {}
         self._halted = False
         self._avg_volumes: Dict[str, int] = {}
         self._quotes_cache: Dict[str, Quote] = {}
@@ -196,6 +237,9 @@ class MomentumScalpStrategy(BaseStrategy):
             self._halted = False
             self._halt_date = None
             self._sell_cooldown = {}
+            self._last_cumulative_volumes = {}
+            self._recent_tick_volumes = {}
+            self._latest_tick_volumes = {}
             self._current_day = today
         self._build_pool()
         self._check_market_regime()
@@ -213,6 +257,13 @@ class MomentumScalpStrategy(BaseStrategy):
         logger.info("  일일 목표(순실현): +%s원, 최대손실(순실현): %s원",
                      f"{self.cfg.daily_profit_target:,}",
                      f"{self.cfg.daily_loss_limit:,}")
+        if self.cfg.enable_expected_net_filter:
+            logger.info(
+                "  진입 필터: 기대상승 %.2f%%, 최소 기대순익 %s원, 최소 RR %.2f",
+                self.cfg.expected_move_pct,
+                f"{self.cfg.min_expected_net_profit:,}",
+                self.cfg.min_expected_rr_ratio,
+            )
         if self.cfg.enable_unrealized_loss_guard:
             total_loss_limit = (
                 self.cfg.daily_total_loss_limit
@@ -220,6 +271,13 @@ class MomentumScalpStrategy(BaseStrategy):
                 else self.cfg.daily_loss_limit
             )
             logger.info("  보조손실컷(순손익추정): %s원", f"{total_loss_limit:,}")
+        if self.cfg.enable_volume_spike_filter:
+            logger.info(
+                "  거래량 스파이크 게이트: 최근 %d개 대비 %.1fx 이상 + 최소 1틱 %d주",
+                self.cfg.volume_spike_min_history,
+                self.cfg.volume_spike_ratio,
+                self.cfg.volume_spike_abs_min,
+            )
         logger.info("  시장 레짐: 약세점수=%d (모드: %s)",
                      self._bear_score, self.cfg.bear_market_mode)
         if self.cfg.inverse_enabled:
@@ -261,8 +319,13 @@ class MomentumScalpStrategy(BaseStrategy):
 
     def on_batch_tick(self, quotes: List[Quote]) -> List[Order]:
         """배치 시세를 받아 전체적으로 판단한다."""
+        now = datetime.now()
         for q in quotes:
             self._quotes_cache[q.symbol] = q
+            self._update_tick_volume_state(q)
+            self._refresh_entry_signal_if_stale(q.symbol, now)
+
+        self._cleanup_stale_entry_signals(now)
 
         # 거래 중지 상태면 주문 없음
         if self._halted:
@@ -358,10 +421,6 @@ class MomentumScalpStrategy(BaseStrategy):
                 self._halted = True
                 self._halt_date = datetime.now().date()
                 return self._liquidate_all()
-
-        # 백테스트 모드: 배치 시세에서 약세 점수 추정
-        if self.market_data is None:
-            self._estimate_market_from_quotes(quotes)
 
         # 개별 종목 평가
         orders = []
@@ -516,12 +575,41 @@ class MomentumScalpStrategy(BaseStrategy):
             return False
         return True
 
+    def sync_positions_from_account(self, account_positions: List[Position]):
+        """계좌 보유를 전략 포지션 상태와 동기화한다.
+
+        장중 재시작 시 메모리 상태가 초기화되더라도 실제 보유 기준으로
+        포지션 한도/추가매수 판단이 일관되게 동작하도록 한다.
+        """
+        synced: Dict[str, PositionState] = {}
+        now = datetime.now()
+
+        for p in account_positions or []:
+            qty = int(p.quantity or 0)
+            if qty <= 0:
+                continue
+
+            avg_price = int(round(float(p.avg_price or 0)))
+            if avg_price <= 0:
+                continue
+
+            current_price = int(p.current_price or 0)
+            synced[p.symbol] = PositionState(
+                symbol=p.symbol,
+                buy_price=avg_price,
+                quantity=qty,
+                invested_amount=avg_price * qty,
+                buy_time=now,
+                high_since_buy=max(avg_price, current_price) if current_price > 0 else avg_price,
+            )
+
+        self.positions = synced
+        logger.info("계좌 보유 동기화 완료: %d종목", len(self.positions))
+
     # --- 내부 로직 ---
 
     def _build_pool(self):
         """종목 풀을 구성한다."""
-        pool = set(self.cfg.static_watchlist)
-
         if self._pool_override:
             self._pool = list(self._pool_override)
             # 인버스 ETF가 override에 없으면 추가
@@ -531,6 +619,9 @@ class MomentumScalpStrategy(BaseStrategy):
                         self._pool.append(sym)
             self._last_pool_refresh = datetime.now()
             return
+
+        pool = set(self.cfg.static_watchlist)
+        appeared: set[str] = set()
 
         # 인버스 ETF 추가
         if self.cfg.inverse_enabled:
@@ -547,14 +638,60 @@ class MomentumScalpStrategy(BaseStrategy):
                     min_volume=self.cfg.min_volume,
                 )
                 for item in rising:
-                    pool.add(item.symbol)
+                    appeared.add(item.symbol)
                 logger.info("동적 풀 갱신: 등락률 상위 %d개 추가 (총 %d종목)",
                             len(rising), len(pool))
             except Exception as e:
                 logger.warning("등락률 순위 조회 실패, 정적 풀만 사용: %s", e)
 
+        self._pool_build_epoch += 1
+        if self.cfg.enable_pool_persistence_gate:
+            self._record_pool_appearances(appeared)
+            persistent = {
+                sym
+                for sym in appeared
+                if self._is_pool_persistent(sym)
+            }
+            for sym in appeared:
+                if sym in persistent:
+                    pool.add(sym)
+            if appeared:
+                logger.info("풀 지속성 반영: %d개 동적 후보 중 %d개 채택",
+                            len(appeared), len(persistent))
+        else:
+            pool.update(appeared)
+
         self._pool = list(pool)[:55]  # 인버스 포함하여 여유 확보
         self._last_pool_refresh = datetime.now()
+
+    def _record_pool_appearances(self, symbols: set[str]):
+        if not self.cfg.enable_pool_persistence_gate:
+            return
+
+        max_window = max(1, self.cfg.momentum_pool_persistence_window)
+        min_keep_epoch = self._pool_build_epoch - max_window + 1
+
+        for dq in self._pool_appearance.values():
+            while dq and dq[0] < min_keep_epoch:
+                dq.popleft()
+        for sym in list(self._pool_appearance.keys()):
+            if not self._pool_appearance[sym]:
+                self._pool_appearance.pop(sym, None)
+
+        for sym in symbols:
+            dq = self._pool_appearance.setdefault(sym, deque(maxlen=max_window))
+            dq.append(self._pool_build_epoch)
+
+    def _is_pool_persistent(self, symbol: str) -> bool:
+        if not self.cfg.enable_pool_persistence_gate:
+            return True
+        if symbol in self.cfg.static_watchlist:
+            return True
+        dq = self._pool_appearance.get(symbol)
+        if not dq:
+            return False
+        required = max(1, self.cfg.momentum_pool_min_appearances)
+        return len(dq) >= required
 
     def _check_market_regime(self):
         """KOSPI 기반 약세 점수(0~3)를 계산한다."""
@@ -609,6 +746,192 @@ class MomentumScalpStrategy(BaseStrategy):
             self._bear_score = 0
             self._bear_market = False
 
+    def _cleanup_stale_entry_signals(self, now: datetime):
+        if not self.cfg.enable_entry_confirmation:
+            self._entry_signals.clear()
+            return
+
+        ttl = max(1, self.cfg.entry_confirmation_window_seconds)
+        remove = [
+            symbol
+            for symbol, signal in self._entry_signals.items()
+            if (now - signal.last_seen_at).total_seconds() > ttl
+        ]
+        for symbol in remove:
+            self._entry_signals.pop(symbol, None)
+
+    def _refresh_entry_signal_if_stale(self, symbol: str, now: datetime):
+        if not self.cfg.enable_entry_confirmation:
+            return
+        signal = self._entry_signals.get(symbol)
+        if not signal:
+            return
+        ttl = max(1, self.cfg.entry_confirmation_window_seconds)
+        if (now - signal.last_seen_at).total_seconds() > ttl:
+            self._entry_signals.pop(symbol, None)
+
+    def _update_tick_volume_state(self, quote: Quote):
+        if quote.volume <= 0:
+            self._latest_tick_volumes[quote.symbol] = 0
+            return
+
+        prev = self._last_cumulative_volumes.get(quote.symbol)
+        if prev is None:
+            delta = quote.volume
+        else:
+            delta = quote.volume - prev
+            if delta < 0:
+                delta = quote.volume
+
+        self._last_cumulative_volumes[quote.symbol] = quote.volume
+        self._latest_tick_volumes[quote.symbol] = delta
+        if delta <= 0:
+            return
+
+        dq = self._recent_tick_volumes.setdefault(
+            quote.symbol,
+            deque(maxlen=max(self.cfg.volume_spike_min_history * 3, 12)),
+        )
+        dq.append(delta)
+
+    def _is_volume_spike(self, quote: Quote) -> bool:
+        if not self.cfg.enable_volume_spike_filter:
+            return True
+
+        if quote.volume <= 0:
+            logger.debug("거래량 스파이크 탈락: %s 누적거래량 없음", quote.symbol)
+            return False
+
+        current_delta = self._latest_tick_volumes.get(quote.symbol, 0)
+        if current_delta < self.cfg.volume_spike_abs_min:
+            logger.debug(
+                "거래량 스파이크 탈락(절대량 부족): %s 현재 %d < %d",
+                quote.symbol,
+                current_delta,
+                self.cfg.volume_spike_abs_min,
+            )
+            return False
+
+        history = self._recent_tick_volumes.get(quote.symbol, deque())
+        if len(history) < self.cfg.volume_spike_min_history:
+            return True
+
+        baseline_cnt = max(1, len(history) - 1)
+        if baseline_cnt <= 0:
+            return True
+        baseline = (sum(history) - current_delta) / baseline_cnt
+        if baseline <= 0:
+            return True
+        ratio = current_delta / baseline
+        if ratio < self.cfg.volume_spike_ratio:
+            logger.info(
+                "거래량 스파이크 탈락: %s 현재=%d, 기준=%d, 비율=%.2f (임계 %.2f)",
+                quote.symbol,
+                current_delta,
+                int(baseline),
+                ratio,
+                self.cfg.volume_spike_ratio,
+            )
+            return False
+        return True
+
+    def _can_open_new_long(self, quote: Quote, pending_orders: Optional[List[Order]] = None) -> bool:
+        if any(
+            o.side == OrderSide.BUY and o.symbol == quote.symbol
+            for o in pending_orders or []
+        ):
+            return False
+
+        if self._bear_market and self.cfg.bear_market_mode == "B":
+            logger.info("신규롱 차단: 약세 모드 B")
+            return False
+
+        if (
+            self.cfg.enable_pool_persistence_gate
+            and not self._is_pool_persistent(quote.symbol)
+        ):
+            logger.debug("신규롱 차단: 동적 풀 지속성 미충족 (%s)", quote.symbol)
+            return False
+
+        return True
+
+    def _can_confirm_entry(
+        self,
+        quote: Quote,
+        score: float,
+        is_scale_in: bool,
+        now: datetime,
+    ) -> bool:
+        if not self.cfg.enable_entry_confirmation:
+            return True
+
+        required_ticks = (
+            self.cfg.scale_in_confirmation_ticks
+            if is_scale_in
+            else self.cfg.entry_confirmation_ticks
+        )
+        if required_ticks <= 1:
+            self._entry_signals.pop(quote.symbol, None)
+            return True
+
+        if not quote.current_price:
+            self._entry_signals.pop(quote.symbol, None)
+            return False
+
+        signal = self._entry_signals.get(quote.symbol)
+        if not signal:
+            self._entry_signals[quote.symbol] = MomentumEntrySignal(
+                streak=1,
+                first_price=quote.current_price,
+                best_score=score,
+                started_at=now,
+                last_seen_at=now,
+            )
+            return False
+
+        ttl = max(1, self.cfg.entry_confirmation_window_seconds)
+        if (now - signal.last_seen_at).total_seconds() > ttl:
+            self._entry_signals[quote.symbol] = MomentumEntrySignal(
+                streak=1,
+                first_price=quote.current_price,
+                best_score=score,
+                started_at=now,
+                last_seen_at=now,
+            )
+            return False
+
+        pullback_pct = (quote.current_price - signal.first_price) / signal.first_price * 100
+        if pullback_pct < self.cfg.entry_confirmation_max_pullback_pct:
+            self._entry_signals[quote.symbol] = MomentumEntrySignal(
+                streak=1,
+                first_price=quote.current_price,
+                best_score=score,
+                started_at=now,
+                last_seen_at=now,
+            )
+            logger.debug(
+                "진입 재확인 리셋(과도한 되돌림): %s %.2f%% < %.2f%%",
+                quote.symbol,
+                pullback_pct,
+                self.cfg.entry_confirmation_max_pullback_pct,
+            )
+            return False
+
+        if score + self.cfg.entry_confirmation_min_score_tolerance < signal.best_score:
+            self._entry_signals[quote.symbol] = MomentumEntrySignal(
+                streak=1,
+                first_price=quote.current_price,
+                best_score=score,
+                started_at=now,
+                last_seen_at=now,
+            )
+            return False
+
+        signal.streak += 1
+        signal.best_score = max(signal.best_score, score)
+        signal.last_seen_at = now
+        return signal.streak >= required_ticks
+
     def _estimate_market_from_quotes(self, quotes: List[Quote]):
         """배치 시세에서 약세 점수를 추정한다 (백테스트용).
 
@@ -644,9 +967,17 @@ class MomentumScalpStrategy(BaseStrategy):
         if quote.symbol in self._inverse_symbols:
             return None
 
+        now = datetime.now()
+
         if quote.current_price <= 0 or quote.open_price <= 0:
             return None
         if quote.current_price < self.cfg.min_price:
+            return None
+        if quote.change_rate < self.cfg.min_change_rate:
+            return None
+        if quote.change_rate < 0:
+            return None
+        if not self._is_volume_spike(quote):
             return None
 
         # 쿨다운 체크
@@ -656,12 +987,14 @@ class MomentumScalpStrategy(BaseStrategy):
             if elapsed < self.cfg.cooldown_seconds:
                 return None
 
+        if any(
+            o.side == OrderSide.BUY and o.symbol == quote.symbol
+            for o in pending_orders or []
+        ):
+            return None
+
         position = self.positions.get(quote.symbol)
         is_scale_in = position is not None
-
-        # 약세장 보수 모드(B): 신규 롱 진입 금지
-        if not is_scale_in and self._bear_market and self.cfg.bear_market_mode == 'B':
-            return None
 
         score = self._calc_momentum_score(quote)
         if is_scale_in:
@@ -676,6 +1009,34 @@ class MomentumScalpStrategy(BaseStrategy):
             if score < self.cfg.min_momentum_score:
                 return None
 
+        if quote.change_rate >= self.cfg.overheated_jump_change_pct:
+            retrace_anchor = quote.open_price * (
+                1
+                + (self.cfg.overheated_jump_change_pct / 100)
+                * self.cfg.overheated_retrace_ratio
+            )
+            if quote.current_price < retrace_anchor:
+                logger.info(
+                    "과열 회피: %s %s%% 급등 후 되돌림 %.2f%% < %.2f%%",
+                    quote.symbol,
+                    f"{quote.change_rate:.2f}",
+                    (quote.current_price - quote.open_price) / quote.open_price * 100,
+                    (retrace_anchor / quote.open_price - 1) * 100,
+                )
+                self._entry_signals.pop(quote.symbol, None)
+                return None
+
+        if not is_scale_in and not self._can_open_new_long(quote, pending_orders):
+            return None
+
+        if not self._can_confirm_entry(
+            quote=quote,
+            score=score,
+            is_scale_in=is_scale_in,
+            now=now,
+        ):
+            return None
+
         alloc = self._compute_buy_allocation(
             symbol=quote.symbol,
             current_price=quote.current_price,
@@ -684,6 +1045,12 @@ class MomentumScalpStrategy(BaseStrategy):
         quantity = alloc // quote.current_price
 
         if quantity <= 0:
+            return None
+        if not self._passes_expected_net_filter(
+            symbol=quote.symbol,
+            quantity=quantity,
+            entry_price=quote.current_price,
+        ):
             return None
 
         if is_scale_in:
@@ -707,6 +1074,8 @@ class MomentumScalpStrategy(BaseStrategy):
                 f"{alloc:,}",
             )
 
+        self._entry_signals.pop(quote.symbol, None)
+
         return Order(
             symbol=quote.symbol,
             side=OrderSide.BUY,
@@ -722,6 +1091,10 @@ class MomentumScalpStrategy(BaseStrategy):
         인버스 ETF는 시장 하락 시 상승하므로 모멘텀 점수가 자연스럽게 높아진다.
         """
         if quote.current_price <= 0 or quote.open_price <= 0:
+            return None
+        if quote.change_rate < 1.0:
+            return None
+        if not self._is_volume_spike(quote):
             return None
 
         if self._bear_score < self.cfg.bearish_threshold:
@@ -746,6 +1119,12 @@ class MomentumScalpStrategy(BaseStrategy):
         )
         quantity = alloc // quote.current_price
         if quantity <= 0:
+            return None
+        if not self._passes_expected_net_filter(
+            symbol=quote.symbol,
+            quantity=quantity,
+            entry_price=quote.current_price,
+        ):
             return None
 
         logger.info("[INV] 매수 신호: %s 약세점수=%d, 모멘텀=%.1f, %d주 @ %s원",
@@ -940,6 +1319,41 @@ class MomentumScalpStrategy(BaseStrategy):
         if sell_notional <= 0:
             return 0
         return int(round(sell_notional * self.cfg.tax_slippage_rate))
+
+    def _passes_expected_net_filter(self, symbol: str, quantity: int, entry_price: int) -> bool:
+        if not self.cfg.enable_expected_net_filter:
+            return True
+        if quantity <= 0 or entry_price <= 0:
+            return False
+
+        buy_notional = entry_price * quantity
+        expected_exit_price = int(round(entry_price * (1 + self.cfg.expected_move_pct / 100)))
+        if expected_exit_price <= 0:
+            return False
+
+        sell_notional = expected_exit_price * quantity
+        gross_expected = (expected_exit_price - entry_price) * quantity
+        buy_fee = self._calc_commission_cost(buy_notional)
+        sell_fee = self._calc_commission_cost(sell_notional)
+        sell_tax_slippage = self._calc_sell_tax_slippage_cost(sell_notional)
+        expected_net = gross_expected - buy_fee - sell_fee - sell_tax_slippage
+
+        risk_amount = max(1, abs(self.cfg.per_position_stop_loss))
+        rr_ratio = expected_net / risk_amount
+        passes = (
+            expected_net >= self.cfg.min_expected_net_profit
+            and rr_ratio >= self.cfg.min_expected_rr_ratio
+        )
+        if not passes:
+            logger.info(
+                "진입 필터 탈락: %s 기대순익 %s원, RR %.2f (기준: %s원 / %.2f)",
+                symbol,
+                f"{expected_net:,}",
+                rr_ratio,
+                f"{self.cfg.min_expected_net_profit:,}",
+                self.cfg.min_expected_rr_ratio,
+            )
+        return passes
 
     def _estimate_unrealized_net_pnl(self) -> int:
         total = 0

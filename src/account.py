@@ -37,7 +37,24 @@ class AccountAPI:
             params=params,
         )
         if not res.success:
-            logger.error("잔고 조회 실패: %s", res.error_message)
+            config = getattr(self.client, "config", None)
+            acc_no = getattr(config, "account_number", "")
+            acc_prod = getattr(config, "account_product_code", "")
+            if acc_no:
+                acc_masked = f"{acc_no[:2]}******" if len(acc_no) > 2 else "***"
+            else:
+                acc_masked = "***"
+
+            if res.error_code == "OPSQ2000" and "INVALID_CHECK_ACNO" in res.error_message:
+                logger.error(
+                    "잔고 조회 실패: INVALID_CHECK_ACNO (입력값 체크 실패) "
+                    "CANO=%s, ACNT_PRDT_CD=%s, MODE=%s",
+                    acc_masked,
+                    acc_prod,
+                    getattr(config, "trading_mode", "unknown"),
+                )
+            else:
+                logger.error("잔고 조회 실패: %s", res.error_message)
             return None
 
         # 보유종목

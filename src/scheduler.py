@@ -36,6 +36,9 @@ class TradingScheduler:
         self.account = AccountAPI(self.client)
         self.executor = OrderExecutor(self.trading, RiskManager())
 
+        self._balance_retry_attempts = 3
+        self._balance_retry_delay_seconds = 2
+
     def stop(self):
         self._shutdown = True
 
@@ -147,13 +150,20 @@ class TradingScheduler:
         logger.info("감시 종목: %d개", len(watchlist))
 
         # 잔고 확인
-        balance = self.account.get_balance()
+        balance = self._fetch_balance_with_retry("세션 시작 잔고 조회")
         if balance:
+            if hasattr(self.strategy, "sync_positions_from_account"):
+                self.strategy.sync_positions_from_account(balance.positions)
             logger.info(
                 "예수금: %s원 | 보유: %d종목",
                 f"{balance.total_deposit:,}",
                 len(balance.positions),
             )
+        else:
+            logger.error("잔고 조회 실패로 이번 세션의 주문 진행을 중단합니다.")
+            self._interruptible_sleep(60)
+            logger.info("--- 트레이딩 세션 종료 ---")
+            return False
 
         halted_for_day = False
 
@@ -194,11 +204,41 @@ class TradingScheduler:
         logger.info("--- 트레이딩 세션 종료 ---")
 
         # 종료 시 잔고 요약
-        balance = self.account.get_balance()
+        balance = self._fetch_balance_with_retry("세션 종료 잔고 조회", max_attempts=2, base_delay_seconds=1)
         if balance:
             logger.info(
                 "최종 잔고 — 평가금액: %s원 | 손익: %s원",
                 f"{balance.total_eval_amount:,}",
                 f"{balance.total_profit_loss:,}",
             )
+        else:
+            logger.warning("세션 종료 잔고 조회 실패: 오늘 요약 로그를 생략합니다.")
         return halted_for_day
+
+    def _fetch_balance_with_retry(
+        self,
+        context: str,
+        max_attempts: int = None,
+        base_delay_seconds: int = None,
+    ):
+        """잔고 조회를 실패 시 재시도한다."""
+        attempts = max_attempts or self._balance_retry_attempts
+        delay = base_delay_seconds or self._balance_retry_delay_seconds
+
+        for i in range(1, attempts + 1):
+            balance = self.account.get_balance()
+            if balance is not None:
+                return balance
+
+            if i < attempts and not self._shutdown:
+                wait = delay * (2 ** (i - 1))
+                logger.warning(
+                    "%s 실패 (%d/%d): %d초 후 재시도",
+                    context,
+                    i,
+                    attempts,
+                    wait,
+                )
+                self._interruptible_sleep(wait)
+
+        return None
