@@ -2,6 +2,8 @@
 
 한국투자증권(Korea Investment & Securities) **Open API**를 사용하는 주식 자동거래 프로그램입니다.
 
+프로젝트 이름인 `msg`는 `make siseum great`의 약자입니다.
+
 ## 개요
 
 - **API**: [한국투자증권 Open API](https://apiportal.koreainvestment.com/) (KIS Developers)
