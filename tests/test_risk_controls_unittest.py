@@ -1,4 +1,6 @@
 import unittest
+from collections import deque
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from src.api_client import KISClient
@@ -153,7 +155,9 @@ class RiskControlTests(unittest.TestCase):
     def test_momentum_unrealized_loss_guard_liquidates_all(self):
         cfg = MomentumScalpConfig(
             daily_loss_limit=-5_000,
+            daily_total_loss_limit=-5_000,
             enable_unrealized_loss_guard=True,
+            enable_regime_adaptive=False,
             per_position_stop_loss=-100_000,  # 개별 손절보다 보조컷이 먼저 작동하도록 완화
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
@@ -183,6 +187,25 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(orders[0].symbol, "005930")
         self.assertEqual(orders[0].side, OrderSide.SELL)
 
+    def test_momentum_daily_breaker_uses_effective_pnl_after_restore_offset(self):
+        cfg = MomentumScalpConfig(
+            daily_profit_target=500,
+            daily_loss_limit=-500,
+            use_restored_pnl_for_daily_breaker=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+
+        # 재시작 복구값(누적 +1,500원)이 있어도 브레이커 시작값은 0원으로 본다.
+        strategy.daily_pnl.realized_net_pnl = 1_500
+        strategy._daily_breaker_pnl_offset = 1_500
+        strategy.on_batch_tick([])
+        self.assertFalse(strategy._halted)
+
+        # 세션 중 신규 순실현이 +650원으로 늘면(강세 프로파일 목표 600원 초과) 목표 달성 처리.
+        strategy.daily_pnl.realized_net_pnl = 2_150
+        strategy.on_batch_tick([])
+        self.assertTrue(strategy._halted)
+
     def test_momentum_sync_positions_from_account(self):
         strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
         account_positions = [
@@ -205,6 +228,187 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(pos.quantity, 3)
         self.assertEqual(pos.buy_price, 71234)
         self.assertEqual(pos.invested_amount, 213702)
+
+    def test_inverse_buy_blocked_by_global_loss_cooldown(self):
+        cfg = MomentumScalpConfig(
+            inverse_enabled=True,
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            inverse_min_change_rate=1.0,
+            inverse_min_momentum=0.0,
+            inverse_min_bear_score=2,
+            bearish_threshold=2,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 3
+        strategy._global_loss_cooldown_until = datetime.now() + timedelta(minutes=5)
+
+        quote = Quote(
+            symbol="252670",
+            name="KODEX 200선물인버스2X",
+            current_price=2_000,
+            change=40,
+            change_rate=2.0,
+            open_price=1_980,
+            high_price=2_010,
+            low_price=1_970,
+            volume=500_000,
+            trade_amount=1_000_000_000,
+        )
+
+        order = strategy._evaluate_inverse_buy(quote)
+        self.assertIsNone(order)
+
+    def test_inverse_volume_spike_gate_relaxes_only_for_inverse(self):
+        cfg = MomentumScalpConfig(
+            inverse_enabled=True,
+            inverse_etfs=["252670"],
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 3
+
+        inverse_quote = Quote(
+            symbol="252670",
+            name="KODEX 200선물인버스2X",
+            current_price=2_000,
+            change=40,
+            change_rate=2.0,
+            open_price=1_980,
+            high_price=2_010,
+            low_price=1_970,
+            volume=500_000,
+            trade_amount=1_000_000_000,
+        )
+        regular_quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=60_000,
+            change=1_200,
+            change_rate=2.0,
+            open_price=59_400,
+            high_price=60_300,
+            low_price=59_100,
+            volume=500_000,
+            trade_amount=30_000_000_000,
+        )
+
+        for symbol in ("252670", "005930"):
+            strategy._latest_tick_volumes[symbol] = 15_500
+            strategy._recent_tick_volumes[symbol] = deque([10_000, 10_000, 15_500], maxlen=12)
+
+        self.assertTrue(strategy._is_volume_spike(inverse_quote, score=2.5))
+        self.assertFalse(strategy._is_volume_spike(regular_quote, score=2.5))
+
+    def test_inverse_buy_can_pass_relaxed_volume_spike_gate(self):
+        cfg = MomentumScalpConfig(
+            inverse_enabled=True,
+            inverse_etfs=["252670"],
+            enable_expected_net_filter=False,
+            inverse_min_change_rate=1.0,
+            inverse_min_momentum=0.0,
+            inverse_min_bear_score=2,
+            bearish_threshold=2,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 3
+
+        quote = Quote(
+            symbol="252670",
+            name="KODEX 200선물인버스2X",
+            current_price=2_000,
+            change=40,
+            change_rate=2.0,
+            open_price=1_980,
+            high_price=2_010,
+            low_price=1_970,
+            volume=500_000,
+            trade_amount=1_000_000_000,
+        )
+        strategy._latest_tick_volumes["252670"] = 15_500
+        strategy._recent_tick_volumes["252670"] = deque([10_000, 10_000, 15_500], maxlen=12)
+
+        order = strategy._evaluate_inverse_buy(quote)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order.side, OrderSide.BUY)
+
+    def test_inverse_trailing_stop_requires_activation_gain(self):
+        cfg = MomentumScalpConfig(
+            inverse_enabled=True,
+            enable_regime_adaptive=False,
+            inverse_take_profit_pct=5.0,
+            inverse_stop_loss_pct=-2.0,
+            inverse_trailing_stop_pct=-0.3,
+            inverse_trailing_stop_activation_gain_pct=0.45,
+            bearish_threshold=2,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 2  # 시장반등 청산 우회
+        strategy.positions["252670"] = PositionState(
+            symbol="252670",
+            buy_price=10_000,
+            quantity=1,
+            invested_amount=10_000,
+        )
+
+        pos = strategy.positions["252670"]
+
+        # 고점 이익이 0.45% 미만이면 추적손절 조건 미발동
+        pos.high_since_buy = 10_020  # +0.2%
+        no_trigger_quote = Quote(
+            symbol="252670",
+            name="KODEX 200선물인버스2X",
+            current_price=9_985,
+            change=0,
+            change_rate=0.0,
+            open_price=10_000,
+            high_price=10_030,
+            low_price=9_960,
+            volume=100_000,
+            trade_amount=200_000_000,
+        )
+        self.assertIsNone(strategy._evaluate_inverse_sell(no_trigger_quote))
+
+        # 고점 이익이 충분하고 고점 대비 하락률이 임계 이하면 추적손절 발동
+        pos.high_since_buy = 10_080  # +0.8%
+        trigger_quote = Quote(
+            symbol="252670",
+            name="KODEX 200선물인버스2X",
+            current_price=10_040,  # 고점 대비 약 -0.40%
+            change=0,
+            change_rate=0.0,
+            open_price=10_000,
+            high_price=10_080,
+            low_price=10_000,
+            volume=120_000,
+            trade_amount=250_000_000,
+        )
+        order = strategy._evaluate_inverse_sell(trigger_quote)
+        self.assertIsNotNone(order)
+        self.assertEqual(order.side, OrderSide.SELL)
+
+    def test_entry_window_blocked_when_dynamic_mode_disabled(self):
+        cfg = MomentumScalpConfig(
+            block_new_entry_windows=["11:00-12:00"],
+            enable_dynamic_entry_block_windows=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 3
+
+        blocked = strategy._is_new_entry_window_blocked(datetime(2026, 3, 9, 11, 30, 0))
+        self.assertTrue(blocked)
+
+    def test_entry_window_dynamic_unblock_in_bear_market(self):
+        cfg = MomentumScalpConfig(
+            block_new_entry_windows=["11:00-12:00"],
+            enable_dynamic_entry_block_windows=True,
+            dynamic_entry_block_disable_bear_score=2,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 3
+
+        blocked = strategy._is_new_entry_window_blocked(datetime(2026, 3, 9, 11, 30, 0))
+        self.assertFalse(blocked)
 
 
 if __name__ == "__main__":

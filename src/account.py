@@ -15,6 +15,23 @@ class AccountAPI:
     def __init__(self, client: KISClient):
         self.client = client
 
+    @staticmethod
+    def _coerce_int(value) -> Optional[int]:
+        """API 문자열/숫자 값을 int로 변환한다."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+
     def get_balance(self) -> Optional[AccountBalance]:
         """주식 잔고를 조회한다 (보유종목 + 계좌 요약)."""
         params = {
@@ -86,6 +103,62 @@ class AccountAPI:
             total_profit_rate=float(summary.get("tot_evlu_pfls_amt_rt", 0) or 0),
             positions=positions,
         )
+
+    def get_realized_profit_loss(self) -> Optional[int]:
+        """당일 실현손익(원)을 조회한다.
+
+        주식잔고조회_실현손익(v1_국내주식-041) 기준이며,
+        전일 매매를 제외(PRCS_DVSN=01)한 당일 값을 사용한다.
+        """
+        params = {
+            "CANO": "",
+            "ACNT_PRDT_CD": "",
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",  # 전일매매 미포함 (당일 기준)
+            "COST_ICLD_YN": "N",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+        res = self.client.get(
+            api_url="/uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl",
+            tr_id="TTTC8494R",
+            params=params,
+        )
+        if not res.success:
+            logger.warning("실현손익 조회 실패: %s", res.error_message)
+            return None
+
+        # output2 요약값 우선
+        if isinstance(res.output2, list) and res.output2:
+            summary = res.output2[0] if isinstance(res.output2[0], dict) else {}
+            for key in ("rlzt_pfls", "real_evlu_pfls"):
+                parsed = self._coerce_int(summary.get(key))
+                if parsed is not None:
+                    return parsed
+
+        # output1 종목별 실현손익 합산 fallback
+        if isinstance(res.output1, list):
+            total = 0
+            found = False
+            for item in res.output1:
+                if not isinstance(item, dict):
+                    continue
+                parsed = self._coerce_int(item.get("rlzt_pfls"))
+                if parsed is None:
+                    continue
+                total += parsed
+                found = True
+            if found:
+                return total
+
+        logger.warning("실현손익 응답 파싱 실패: rlzt_pfls 값을 찾지 못했습니다.")
+        return None
 
     def get_buying_power(self, symbol: str = "", price: int = 0) -> int:
         """매수 가능 금액을 조회한다."""

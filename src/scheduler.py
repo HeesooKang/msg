@@ -1,6 +1,9 @@
 import logging
+import math
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as clock_time, timedelta
+
+import requests
 
 from src.account import AccountAPI
 from src.api_client import KISClient
@@ -57,27 +60,41 @@ class TradingScheduler:
 
         try:
             while not self._shutdown:
-                now = datetime.now()
+                try:
+                    now = datetime.now()
 
-                if self._is_trading_time(now):
-                    halted_for_day = self._run_trading_session(tick_interval)
-                    if halted_for_day and not self._shutdown:
-                        logger.info("당일 하드스탑 감지: 다음 장 준비 시각까지 대기합니다.")
-                        self._sleep_until_preopen()
-                else:
-                    wait = self._seconds_until_preopen(now)
-                    if wait > 0:
-                        next_open = now + timedelta(seconds=wait)
-                        logger.info(
-                            "장 시간이 아닙니다. 다음 준비 시각: %s (%d분 후)",
-                            next_open.strftime("%H:%M"),
-                            wait // 60,
-                        )
-                        self._interruptible_sleep(min(wait, self.config.off_hours_check_interval))
+                    if self._is_trading_time(now):
+                        halted_for_day = self._run_trading_session(tick_interval)
+                        if halted_for_day and not self._shutdown:
+                            logger.info("당일 하드스탑 감지: 다음 장 준비 시각까지 대기합니다.")
+                            self._sleep_until_preopen()
                     else:
-                        # 오늘 장 끝남, 내일까지 대기
-                        logger.info("오늘 장이 종료되었습니다. 내일까지 대기합니다.")
-                        self._interruptible_sleep(self.config.off_hours_check_interval)
+                        wait = self._seconds_until_preopen(now)
+                        if wait > 0:
+                            next_open = now + timedelta(seconds=wait)
+                            logger.info(
+                                "장 시간이 아닙니다. 다음 준비 시각: %s (%d분 후)",
+                                next_open.strftime("%H:%M"),
+                                wait // 60,
+                            )
+                            self._interruptible_sleep(min(wait, self.config.off_hours_check_interval))
+                        else:
+                            # 오늘 장 끝남, 내일까지 대기
+                            logger.info("오늘 장이 종료되었습니다. 내일까지 대기합니다.")
+                            self._interruptible_sleep(self.config.off_hours_check_interval)
+                except requests.exceptions.RequestException as e:
+                    if self._shutdown:
+                        break
+                    logger.warning(
+                        "스케줄러 네트워크 오류: %s (30초 후 재시도)",
+                        e,
+                    )
+                    self._interruptible_sleep(min(30, self.config.off_hours_check_interval))
+                except Exception:
+                    if self._shutdown:
+                        break
+                    logger.exception("스케줄러 루프 오류 (30초 후 재시도)")
+                    self._interruptible_sleep(min(30, self.config.off_hours_check_interval))
 
         except KeyboardInterrupt:
             logger.info("Ctrl+C — 스케줄러를 종료합니다.")
@@ -86,20 +103,27 @@ class TradingScheduler:
 
     def _is_trading_time(self, now: datetime) -> bool:
         """현재가 거래 가능 시간인지 확인."""
-        current = (now.hour, now.minute)
-        return MARKET_OPEN <= current < MARKET_CLOSE and now.weekday() < 5
+        open_time = clock_time(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1])
+        close_time = clock_time(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1])
+        return now.weekday() < 5 and open_time <= now.time() < close_time
 
     def _is_preopen_time(self, now: datetime) -> bool:
         """장 시작 전 준비 시간인지 확인."""
-        current = (now.hour, now.minute)
-        return PRE_OPEN <= current < MARKET_OPEN and now.weekday() < 5
+        preopen_time = clock_time(hour=PRE_OPEN[0], minute=PRE_OPEN[1])
+        open_time = clock_time(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1])
+        return now.weekday() < 5 and preopen_time <= now.time() < open_time
 
     def _seconds_until_preopen(self, now: datetime) -> int:
         """다음 준비 시각까지 남은 초."""
-        today_preopen = now.replace(hour=PRE_OPEN[0], minute=PRE_OPEN[1], second=0)
+        today_preopen = now.replace(hour=PRE_OPEN[0], minute=PRE_OPEN[1], second=0, microsecond=0)
+        today_open = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
 
-        if now < today_preopen and now.weekday() < 5:
-            return int((today_preopen - now).total_seconds())
+        if now.weekday() < 5:
+            if now < today_preopen:
+                return max(0, math.ceil((today_preopen - now).total_seconds()))
+            if today_preopen <= now < today_open:
+                # 프리오픈(08:50~09:00) 구간은 당일 09:00 장 시작까지 대기
+                return max(0, math.ceil((today_open - now).total_seconds()))
 
         # 오늘 이미 지남 → 다음 평일 계산
         days_ahead = 1
@@ -109,7 +133,22 @@ class TradingScheduler:
             next_day = now + timedelta(days=days_ahead)
 
         next_preopen = next_day.replace(hour=PRE_OPEN[0], minute=PRE_OPEN[1], second=0, microsecond=0)
-        return int((next_preopen - now).total_seconds())
+        return max(0, math.ceil((next_preopen - now).total_seconds()))
+
+    def _next_preopen_after(self, now: datetime) -> datetime:
+        """지정 시각 이후 가장 가까운 다음 준비 시각을 계산한다."""
+        today_preopen = now.replace(hour=PRE_OPEN[0], minute=PRE_OPEN[1], second=0, microsecond=0)
+
+        if now.weekday() < 5 and now < today_preopen:
+            return today_preopen
+
+        days_ahead = 1
+        next_day = now + timedelta(days=days_ahead)
+        while next_day.weekday() >= 5:  # 토(5), 일(6) 건너뛰기
+            days_ahead += 1
+            next_day = now + timedelta(days=days_ahead)
+
+        return next_day.replace(hour=PRE_OPEN[0], minute=PRE_OPEN[1], second=0, microsecond=0)
 
     def _interruptible_sleep(self, seconds: int):
         """shutdown 체크하면서 대기."""
@@ -119,11 +158,19 @@ class TradingScheduler:
 
     def _sleep_until_preopen(self):
         """다음 장 준비 시각까지 대기한다."""
+        target_preopen = self._next_preopen_after(datetime.now())
+
         while not self._shutdown:
             now = datetime.now()
-            wait = self._seconds_until_preopen(now)
-            if wait <= 0:
+            if now >= target_preopen:
                 return
+
+            wait = max(0, math.ceil((target_preopen - now).total_seconds()))
+            logger.info(
+                "장 시간이 아닙니다. 다음 준비 시각: %s (%d분 후)",
+                target_preopen.strftime("%H:%M"),
+                wait // 60,
+            )
             self._interruptible_sleep(min(wait, self.config.off_hours_check_interval))
 
     def _run_trading_session(self, tick_interval: int) -> bool:
@@ -146,6 +193,7 @@ class TradingScheduler:
 
         # 전략 초기화
         self.strategy.initialize()
+        strategy_pnl_baseline = self._extract_strategy_realized_pnl()
         watchlist = self.strategy.get_watchlist()
         logger.info("감시 종목: %d개", len(watchlist))
 
@@ -169,51 +217,125 @@ class TradingScheduler:
 
         # 틱 루프
         while not self._shutdown and self._is_trading_time(datetime.now()):
-            if not self.strategy.should_continue():
-                logger.info("전략이 종료를 요청했습니다.")
-                halted_for_day = True
-                break
+            try:
+                if not self.strategy.should_continue():
+                    logger.info("전략이 종료를 요청했습니다.")
+                    halted_for_day = True
+                    break
 
-            # 동적 watchlist 갱신
-            watchlist = self.strategy.get_watchlist()
+                # 동적 watchlist 갱신
+                watchlist = self.strategy.get_watchlist()
 
-            # 배치 시세 조회 (30종목씩)
-            all_quotes = []
-            for i in range(0, len(watchlist), 30):
-                chunk = watchlist[i:i+30]
-                chunk_quotes = self.market_data.get_multi_price(chunk)
-                all_quotes.extend(chunk_quotes)
+                # 배치 시세 조회 (30종목씩)
+                all_quotes = []
+                for i in range(0, len(watchlist), 30):
+                    chunk = watchlist[i:i+30]
+                    chunk_quotes = self.market_data.get_multi_price(chunk)
+                    all_quotes.extend(chunk_quotes)
 
-            if all_quotes:
-                for q in all_quotes:
-                    logger.debug(
-                        "[%s] %s %s원 (%+.2f%%)",
-                        q.symbol, q.name,
-                        f"{q.current_price:,}", q.change_rate,
-                    )
+                if all_quotes:
+                    for q in all_quotes:
+                        logger.debug(
+                            "[%s] %s %s원 (%+.2f%%)",
+                            q.symbol, q.name,
+                            f"{q.current_price:,}", q.change_rate,
+                        )
 
-                orders = self.strategy.on_batch_tick(all_quotes)
-                if orders:
-                    logger.info("주문 %d건 제출", len(orders))
-                    results = self.executor.submit_orders(orders)
-                    for r in results:
-                        self.strategy.on_order_filled(r)
+                    orders = self.strategy.on_batch_tick(all_quotes)
+                    if orders:
+                        logger.info("주문 %d건 제출", len(orders))
+                        results = self.executor.submit_orders(orders)
+                        for r in results:
+                            self.strategy.on_order_filled(r)
 
-            self._interruptible_sleep(tick_interval)
+                self._interruptible_sleep(tick_interval)
+            except requests.exceptions.RequestException as e:
+                if self._shutdown:
+                    break
+                logger.warning(
+                    "장중 네트워크 오류: %s (10초 후 재시도)",
+                    e,
+                )
+                self._interruptible_sleep(max(10, tick_interval))
+            except Exception:
+                if self._shutdown:
+                    break
+                logger.exception("장중 루프 오류 (10초 후 재시도)")
+                self._interruptible_sleep(max(10, tick_interval))
 
         logger.info("--- 트레이딩 세션 종료 ---")
 
         # 종료 시 잔고 요약
         balance = self._fetch_balance_with_retry("세션 종료 잔고 조회", max_attempts=2, base_delay_seconds=1)
         if balance:
+            session_pnl = self._resolve_session_profit_loss(
+                balance,
+                strategy_pnl_baseline=strategy_pnl_baseline,
+            )
             logger.info(
                 "최종 잔고 — 평가금액: %s원 | 손익: %s원",
                 f"{balance.total_eval_amount:,}",
-                f"{balance.total_profit_loss:,}",
+                f"{session_pnl:,}",
             )
         else:
             logger.warning("세션 종료 잔고 조회 실패: 오늘 요약 로그를 생략합니다.")
         return halted_for_day
+
+    def _resolve_session_profit_loss(self, balance, strategy_pnl_baseline=None) -> int:
+        """세션 종료 손익 값을 결정한다.
+
+        우선순위:
+        1) 계좌 API 당일 실현손익
+        2) 전략 세션 증분 순손익(누적 - 세션 시작 시점)
+        3) 잔고 API 평가손익 (fallback)
+        """
+        realized_pnl = self.account.get_realized_profit_loss()
+        if realized_pnl is not None:
+            return realized_pnl
+
+        strategy_pnl = self._extract_strategy_realized_pnl()
+        if strategy_pnl is not None:
+            if strategy_pnl_baseline is not None:
+                try:
+                    baseline = int(strategy_pnl_baseline)
+                    session_delta = int(strategy_pnl) - baseline
+                    logger.warning(
+                        "실현손익 API 조회 실패로 전략 세션 증분 순손익을 사용합니다: %s원 "
+                        "(세션시작=%s원, 현재누적=%s원)",
+                        f"{session_delta:,}",
+                        f"{baseline:,}",
+                        f"{int(strategy_pnl):,}",
+                    )
+                    return session_delta
+                except (TypeError, ValueError):
+                    pass
+            logger.warning(
+                "실현손익 API 조회 실패로 전략 누적 순손익을 사용합니다: %s원",
+                f"{strategy_pnl:,}",
+            )
+            return strategy_pnl
+
+        logger.warning(
+            "실현손익 집계 실패로 평가손익 fallback을 사용합니다: %s원",
+            f"{balance.total_profit_loss:,}",
+        )
+        return int(balance.total_profit_loss)
+
+    def _extract_strategy_realized_pnl(self):
+        """전략 객체에서 누적 순손익을 추출한다."""
+        daily_pnl = getattr(self.strategy, "daily_pnl", None)
+        if daily_pnl is None:
+            return None
+
+        for field in ("realized_net_pnl", "realized_pnl", "total_pnl"):
+            if not hasattr(daily_pnl, field):
+                continue
+            try:
+                return int(getattr(daily_pnl, field))
+            except (TypeError, ValueError):
+                continue
+
+        return None
 
     def _fetch_balance_with_retry(
         self,
