@@ -15,6 +15,7 @@ build/
 # Logs
 logs/*.log
 logs/
+state/momentum_scalp_daily_state.json
 
 # IDE
 .vscode/
