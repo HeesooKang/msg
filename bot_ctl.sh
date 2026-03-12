@@ -7,14 +7,18 @@
 #   ./bot_ctl.sh restart   — 봇 재시작
 #   ./bot_ctl.sh status    — 상태 확인
 #   ./bot_ctl.sh today     — 오늘 손익 + 실행 상태 간단 확인
+#   ./bot_ctl.sh report    — 오늘 성적표 확인
+#   ./bot_ctl.sh gate      — 실투자 전환 게이트 확인
 #   ./bot_ctl.sh uninstall — launchd에서 제거
 #   ./bot_ctl.sh logs      — 로그 실시간 확인
 #   ./bot_ctl.sh monitor   — 장중 핵심 이벤트 필터 로그
 
+PROJECT_ROOT="$HOME/msg"
 PLIST_NAME="com.kis.trading-bot"
-PLIST_SRC="$HOME/msg/com.kis.trading-bot.plist"
+PLIST_SRC="$PROJECT_ROOT/com.kis.trading-bot.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
-TRADING_LOG="$HOME/msg/logs/trading.log"
+TRADING_LOG="$PROJECT_ROOT/logs/trading.log"
+REPORT_ROOT="$PROJECT_ROOT/reports"
 
 print_service_status() {
     echo "=== 서비스 상태 ==="
@@ -22,15 +26,27 @@ print_service_status() {
 }
 
 print_today_pnl() {
-    local today final_line realized_line legacy_line latest_line pnl balance ts
+    local today archive_log final_line realized_line legacy_line latest_line pnl balance ts line_ts latest_ts
     today=$(date +%F)
-    final_line=$(grep -h "^$today .*최종 잔고" "$TRADING_LOG" "$TRADING_LOG.$today" 2>/dev/null | tail -1)
+    archive_log="$HOME/msg/logs/$(date +%Y)/$(date +%m)/trading.log.$today"
+    final_line=$(grep -h "^$today .*최종 잔고" "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
+    realized_line=$(grep -h "^$today .*누적순손익:" "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
+    legacy_line=$(grep -h "^$today .*누적: " "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
+
+    for line in "$final_line" "$realized_line" "$legacy_line"; do
+        [ -z "$line" ] && continue
+        line_ts=$(echo "$line" | awk '{print $1" "$2}')
+        if [ -z "$latest_line" ] || [[ "$line_ts" > "$latest_ts" ]]; then
+            latest_line="$line"
+            latest_ts="$line_ts"
+        fi
+    done
 
     echo "=== 오늘 손익 ==="
-    if [ -n "$final_line" ]; then
-        ts=$(echo "$final_line" | awk '{print $1" "$2}')
-        balance=$(echo "$final_line" | awk -F'평가금액: | \\| 손익: ' '{print $2}')
-        pnl=$(echo "$final_line" | awk -F'손익: ' '{print $2}')
+    if [ -n "$latest_line" ] && echo "$latest_line" | grep -q "최종 잔고"; then
+        ts=$(echo "$latest_line" | awk '{print $1" "$2}')
+        balance=$(echo "$latest_line" | awk -F'평가금액: | \\| 손익: ' '{print $2}')
+        pnl=$(echo "$latest_line" | awk -F'손익: ' '{print $2}')
         echo "→ 최신 집계 시각: $ts"
         echo "→ 기준: 세션 종료 잔고 요약"
         echo "→ 평가금액: $balance"
@@ -38,27 +54,25 @@ print_today_pnl() {
         return
     fi
 
-    realized_line=$(grep -h "^$today .*누적순손익:" "$TRADING_LOG" "$TRADING_LOG.$today" 2>/dev/null | tail -1)
-    if [ -n "$realized_line" ]; then
-        ts=$(echo "$realized_line" | awk '{print $1" "$2}')
-        pnl=$(echo "$realized_line" | sed -nE 's/.*누적순손익: ([^)]*).*/\1/p')
+    if [ -n "$latest_line" ] && echo "$latest_line" | grep -q "누적순손익:"; then
+        ts=$(echo "$latest_line" | awk '{print $1" "$2}')
+        pnl=$(echo "$latest_line" | sed -nE 's/.*누적순손익: ([^)]*).*/\1/p')
         echo "→ 최신 집계 시각: $ts"
         echo "→ 기준: 최근 체결 누적순손익"
         echo "→ 손익: $pnl"
         return
     fi
 
-    legacy_line=$(grep -h "^$today .*누적: " "$TRADING_LOG" "$TRADING_LOG.$today" 2>/dev/null | tail -1)
-    if [ -n "$legacy_line" ]; then
-        ts=$(echo "$legacy_line" | awk '{print $1" "$2}')
-        pnl=$(echo "$legacy_line" | sed -nE 's/.*누적: ([^)]*).*/\1/p')
+    if [ -n "$latest_line" ] && echo "$latest_line" | grep -q "누적: "; then
+        ts=$(echo "$latest_line" | awk '{print $1" "$2}')
+        pnl=$(echo "$latest_line" | sed -nE 's/.*누적: ([^)]*).*/\1/p')
         echo "→ 최신 집계 시각: $ts"
         echo "→ 기준: 최근 체결 누적손익"
         echo "→ 손익: $pnl"
         return
     fi
 
-    latest_line=$(grep -h "^$today " "$TRADING_LOG" "$TRADING_LOG.$today" 2>/dev/null | tail -1)
+    latest_line=$(grep -h "^$today " "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
     if [ -n "$latest_line" ]; then
         ts=$(echo "$latest_line" | awk '{print $1" "$2}')
         echo "→ 최신 집계 시각: $ts"
@@ -79,6 +93,14 @@ monitor_filtered_logs() {
     else
         tail -f "$TRADING_LOG" 2>/dev/null | grep --line-buffered -E "$pattern"
     fi
+}
+
+print_today_report() {
+    PYTHONPATH="$PROJECT_ROOT" python3 -m src.performance_reporting today --report-root "$REPORT_ROOT"
+}
+
+print_real_trade_gate() {
+    PYTHONPATH="$PROJECT_ROOT" python3 -m src.performance_reporting gate --report-root "$REPORT_ROOT"
 }
 
 load_service() {
@@ -126,6 +148,12 @@ case "$1" in
         echo ""
         print_today_pnl
         ;;
+    report)
+        print_today_report
+        ;;
+    gate)
+        print_real_trade_gate
+        ;;
     uninstall)
         launchctl stop "$PLIST_NAME" 2>/dev/null
         launchctl unload "$PLIST_DST" 2>/dev/null
@@ -139,7 +167,7 @@ case "$1" in
         monitor_filtered_logs
         ;;
     *)
-        echo "사용법: $0 {install|start|stop|restart|status|today|uninstall|logs|monitor}"
+        echo "사용법: $0 {install|start|stop|restart|status|today|report|gate|uninstall|logs|monitor}"
         exit 1
         ;;
 esac

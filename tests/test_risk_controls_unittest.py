@@ -206,6 +206,364 @@ class RiskControlTests(unittest.TestCase):
         strategy.on_batch_tick([])
         self.assertTrue(strategy._halted)
 
+    def test_momentum_daily_loss_limit_waits_for_open_profit_offset(self):
+        cfg = MomentumScalpConfig(
+            daily_loss_limit=-500,
+            daily_total_loss_limit=-1_500,
+            enable_regime_adaptive=False,
+            take_profit_pct=20.0,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.initialize()
+        strategy.daily_pnl.realized_net_pnl = -600
+        strategy.positions["005930"] = PositionState(
+            symbol="005930",
+            buy_price=10_000,
+            quantity=1,
+            invested_amount=10_000,
+        )
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_600,
+            change=600,
+            change_rate=6.0,
+            open_price=10_050,
+            high_price=10_650,
+            low_price=9_980,
+            volume=500_000,
+            trade_amount=5_300_000_000,
+        )
+
+        orders = strategy.on_batch_tick([quote])
+
+        self.assertFalse(strategy._halted)
+
+    def test_momentum_backtest_regime_uses_quotes_without_market_data(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(inverse_enabled=False),
+        )
+        quotes = [
+            Quote(
+                symbol="AAA",
+                name="AAA",
+                current_price=9_000,
+                change=-1_000,
+                change_rate=-10.0,
+                open_price=9_800,
+                high_price=9_900,
+                low_price=8_900,
+                volume=500_000,
+                trade_amount=4_500_000_000,
+            ),
+            Quote(
+                symbol="BBB",
+                name="BBB",
+                current_price=9_200,
+                change=-800,
+                change_rate=-8.0,
+                open_price=9_700,
+                high_price=9_800,
+                low_price=9_100,
+                volume=420_000,
+                trade_amount=3_864_000_000,
+            ),
+            Quote(
+                symbol="CCC",
+                name="CCC",
+                current_price=9_400,
+                change=-600,
+                change_rate=-6.0,
+                open_price=9_900,
+                high_price=10_000,
+                low_price=9_300,
+                volume=410_000,
+                trade_amount=3_854_000_000,
+            ),
+        ]
+
+        strategy.on_batch_tick(quotes)
+
+        self.assertGreaterEqual(strategy._bear_score, 2)
+        self.assertTrue(strategy._bear_market)
+
+    def test_momentum_regime_profile_uses_neutral_for_bear_score_one(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(inverse_enabled=False),
+        )
+        strategy._bear_score = 1
+
+        self.assertEqual(strategy._resolve_regime_profile_name(), "neutral")
+        self.assertFalse(strategy._is_bullish_regime())
+
+    def test_momentum_regime_specific_max_position_count(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                max_position_count=3,
+                bull_max_position_count=4,
+                neutral_max_position_count=2,
+                bear_max_position_count=1,
+                inverse_enabled=False,
+            ),
+        )
+
+        strategy._bear_score = 0
+        self.assertEqual(strategy._effective_max_position_count(), 4)
+
+        strategy._bear_score = 1
+        self.assertEqual(strategy._effective_max_position_count(), 2)
+
+        strategy._bear_score = 2
+        self.assertEqual(strategy._effective_max_position_count(), 1)
+
+    def test_momentum_daily_loss_limit_still_halts_when_total_net_below_limit(self):
+        cfg = MomentumScalpConfig(
+            daily_loss_limit=-500,
+            daily_total_loss_limit=-1_500,
+            enable_regime_adaptive=False,
+            take_profit_pct=20.0,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.initialize()
+        strategy.daily_pnl.realized_net_pnl = -600
+        strategy.positions["005930"] = PositionState(
+            symbol="005930",
+            buy_price=10_000,
+            quantity=1,
+            invested_amount=10_000,
+        )
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_050,
+            change=50,
+            change_rate=0.5,
+            open_price=10_000,
+            high_price=10_080,
+            low_price=9_980,
+            volume=500_000,
+            trade_amount=5_025_000_000,
+        )
+
+        orders = strategy.on_batch_tick([quote])
+
+        self.assertTrue(strategy._halted)
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].symbol, "005930")
+        self.assertEqual(orders[0].side, OrderSide.SELL)
+
+    def test_bullish_marginal_signal_requires_full_confirmation(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=True,
+            enable_early_session_guard=True,
+            entry_confirmation_ticks=2,
+            bullish_min_momentum_score=2.6,
+            bullish_min_momentum_score_floor=3.4,
+            bullish_fast_entry_score_bonus=0.9,
+            bullish_fast_entry_change_rate_bonus=0.6,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 0
+
+        now = datetime.now()
+        strategy._session_start_at = now - timedelta(minutes=30)
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=71_000,
+            change=800,
+            change_rate=1.14,
+            open_price=70_200,
+            high_price=71_100,
+            low_price=70_100,
+            volume=300_000,
+            trade_amount=21_300_000_000,
+        )
+
+        first = strategy._can_confirm_entry(
+            quote=quote,
+            score=3.4,
+            is_scale_in=False,
+            now=now,
+        )
+        second = strategy._can_confirm_entry(
+            quote=quote,
+            score=3.4,
+            is_scale_in=False,
+            now=now + timedelta(seconds=10),
+        )
+
+        self.assertFalse(first)
+        self.assertTrue(second)
+
+    def test_bullish_exceptional_signal_can_still_fast_enter(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=True,
+            enable_early_session_guard=True,
+            entry_confirmation_ticks=2,
+            bullish_min_momentum_score=2.6,
+            bullish_min_momentum_score_floor=3.4,
+            bullish_fast_entry_score_bonus=0.9,
+            bullish_fast_entry_change_rate_bonus=0.6,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 0
+
+        now = datetime.now()
+        strategy._session_start_at = now - timedelta(minutes=30)
+        quote = Quote(
+            symbol="000660",
+            name="SK하이닉스",
+            current_price=210_000,
+            change=4_500,
+            change_rate=2.19,
+            open_price=205_500,
+            high_price=210_500,
+            low_price=205_000,
+            volume=350_000,
+            trade_amount=73_500_000_000,
+        )
+
+        fast_entry = strategy._can_confirm_entry(
+            quote=quote,
+            score=4.5,
+            is_scale_in=False,
+            now=now,
+        )
+
+        self.assertTrue(fast_entry)
+
+    def test_bullish_trailing_stop_waits_for_meaningful_gain(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=True,
+            take_profit_pct=5.0,
+            trailing_stop_pct=-0.7,
+            trailing_stop_activation_gain_pct=0.8,
+            bullish_trailing_stop_activation_gain_pct_floor=1.1,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 0
+        strategy.positions["005930"] = PositionState(
+            symbol="005930",
+            buy_price=10_000,
+            quantity=1,
+            invested_amount=10_000,
+        )
+
+        pos = strategy.positions["005930"]
+        pos.high_since_buy = 10_100  # +1.0%
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_000,
+            change=0,
+            change_rate=0.0,
+            open_price=10_000,
+            high_price=10_100,
+            low_price=9_980,
+            volume=200_000,
+            trade_amount=2_000_000_000,
+        )
+
+        self.assertIsNone(strategy._evaluate_sell(quote))
+
+    def test_take_profit_defers_when_round_trip_net_is_negative(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=False,
+            take_profit_pct=0.1,
+            enable_cost_aware_profit_exit=True,
+            min_profit_exit_net_pnl=1,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.positions["005930"] = PositionState(
+            symbol="005930",
+            buy_price=10_000,
+            quantity=1,
+            invested_amount=10_000,
+        )
+
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_010,
+            change=10,
+            change_rate=0.1,
+            open_price=10_000,
+            high_price=10_020,
+            low_price=9_990,
+            volume=100_000,
+            trade_amount=100_100_000,
+        )
+
+        self.assertIsNone(strategy._evaluate_sell(quote))
+
+    def test_trailing_stop_defers_when_round_trip_net_is_negative(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=False,
+            take_profit_pct=5.0,
+            trailing_stop_pct=-0.7,
+            trailing_stop_activation_gain_pct=0.5,
+            enable_cost_aware_profit_exit=True,
+            min_profit_exit_net_pnl=1,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.positions["005930"] = PositionState(
+            symbol="005930",
+            buy_price=10_000,
+            quantity=10,
+            invested_amount=100_000,
+        )
+        strategy.positions["005930"].high_since_buy = 10_100
+
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_020,
+            change=20,
+            change_rate=0.2,
+            open_price=10_000,
+            high_price=10_100,
+            low_price=9_990,
+            volume=100_000,
+            trade_amount=1_002_000_000,
+        )
+
+        self.assertIsNone(strategy._evaluate_sell(quote))
+
+    def test_inverse_take_profit_defers_when_round_trip_net_is_negative(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=False,
+            inverse_enabled=True,
+            inverse_take_profit_pct=0.1,
+            enable_cost_aware_profit_exit=True,
+            min_profit_exit_net_pnl=1,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.positions["252670"] = PositionState(
+            symbol="252670",
+            buy_price=10_000,
+            quantity=1,
+            invested_amount=10_000,
+        )
+
+        quote = Quote(
+            symbol="252670",
+            name="KODEX 200선물인버스2X",
+            current_price=10_010,
+            change=10,
+            change_rate=0.1,
+            open_price=10_000,
+            high_price=10_020,
+            low_price=9_990,
+            volume=100_000,
+            trade_amount=100_100_000,
+        )
+
+        self.assertIsNone(strategy._evaluate_inverse_sell(quote))
+
     def test_momentum_sync_positions_from_account(self):
         strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
         account_positions = [
@@ -228,6 +586,107 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(pos.quantity, 3)
         self.assertEqual(pos.buy_price, 71234)
         self.assertEqual(pos.invested_amount, 213702)
+
+    def test_restored_position_uses_saved_buy_time_for_time_exit(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=False,
+            restored_position_grace_seconds=0,
+            max_position_holding_minutes=10,
+            take_profit_pct=5.0,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        restored_buy_time = datetime.now() - timedelta(minutes=35)
+        strategy._loaded_position_meta = {
+            "005930": {
+                "buy_time": restored_buy_time.isoformat(timespec="seconds"),
+                "invested_amount": 10_000,
+                "high_since_buy": 10_000,
+            }
+        }
+
+        strategy.sync_positions_from_account(
+            [
+                Position(
+                    symbol="005930",
+                    name="삼성전자",
+                    quantity=1,
+                    avg_price=10_000.0,
+                    current_price=10_050,
+                    eval_amount=0,
+                    profit_loss=0,
+                    profit_rate=0.0,
+                )
+            ]
+        )
+
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_050,
+            change=50,
+            change_rate=0.5,
+            open_price=10_000,
+            high_price=10_100,
+            low_price=9_980,
+            volume=500_000,
+            trade_amount=5_025_000_000,
+        )
+
+        orders = strategy.on_batch_tick([quote])
+
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].symbol, "005930")
+        self.assertEqual(orders[0].side, OrderSide.SELL)
+
+    def test_restored_position_keeps_grace_before_time_exit(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=False,
+            restored_position_grace_seconds=300,
+            max_position_holding_minutes=10,
+            take_profit_pct=5.0,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        restored_buy_time = datetime.now() - timedelta(minutes=35)
+        strategy._loaded_position_meta = {
+            "005930": {
+                "buy_time": restored_buy_time.isoformat(timespec="seconds"),
+                "invested_amount": 10_000,
+                "high_since_buy": 10_000,
+            }
+        }
+
+        strategy.sync_positions_from_account(
+            [
+                Position(
+                    symbol="005930",
+                    name="삼성전자",
+                    quantity=1,
+                    avg_price=10_000.0,
+                    current_price=10_050,
+                    eval_amount=0,
+                    profit_loss=0,
+                    profit_rate=0.0,
+                )
+            ]
+        )
+
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_050,
+            change=50,
+            change_rate=0.5,
+            open_price=10_000,
+            high_price=10_100,
+            low_price=9_980,
+            volume=500_000,
+            trade_amount=5_025_000_000,
+        )
+
+        orders = strategy.on_batch_tick([quote])
+
+        self.assertEqual(orders, [])
+        self.assertTrue(strategy.positions["005930"].is_restored)
 
     def test_inverse_buy_blocked_by_global_loss_cooldown(self):
         cfg = MomentumScalpConfig(

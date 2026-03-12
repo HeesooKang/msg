@@ -1,0 +1,37 @@
+{
+  "date": "2026-03-12",
+  "generated_at": "2026-03-12T13:49:15",
+  "trading_mode": "paper",
+  "balance": {
+    "total_eval_amount": 9789909,
+    "total_deposit": 9796723,
+    "total_profit_loss": 0,
+    "total_profit_rate": 0.0
+  },
+  "pnl": {
+    "session_pnl": -942,
+    "realized_gross_pnl": -760,
+    "realized_net_pnl": -942,
+    "fees_paid": 24,
+    "taxes_paid": 158,
+    "winning_net_pnl_sum": 0,
+    "losing_net_pnl_sum": -930,
+    "largest_win_net": 0,
+    "largest_loss_net": -930
+  },
+  "trades": {
+    "closed_trades": 1,
+    "wins": 0,
+    "losses": 1,
+    "breakeven": 0,
+    "win_rate": 0.0,
+    "average_net_per_trade": -942.0,
+    "average_win_net": 0.0,
+    "average_loss_net": -930.0,
+    "profit_factor": 0.0
+  },
+  "strategy": {
+    "halted": false,
+    "open_positions_count": 0
+  }
+}

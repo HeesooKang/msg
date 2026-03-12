@@ -3,7 +3,7 @@
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -134,16 +134,20 @@ class BacktestEngine:
             day_trades = 0
 
             # 전략 초기화 (매일 리셋)
+            self._set_strategy_time(self._tick_datetime(day, 0))
             self.strategy.initialize()
+            self._load_strategy_avg_volumes(day)
 
             # 하루 4틱 시뮬레이션
             ticks = self._generate_day_ticks(day)
-            for tick_quotes in ticks:
+            for tick_idx, tick_quotes in enumerate(ticks):
                 if not tick_quotes:
                     continue
 
+                self._set_strategy_time(self._tick_datetime(day, tick_idx))
+
                 # 이전 틱의 대기 주문 체결
-                self._fill_pending_orders(tick_quotes, result)
+                day_trades += self._fill_pending_orders(tick_quotes, result, trade_date=day)
 
                 # 전략 실행
                 orders = self.strategy.on_batch_tick(tick_quotes)
@@ -152,12 +156,14 @@ class BacktestEngine:
             # 대기 주문은 종가에 체결 시도
             if self._pending_orders:
                 close_quotes = ticks[-1] if ticks else []
-                self._fill_pending_orders(close_quotes, result)
+                self._set_strategy_time(self._tick_datetime(day, len(ticks) - 1))
+                day_trades += self._fill_pending_orders(close_quotes, result, trade_date=day)
 
             # 장마감 강제 청산: 잔여 포지션을 종가에 매도 (오버나잇 없음)
             if self._positions and ticks:
                 close_quotes = ticks[-1]
                 quote_map = {q.symbol: q for q in close_quotes}
+                self._set_strategy_time(self._tick_datetime(day, len(ticks) - 1))
                 for symbol in list(self._positions.keys()):
                     q = quote_map.get(symbol)
                     if not q:
@@ -190,6 +196,7 @@ class BacktestEngine:
                         quantity=pos["qty"], price=fill_price, pnl=net_pnl,
                     ))
                     result.total_trades += 1
+                    day_trades += 1
 
             # 일별 기록
             portfolio_value = self._capital
@@ -203,6 +210,7 @@ class BacktestEngine:
 
         # 최종 자본 계산 (매일 청산하므로 잔여 포지션 없음)
         result.final_capital = self._capital
+        self._set_strategy_time(None)
 
         logger.info("백테스트 완료")
         return result
@@ -276,9 +284,15 @@ class BacktestEngine:
 
         return ticks
 
-    def _fill_pending_orders(self, quotes: List[Quote], result: BacktestResult):
+    def _fill_pending_orders(
+        self,
+        quotes: List[Quote],
+        result: BacktestResult,
+        trade_date: str,
+    ) -> int:
         """대기 주문을 현재 틱 가격에 체결한다."""
         quote_map = {q.symbol: q for q in quotes}
+        filled_count = 0
 
         for order in self._pending_orders:
             q = quote_map.get(order.symbol)
@@ -309,10 +323,11 @@ class BacktestEngine:
                 self.strategy.on_order_filled(fill_result)
 
                 result.trade_records.append(TradeRecord(
-                    date="", symbol=order.symbol, side="buy",
+                    date=trade_date, symbol=order.symbol, side="buy",
                     quantity=order.quantity, price=fill_price,
                 ))
                 result.total_trades += 1
+                filled_count += 1
 
             elif order.side == OrderSide.SELL:
                 pos = self._positions.pop(order.symbol, None)
@@ -344,9 +359,33 @@ class BacktestEngine:
                 self.strategy.on_order_filled(fill_result)
 
                 result.trade_records.append(TradeRecord(
-                    date="", symbol=order.symbol, side="sell",
+                    date=trade_date, symbol=order.symbol, side="sell",
                     quantity=order.quantity, price=fill_price, pnl=net_pnl,
                 ))
                 result.total_trades += 1
+                filled_count += 1
 
         self._pending_orders = []
+        return filled_count
+
+    def _set_strategy_time(self, now: Optional[datetime]):
+        if hasattr(self.strategy, "set_simulated_now"):
+            self.strategy.set_simulated_now(now)
+
+    def _tick_datetime(self, day: str, tick_idx: int) -> datetime:
+        slots = ((9, 0), (9, 20), (11, 0), (15, 10))
+        hour, minute = slots[min(max(tick_idx, 0), len(slots) - 1)]
+        return datetime.strptime(day, "%Y%m%d").replace(hour=hour, minute=minute)
+
+    def _load_strategy_avg_volumes(self, day: str):
+        if not hasattr(self.strategy, "load_avg_volumes"):
+            return
+
+        avg_volumes: Dict[str, int] = {}
+        for symbol, df in self.data.items():
+            history = df[df.index < day].tail(5)
+            if history.empty:
+                continue
+            avg_volumes[symbol] = int(history["acml_vol"].mean())
+
+        self.strategy.load_avg_volumes(avg_volumes)

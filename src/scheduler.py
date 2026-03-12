@@ -12,6 +12,7 @@ from src.config import Config
 from src.executor import OrderExecutor, RiskManager
 from src.logger_setup import setup_logger
 from src.market_data import MarketDataAPI
+from src.performance_reporting import update_performance_reports
 from src.strategy import BaseStrategy
 from src.trading import TradingAPI
 
@@ -277,9 +278,26 @@ class TradingScheduler:
                 f"{balance.total_eval_amount:,}",
                 f"{session_pnl:,}",
             )
+            self._write_performance_reports(balance, session_pnl)
         else:
             logger.warning("세션 종료 잔고 조회 실패: 오늘 요약 로그를 생략합니다.")
         return halted_for_day
+
+    def _write_performance_reports(self, balance, session_pnl: int):
+        try:
+            paths = update_performance_reports(
+                strategy=self.strategy,
+                balance=balance,
+                session_pnl=session_pnl,
+                trading_mode=self.config.trading_mode,
+            )
+            logger.info(
+                "성과 리포트 갱신: score=%s, gate=%s",
+                paths["scorecard"]["json"],
+                paths["readiness"]["json"],
+            )
+        except Exception:
+            logger.exception("성과 리포트 생성 실패")
 
     def _resolve_session_profit_loss(self, balance, strategy_pnl_baseline=None) -> int:
         """세션 종료 손익 값을 결정한다.

@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime
 from typing import List, Optional
 
@@ -83,21 +84,39 @@ class MarketDataAPI:
             period: D(일), W(주), M(월), Y(년)
             adjusted: True면 수정주가
         """
-        res = self.client.get(
-            api_url="/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
-            tr_id="FHKST03010100",
-            params={
-                "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_INPUT_ISCD": symbol,
-                "FID_INPUT_DATE_1": start_date,
-                "FID_INPUT_DATE_2": end_date,
-                "FID_PERIOD_DIV_CODE": period,
-                "FID_ORG_ADJ_PRC": "0" if adjusted else "1",
-            },
-        )
-        if not res.success:
-            logger.error("기간별 시세 조회 실패 [%s]: %s", symbol, res.error_message)
-            return pd.DataFrame()
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": symbol,
+            "FID_INPUT_DATE_1": start_date,
+            "FID_INPUT_DATE_2": end_date,
+            "FID_PERIOD_DIV_CODE": period,
+            "FID_ORG_ADJ_PRC": "0" if adjusted else "1",
+        }
+
+        res = None
+        for attempt in range(4):
+            res = self.client.get(
+                api_url="/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                tr_id="FHKST03010100",
+                params=params,
+            )
+            if res.success:
+                break
+
+            error_message = res.error_message or ""
+            is_rate_limited = "EGW00201" in error_message or "초당 거래건수를 초과" in error_message
+            if not is_rate_limited or attempt == 3:
+                logger.error("기간별 시세 조회 실패 [%s]: %s", symbol, error_message)
+                return pd.DataFrame()
+
+            backoff = 1.0 + (attempt * 0.7)
+            logger.warning(
+                "기간별 시세 조회 재시도 [%s]: 호출 제한 감지 (%d/4, %.1fs 후 재시도)",
+                symbol,
+                attempt + 1,
+                backoff,
+            )
+            time.sleep(backoff)
 
         data = res.output2
         if not data:

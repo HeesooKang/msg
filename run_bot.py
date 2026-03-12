@@ -34,9 +34,13 @@ def get_strategy():
     # === 전략 설정 (여기서 수정) ===
     strategy_config = MomentumScalpConfig(
         seed_money=1_000_000,             # 시드 100만원
-        max_position_count=0,             # 0이면 seed_money/per_stock_amount 기준 자동 계산
+        max_position_count=2,             # 기본 슬롯은 2개, 레짐별로 추가 조정
+        bull_max_position_count=2,        # 강세장: 롱 최대 2종목
+        neutral_max_position_count=1,     # 중립장: 롱 최대 1종목
+        bear_max_position_count=1,        # 약세장: 롱 최대 1종목 (mode B면 신규 롱 차단)
         per_stock_amount=100_000,         # 종목당 10만원
-        max_per_stock_amount=300_000,     # 종목당 최대 노출 30만원
+        max_per_stock_amount=100_000,     # 단일 포지션 과도한 스케일인 방지
+        enable_pyramiding=False,          # 장중 추격 추가매수 비활성화
         daily_profit_target=12_000,       # 일일 목표 +1.2만원
         daily_loss_limit=-2_500,          # 일일 손실한도 -2.5천원
         daily_total_loss_limit=-5_000,    # 보조 손실컷(순실현+미실현 추정): -0.5만원
@@ -48,7 +52,7 @@ def get_strategy():
         min_change_rate=1.2,              # 등락률 하한 강화
         min_volume=180_000,               # 거래량 하한
         min_price=5_000,                  # 저가주 제외 강화
-        enable_expected_net_filter=True,   # 진입 전 기대순익 필터
+        enable_expected_net_filter=False,  # 고정 기대순익 필터는 비활성화
         expected_move_pct=2.4,            # 기대 상승폭 +2.4%
         min_expected_net_profit=800,      # 최소 기대순익 기본값
         min_expected_rr_ratio=0.65,       # 최소 기대 RR 기본값
@@ -59,13 +63,16 @@ def get_strategy():
         volume_spike_ratio_min=1.2,
         volume_spike_abs_min=4_000,
         bullish_min_change_rate=0.45,
-        bullish_min_momentum_score=2.6,
+        bullish_min_momentum_score=3.4,
+        bullish_min_momentum_score_floor=3.4,
         bullish_volume_spike_ratio_adjustment=0.30,
         bullish_volume_spike_abs_min_ratio=0.6,
         # 모멘텀 진입 보강
         enable_entry_confirmation=True,       # 연속 재확인 후 진입
         entry_confirmation_ticks=2,
         scale_in_confirmation_ticks=1,
+        bullish_fast_entry_score_bonus=0.9,
+        bullish_fast_entry_change_rate_bonus=0.6,
         entry_confirmation_window_seconds=240,
         entry_confirmation_min_score_tolerance=0.4,
         entry_confirmation_max_pullback_pct=-0.6,   # 최초 대비 -0.6% 허용
@@ -81,12 +88,13 @@ def get_strategy():
         enable_pool_persistence_gate=True,
         momentum_pool_persistence_window=3,
         momentum_pool_min_appearances=2,
-        bear_market_mode='A',             # 'A'=약세 필터 보완 적용, 'B'=완전 차단
+        bear_market_mode='B',             # 약세장에서는 신규 롱을 완전 차단
         min_bear_score_for_new_long=2,    # 약세 점수 2 이상이면 신규 롱 차단
         bear_market_entry_score=3.8,      # 약세장에서도 모멘텀 강할 때 예외 허용
         cooldown_seconds=900,             # 매도 후 재매수 쿨다운(레짐별 보정)
-        loss_trade_cooldown_seconds=420,  # 손실 체결 후 전역 진입 정지(레짐별 보정)
+        loss_trade_cooldown_seconds=900,  # 손실 체결 후 재진입 대기 확대
         trailing_stop_activation_gain_pct=0.8,
+        bullish_trailing_stop_activation_gain_pct_floor=1.1,
         max_position_holding_minutes=45,
         block_new_entry_windows=["15:00-15:21"],  # 장마감 직전만 신규진입 차단
         enable_dynamic_entry_block_windows=True,   # 약세장에서는 차단 시간대 자동 해제
@@ -100,7 +108,7 @@ def get_strategy():
         enable_regime_adaptive=True,      # 시장 레짐 자동 전환(상승/약세/중립)
         # 인버스 ETF 설정
         inverse_enabled=True,             # 인버스 진입 활성화
-        inverse_max_positions=1,          # 인버스 최대 1종목
+        inverse_max_positions=2,          # 인버스 최대 2종목
         bearish_threshold=2,              # 약세 점수 2 이상 시 진입
         inverse_min_bear_score=3,         # 인버스는 약세 점수 3 이상에서만 신규진입
         inverse_min_change_rate=1.4,      # 인버스 최소 등락률 +1.4%
