@@ -6,6 +6,7 @@
     launchd:     자동 실행됨
 """
 
+import json
 import subprocess
 import sys
 import os
@@ -14,10 +15,74 @@ import os
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
+READINESS_REPORT_PATH = os.path.join(PROJECT_ROOT, "reports", "real-trade-readiness.json")
+REAL_MONEY_STAGE_RULES = {
+    1: {
+        "capital_scale": 0.25,
+        "daily_loss_limit": -1_250,
+        "daily_total_loss_limit": -1_250,
+        "profit_protect_threshold": 2_000,
+        "daily_profit_target": 2_500,
+    },
+    2: {
+        "capital_scale": 0.50,
+        "daily_loss_limit": -2_500,
+        "daily_total_loss_limit": -2_500,
+        "profit_protect_threshold": 4_000,
+        "daily_profit_target": 5_000,
+    },
+    3: {
+        "capital_scale": 1.00,
+        "daily_loss_limit": -5_000,
+        "daily_total_loss_limit": -5_000,
+        "profit_protect_threshold": 8_000,
+        "daily_profit_target": 10_000,
+    },
+}
 
 from src.config import Config
 from src.logger_setup import setup_logger
 from src.main import run_scheduled
+
+
+def _load_allowed_real_money_stage() -> int:
+    try:
+        with open(READINESS_REPORT_PATH, encoding="utf-8") as fp:
+            payload = json.load(fp)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "실계좌 모드를 시작하려면 paper gate 리포트가 먼저 필요합니다. "
+            "reports/real-trade-readiness.json 파일이 없습니다."
+        ) from exc
+
+    promotion = payload.get("promotion", {})
+    stage = int(promotion.get("current_stage_allowed", 0) or 0)
+    if stage < 1:
+        raise RuntimeError(
+            "paper gate를 통과하기 전에는 실계좌 모드가 자동 보류됩니다. "
+            "최근 reports/real-trade-readiness.json을 확인해주십시오."
+        )
+    return min(stage, 3)
+
+
+def _apply_real_money_stage(strategy_config, stage: int) -> tuple[int, float]:
+    rules = REAL_MONEY_STAGE_RULES[int(stage)]
+    scale = float(rules["capital_scale"])
+
+    strategy_config.seed_money = max(100_000, int(strategy_config.seed_money * scale))
+    strategy_config.per_stock_amount = max(40_000, int(strategy_config.per_stock_amount * scale))
+    strategy_config.max_per_stock_amount = max(
+        strategy_config.per_stock_amount,
+        int(strategy_config.max_per_stock_amount * scale),
+    )
+    strategy_config.long_stop_loss_cap_amount = max(700, int(strategy_config.long_stop_loss_cap_amount * scale))
+    strategy_config.inverse_stop_loss_cap_amount = max(500, int(strategy_config.inverse_stop_loss_cap_amount * scale))
+    strategy_config.per_position_stop_loss = -abs(strategy_config.long_stop_loss_cap_amount)
+    strategy_config.daily_loss_limit = int(rules["daily_loss_limit"])
+    strategy_config.daily_total_loss_limit = int(rules["daily_total_loss_limit"])
+    strategy_config.profit_protect_threshold = int(rules["profit_protect_threshold"])
+    strategy_config.daily_profit_target = int(rules["daily_profit_target"])
+    return stage, scale
 
 
 def get_strategy():
@@ -34,37 +99,56 @@ def get_strategy():
     # === 전략 설정 (여기서 수정) ===
     strategy_config = MomentumScalpConfig(
         seed_money=1_000_000,             # 시드 100만원
-        max_position_count=2,             # 기본 슬롯은 2개, 레짐별로 추가 조정
+        max_position_count=2,             # 강세 최대 2개, 그 외 레짐별 제한
         bull_max_position_count=2,        # 강세장: 롱 최대 2종목
         neutral_max_position_count=1,     # 중립장: 롱 최대 1종목
-        bear_max_position_count=1,        # 약세장: 롱 최대 1종목 (mode B면 신규 롱 차단)
-        per_stock_amount=100_000,         # 종목당 10만원
-        max_per_stock_amount=100_000,     # 단일 포지션 과도한 스케일인 방지
+        soft_bear_max_position_count=0,   # 완만약세(점수 2): 롱 기본 비활성화
+        bear_max_position_count=0,        # 강한 약세(점수 3): 롱 비활성화
+        per_stock_amount=200_000,         # 기본 슬롯 예산 20만원
+        max_per_stock_amount=350_000,     # 단일 포지션 최대 35만원
+        capital_utilization_pct=0.70,     # 기본 총노출 예산 70%
+        bull_capital_utilization_pct=0.70,      # 강세장: 총노출 70%
+        neutral_capital_utilization_pct=0.35,   # 중립장: 총노출 35%
+        soft_bear_capital_utilization_pct=0.00, # 완만약세: 신규 노출 0%
+        bear_capital_utilization_pct=0.20,      # 강한 약세: 총노출 20% (인버스 중심)
+        max_single_position_pct=0.35,           # 기본 단일 종목 최대 35%
+        bull_max_single_position_pct=0.35,      # 강세장: 단일 종목 최대 35%
+        neutral_max_single_position_pct=0.25,   # 중립장: 단일 종목 최대 25%
+        soft_bear_max_single_position_pct=0.20, # 완만약세: 단일 종목 최대 20%
+        bear_max_single_position_pct=0.20,      # 강한 약세: 단일 종목 최대 20%
         enable_pyramiding=False,          # 장중 추격 추가매수 비활성화
-        daily_profit_target=12_000,       # 일일 목표 +1.2만원
-        daily_loss_limit=-2_500,          # 일일 손실한도 -2.5천원
-        daily_total_loss_limit=-5_000,    # 보조 손실컷(순실현+미실현 추정): -0.5만원
-        enable_unrealized_loss_guard=True,  # 미실현추정 손실컷 활성화
-        per_position_stop_loss=-1_200,    # 포지션당 손절 -1,200원
-        take_profit_pct=2.5,              # 익절 +2.5%
-        trailing_stop_pct=-0.7,           # 추적손절 -0.7%
-        min_momentum_score=3.8,           # 진입 점수 강화
-        min_change_rate=1.2,              # 등락률 하한 강화
+        daily_profit_target=10_000,       # 일일 목표 +1만원
+        profit_protect_threshold=8_000,   # +8천원부터 신규 진입 축소
+        stage1_loss_threshold=-3_000,     # -3천원부터 손실 1단계
+        daily_loss_limit=-5_000,          # 일일 하드스탑 -5천원
+        daily_total_loss_limit=-5_000,    # 실현+미실현 합산 하드스탑 -5천원
+        enable_unrealized_loss_guard=True,
+        loss_stage_exposure_scale=0.5,    # 손실 1단계: 총노출 절반
+        profit_protect_exposure_scale=0.6,  # 수익 보호 단계: 신규 노출 축소
+        per_position_stop_loss=-2_500,    # 로그 표시용 기준 손절
+        long_stop_loss_notional_pct=0.007,
+        long_stop_loss_cap_amount=2_500,
+        inverse_stop_loss_notional_pct=0.006,
+        inverse_stop_loss_cap_amount=1_800,
+        take_profit_pct=1.6,              # 강세장 기본 익절값
+        trailing_stop_pct=-0.55,          # 강세장 기본 추적손절
+        min_momentum_score=3.2,           # 기본 모멘텀 점수
+        min_change_rate=0.8,              # 기본 등락률 하한
         min_volume=180_000,               # 거래량 하한
         min_price=5_000,                  # 저가주 제외 강화
         enable_expected_net_filter=False,  # 고정 기대순익 필터는 비활성화
-        expected_move_pct=2.4,            # 기대 상승폭 +2.4%
-        min_expected_net_profit=800,      # 최소 기대순익 기본값
-        min_expected_rr_ratio=0.65,       # 최소 기대 RR 기본값
+        expected_move_pct=1.4,
+        min_expected_net_profit=300,
+        min_expected_rr_ratio=0.45,
         # 거래량 스파이크 강제
         enable_volume_spike_filter=True,
         volume_spike_min_history=2,
-        volume_spike_ratio=1.8,
-        volume_spike_ratio_min=1.2,
-        volume_spike_abs_min=4_000,
+        volume_spike_ratio=1.7,
+        volume_spike_ratio_min=1.1,
+        volume_spike_abs_min=3_500,
         bullish_min_change_rate=0.45,
-        bullish_min_momentum_score=3.4,
-        bullish_min_momentum_score_floor=3.4,
+        bullish_min_momentum_score=3.0,
+        bullish_min_momentum_score_floor=3.0,
         bullish_volume_spike_ratio_adjustment=0.30,
         bullish_volume_spike_abs_min_ratio=0.6,
         # 모멘텀 진입 보강
@@ -76,8 +160,7 @@ def get_strategy():
         entry_confirmation_window_seconds=240,
         entry_confirmation_min_score_tolerance=0.4,
         entry_confirmation_max_pullback_pct=-0.6,   # 최초 대비 -0.6% 허용
-        # 눌림목(리테스트) 필터: 급등 종목은 고점 추격 대신 조정 확인 후 진입
-        enable_pullback_entry_filter=True,
+        enable_pullback_entry_filter=False,
         pullback_activation_change_rate=1.8,
         pullback_required_min_drop_pct=0.2,
         pullback_allowed_max_drop_pct=1.4,
@@ -88,9 +171,20 @@ def get_strategy():
         enable_pool_persistence_gate=True,
         momentum_pool_persistence_window=3,
         momentum_pool_min_appearances=2,
-        bear_market_mode='B',             # 약세장에서는 신규 롱을 완전 차단
-        min_bear_score_for_new_long=2,    # 약세 점수 2 이상이면 신규 롱 차단
-        bear_market_entry_score=3.8,      # 약세장에서도 모멘텀 강할 때 예외 허용
+        neutral_pullback_min_drop_pct=0.35,
+        neutral_pullback_max_drop_pct=1.2,
+        neutral_min_runup_from_open_pct=1.0,
+        neutral_reclaim_buffer_pct=0.10,
+        neutral_chase_block_proximity_pct=0.25,
+        soft_bear_inverse_pullback_min_drop_pct=0.12,
+        soft_bear_inverse_pullback_max_drop_pct=0.8,
+        soft_bear_inverse_min_runup_from_open_pct=0.4,
+        soft_bear_inverse_reclaim_buffer_pct=0.05,
+        soft_bear_inverse_min_change_rate=0.9,
+        soft_bear_inverse_min_momentum=2.2,
+        bear_market_mode='A',             # 점수 2는 제한적 대응, 점수 3부터는 예외 통과형
+        min_bear_score_for_new_long=2,
+        bear_market_entry_score=4.0,      # 강한 약세장 예외 진입은 더 강한 모멘텀만 허용
         cooldown_seconds=900,             # 매도 후 재매수 쿨다운(레짐별 보정)
         loss_trade_cooldown_seconds=900,  # 손실 체결 후 재진입 대기 확대
         trailing_stop_activation_gain_pct=0.8,
@@ -108,15 +202,28 @@ def get_strategy():
         enable_regime_adaptive=True,      # 시장 레짐 자동 전환(상승/약세/중립)
         # 인버스 ETF 설정
         inverse_enabled=True,             # 인버스 진입 활성화
-        inverse_max_positions=2,          # 인버스 최대 2종목
+        inverse_max_positions=1,          # 강한 약세 인버스 최대 1종목
+        soft_bear_inverse_max_positions=0,  # 완만약세(점수 2)에서는 인버스 신규 진입 금지
         bearish_threshold=2,              # 약세 점수 2 이상 시 진입
-        inverse_min_bear_score=3,         # 인버스는 약세 점수 3 이상에서만 신규진입
-        inverse_min_change_rate=1.4,      # 인버스 최소 등락률 +1.4%
-        inverse_min_momentum=3.0,         # 인버스 최소 모멘텀 강화
-        inverse_trailing_stop_activation_gain_pct=0.45,  # +0.45% 이익 후에만 인버스 추적손절
+        inverse_min_bear_score=3,
+        inverse_min_change_rate=2.5,
+        inverse_min_momentum=4.5,
+        inverse_take_profit_pct=0.9,
+        inverse_trailing_stop_activation_gain_pct=0.5,
     )
 
-    return MomentumScalpStrategy(market_data, strategy_config)
+    real_money_stage = 0
+    capital_scale = 1.0
+    if not config.is_paper:
+        real_money_stage, capital_scale = _apply_real_money_stage(
+            strategy_config,
+            _load_allowed_real_money_stage(),
+        )
+
+    strategy = MomentumScalpStrategy(market_data, strategy_config)
+    strategy._real_money_stage = real_money_stage
+    strategy._capital_scale = capital_scale
+    return strategy
 
 
 def main():

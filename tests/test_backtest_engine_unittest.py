@@ -1,8 +1,10 @@
 import unittest
 
 import pandas as pd
+from types import SimpleNamespace
 
 from src.backtest.engine import BacktestEngine
+from src.backtest.intraday_engine import IntradayBacktestEngine
 from src.models import Order, OrderResult, OrderSide, Quote
 from src.strategy import BaseStrategy
 
@@ -12,6 +14,8 @@ class DummyBacktestStrategy(BaseStrategy):
         self.has_position = False
         self.completed_round_trip = False
         self.simulated_times = []
+        self.positions = {}
+        self._inverse_symbols = set()
 
     def set_simulated_now(self, now):
         if now is not None:
@@ -20,6 +24,7 @@ class DummyBacktestStrategy(BaseStrategy):
     def initialize(self):
         self.has_position = False
         self.completed_round_trip = False
+        self.positions = {}
 
     def get_watchlist(self):
         return ["AAA"]
@@ -40,9 +45,17 @@ class DummyBacktestStrategy(BaseStrategy):
             return
         if result.side == OrderSide.BUY:
             self.has_position = True
+            self.positions[result.symbol] = SimpleNamespace(
+                entry_setup_name="bull_breakout",
+                entry_reason="local_high_breakout",
+                regime_label="bull",
+                bear_score=0,
+                planned_risk_stage="normal",
+            )
         elif result.side == OrderSide.SELL:
             self.has_position = False
             self.completed_round_trip = True
+            self.positions.pop(result.symbol, None)
 
     def should_continue(self):
         return True
@@ -74,9 +87,66 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertEqual(len(result.daily_records), 1)
         self.assertEqual(result.daily_records[0].trade_count, 2)
         self.assertEqual([record.date for record in result.trade_records], ["20260102", "20260102"])
+        self.assertEqual(result.trade_records[0].setup_name, "bull_breakout")
+        self.assertEqual(result.trade_records[1].regime_label, "bull")
         self.assertTrue(strategy.simulated_times)
         self.assertEqual(strategy.simulated_times[0].strftime("%Y%m%d"), "20260102")
         self.assertEqual(strategy.simulated_times[-1].hour, 15)
+
+    def test_intraday_engine_replays_minute_bars(self):
+        strategy = DummyBacktestStrategy()
+        data = {
+            "AAA": pd.DataFrame(
+                [
+                    {
+                        "symbol": "AAA",
+                        "trade_date": "20260102",
+                        "trade_time": "090000",
+                        "timestamp": "2026-01-02 09:00:00",
+                        "open": 10_000,
+                        "high": 10_020,
+                        "low": 9_990,
+                        "close": 10_010,
+                        "volume": 1_000,
+                        "cumulative_volume": 1_000,
+                    },
+                    {
+                        "symbol": "AAA",
+                        "trade_date": "20260102",
+                        "trade_time": "090100",
+                        "timestamp": "2026-01-02 09:01:00",
+                        "open": 10_010,
+                        "high": 10_040,
+                        "low": 10_000,
+                        "close": 10_030,
+                        "volume": 1_200,
+                        "cumulative_volume": 2_200,
+                    },
+                    {
+                        "symbol": "AAA",
+                        "trade_date": "20260102",
+                        "trade_time": "090200",
+                        "timestamp": "2026-01-02 09:02:00",
+                        "open": 10_030,
+                        "high": 10_060,
+                        "low": 10_020,
+                        "close": 10_050,
+                        "volume": 1_400,
+                        "cumulative_volume": 3_600,
+                    },
+                ]
+            )
+        }
+        engine = IntradayBacktestEngine(strategy=strategy, data=data, initial_capital=100_000)
+
+        result = engine.run("20260102", "20260102")
+
+        self.assertEqual(result.total_trades, 2)
+        self.assertEqual(len(result.daily_records), 1)
+        self.assertEqual(result.daily_records[0].trade_count, 2)
+        self.assertEqual([record.date for record in result.trade_records], ["20260102", "20260102"])
+        self.assertTrue(strategy.simulated_times)
+        self.assertEqual(strategy.simulated_times[0].strftime("%Y%m%d"), "20260102")
 
 
 if __name__ == "__main__":

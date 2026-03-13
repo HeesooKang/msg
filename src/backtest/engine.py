@@ -22,6 +22,12 @@ class TradeRecord:
     quantity: int
     price: int
     pnl: int = 0
+    setup_name: str = ""
+    entry_reason: str = ""
+    regime_label: str = ""
+    bear_score: int = 0
+    planned_risk_stage: str = ""
+    is_inverse: bool = False
 
 
 @dataclass
@@ -110,7 +116,7 @@ class BacktestEngine:
         self.tax_rate = tax_rate
 
         self._capital = initial_capital
-        self._positions: Dict[str, dict] = {}  # {symbol: {price, qty, buy_comm}}
+        self._positions: Dict[str, dict] = {}  # {symbol: {price, qty, buy_comm, ...meta}}
         self._daily_pnl = 0
         self._pending_orders: List[Order] = []
 
@@ -194,6 +200,12 @@ class BacktestEngine:
                     result.trade_records.append(TradeRecord(
                         date=day, symbol=symbol, side="sell",
                         quantity=pos["qty"], price=fill_price, pnl=net_pnl,
+                        setup_name=str(pos.get("setup_name", "") or ""),
+                        entry_reason=str(pos.get("entry_reason", "") or ""),
+                        regime_label=str(pos.get("regime_label", "") or ""),
+                        bear_score=int(pos.get("bear_score", 0) or 0),
+                        planned_risk_stage=str(pos.get("planned_risk_stage", "") or ""),
+                        is_inverse=bool(pos.get("is_inverse", False)),
                     ))
                     result.total_trades += 1
                     day_trades += 1
@@ -321,10 +333,17 @@ class BacktestEngine:
                     quantity=order.quantity, price=fill_price,
                 )
                 self.strategy.on_order_filled(fill_result)
+                self._positions[order.symbol].update(self._extract_strategy_position_meta(order.symbol))
 
                 result.trade_records.append(TradeRecord(
                     date=trade_date, symbol=order.symbol, side="buy",
                     quantity=order.quantity, price=fill_price,
+                    setup_name=str(self._positions[order.symbol].get("setup_name", "") or ""),
+                    entry_reason=str(self._positions[order.symbol].get("entry_reason", "") or ""),
+                    regime_label=str(self._positions[order.symbol].get("regime_label", "") or ""),
+                    bear_score=int(self._positions[order.symbol].get("bear_score", 0) or 0),
+                    planned_risk_stage=str(self._positions[order.symbol].get("planned_risk_stage", "") or ""),
+                    is_inverse=bool(self._positions[order.symbol].get("is_inverse", False)),
                 ))
                 result.total_trades += 1
                 filled_count += 1
@@ -361,6 +380,12 @@ class BacktestEngine:
                 result.trade_records.append(TradeRecord(
                     date=trade_date, symbol=order.symbol, side="sell",
                     quantity=order.quantity, price=fill_price, pnl=net_pnl,
+                    setup_name=str(pos.get("setup_name", "") or ""),
+                    entry_reason=str(pos.get("entry_reason", "") or ""),
+                    regime_label=str(pos.get("regime_label", "") or ""),
+                    bear_score=int(pos.get("bear_score", 0) or 0),
+                    planned_risk_stage=str(pos.get("planned_risk_stage", "") or ""),
+                    is_inverse=bool(pos.get("is_inverse", False)),
                 ))
                 result.total_trades += 1
                 filled_count += 1
@@ -371,6 +396,25 @@ class BacktestEngine:
     def _set_strategy_time(self, now: Optional[datetime]):
         if hasattr(self.strategy, "set_simulated_now"):
             self.strategy.set_simulated_now(now)
+
+    def _extract_strategy_position_meta(self, symbol: str) -> dict:
+        positions = getattr(self.strategy, "positions", None)
+        if not isinstance(positions, dict):
+            return {}
+
+        pos = positions.get(symbol)
+        if pos is None:
+            return {}
+
+        inverse_symbols = getattr(self.strategy, "_inverse_symbols", set()) or set()
+        return {
+            "setup_name": str(getattr(pos, "entry_setup_name", "") or ""),
+            "entry_reason": str(getattr(pos, "entry_reason", "") or ""),
+            "regime_label": str(getattr(pos, "regime_label", "") or ""),
+            "bear_score": int(getattr(pos, "bear_score", 0) or 0),
+            "planned_risk_stage": str(getattr(pos, "planned_risk_stage", "") or ""),
+            "is_inverse": symbol in inverse_symbols,
+        }
 
     def _tick_datetime(self, day: str, tick_idx: int) -> datetime:
         slots = ((9, 0), (9, 20), (11, 0), (15, 10))

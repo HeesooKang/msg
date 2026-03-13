@@ -72,6 +72,47 @@ class RiskControlTests(unittest.TestCase):
         # total_room=50,000, stock_room=100,000 -> alloc=50,000
         self.assertEqual(alloc, 50_000)
 
+    def test_momentum_allocation_uses_regime_budget_ratios(self):
+        cfg = MomentumScalpConfig(
+            seed_money=1_000_000,
+            max_position_count=2,
+            bull_max_position_count=2,
+            neutral_max_position_count=1,
+            per_stock_amount=220_000,
+            max_per_stock_amount=500_000,
+            capital_utilization_pct=0.60,
+            bull_capital_utilization_pct=0.84,
+            neutral_capital_utilization_pct=0.68,
+            max_single_position_pct=0.50,
+            bull_max_single_position_pct=0.42,
+            neutral_max_single_position_pct=0.36,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+
+        strategy._bear_score = 0
+        bull_alloc = strategy._compute_buy_allocation("AAA", current_price=10_000)
+        self.assertEqual(bull_alloc, 420_000)
+
+        strategy._bear_score = 1
+        neutral_alloc = strategy._compute_buy_allocation("BBB", current_price=10_000)
+        self.assertEqual(neutral_alloc, 360_000)
+
+    def test_momentum_allocation_compounds_realized_pnl_intraday(self):
+        cfg = MomentumScalpConfig(
+            seed_money=1_000_000,
+            max_position_count=2,
+            per_stock_amount=200_000,
+            max_per_stock_amount=500_000,
+            capital_utilization_pct=0.60,
+            max_single_position_pct=0.50,
+            profit_protect_threshold=999_999,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.daily_pnl.realized_net_pnl = 100_000
+
+        alloc = strategy._compute_buy_allocation("AAA", current_price=10_000)
+        self.assertEqual(alloc, 330_000)
+
     def test_api_client_keeps_ctca_tr_id_in_paper(self):
         config = Config(
             trading_mode="paper",
@@ -298,6 +339,16 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(strategy._resolve_regime_profile_name(), "neutral")
         self.assertFalse(strategy._is_bullish_regime())
 
+    def test_momentum_regime_profile_uses_soft_bear_for_bear_score_two(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(inverse_enabled=False),
+        )
+        strategy._bear_score = 2
+
+        self.assertEqual(strategy._resolve_regime_profile_name(), "soft_bear")
+        self.assertFalse(strategy._is_bullish_regime())
+
     def test_momentum_regime_specific_max_position_count(self):
         strategy = MomentumScalpStrategy(
             market_data=None,
@@ -305,6 +356,7 @@ class RiskControlTests(unittest.TestCase):
                 max_position_count=3,
                 bull_max_position_count=4,
                 neutral_max_position_count=2,
+                soft_bear_max_position_count=1,
                 bear_max_position_count=1,
                 inverse_enabled=False,
             ),
@@ -319,10 +371,48 @@ class RiskControlTests(unittest.TestCase):
         strategy._bear_score = 2
         self.assertEqual(strategy._effective_max_position_count(), 1)
 
+        strategy._bear_score = 3
+        self.assertEqual(strategy._effective_max_position_count(), 1)
+
+    def test_momentum_soft_bear_inverse_profile_relaxes_thresholds(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                inverse_enabled=True,
+                inverse_max_positions=2,
+                soft_bear_inverse_max_positions=1,
+                inverse_min_bear_score=3,
+                inverse_min_change_rate=1.4,
+                inverse_min_momentum=3.0,
+            ),
+        )
+
+        strategy._bear_score = 2
+        self.assertEqual(strategy._resolve_regime_profile_name(), "soft_bear")
+        self.assertEqual(strategy._regime_inverse_max_positions(), 1)
+        self.assertEqual(strategy._regime_inverse_min_bear_score(), 2)
+        self.assertLess(strategy._regime_inverse_min_change_rate(), 1.4)
+        self.assertLess(strategy._regime_inverse_min_momentum(), 3.0)
+
+        strategy._bear_score = 3
+        self.assertEqual(strategy._resolve_regime_profile_name(), "bear")
+        self.assertEqual(strategy._regime_inverse_max_positions(), 2)
+        self.assertEqual(strategy._regime_inverse_min_bear_score(), 3)
+
+    def test_neutral_profile_relaxes_long_entry_thresholds(self):
+        cfg = MomentumScalpConfig()
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 1
+
+        self.assertEqual(strategy._resolve_regime_profile_name(), "neutral")
+        self.assertLess(strategy._regime_min_change_rate(), cfg.min_change_rate)
+        self.assertLess(strategy._regime_min_momentum_score(), cfg.min_momentum_score)
+        self.assertLess(strategy._regime_volume_spike_ratio(), cfg.volume_spike_ratio)
+
     def test_momentum_daily_loss_limit_still_halts_when_total_net_below_limit(self):
         cfg = MomentumScalpConfig(
             daily_loss_limit=-500,
-            daily_total_loss_limit=-1_500,
+            daily_total_loss_limit=-500,
             enable_regime_adaptive=False,
             take_profit_pct=20.0,
         )
@@ -354,6 +444,161 @@ class RiskControlTests(unittest.TestCase):
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0].symbol, "005930")
         self.assertEqual(orders[0].side, OrderSide.SELL)
+
+    def test_neutral_chase_block_rejects_day_high_without_pullback(self):
+        cfg = MomentumScalpConfig(
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 1
+
+        history = [
+            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
+            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_120, 9_950, 20_000, 200_000),
+            Quote("011700", "미원", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 30_000, 300_000),
+            Quote("011700", "미원", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 40_000, 400_000),
+        ]
+        for quote in history:
+            strategy._record_recent_quote(quote)
+
+        ok, _, reject = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.4)
+        self.assertFalse(ok)
+        self.assertEqual(reject, "neutral_chase_block")
+
+    def test_neutral_pullback_reclaim_requires_pullback_and_reclaim(self):
+        cfg = MomentumScalpConfig(
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 1
+
+        history = [
+            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
+            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
+            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
+            Quote("011700", "미원", 10_205, 205, 2.05, 10_000, 10_220, 9_950, 40_000, 400_000),
+        ]
+        for quote in history:
+            strategy._record_recent_quote(quote)
+
+        ok, setup_name, reason = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.1)
+        self.assertTrue(ok)
+        self.assertEqual(setup_name, "neutral_pullback_reclaim")
+        self.assertIn("pullback_reclaim", reason)
+
+    def test_soft_bear_inverse_setup_allows_reclaim_after_pullback(self):
+        cfg = MomentumScalpConfig(
+            inverse_enabled=True,
+            inverse_etfs=["252670"],
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 2
+
+        history = [
+            Quote("252670", "KODEX 인버스", 2_000, 0, 0.0, 2_000, 2_000, 1_995, 10_000, 20_000_000),
+            Quote("252670", "KODEX 인버스", 2_030, 30, 1.5, 2_000, 2_030, 1_995, 20_000, 40_000_000),
+            Quote("252670", "KODEX 인버스", 2_020, 20, 1.0, 2_000, 2_030, 1_995, 30_000, 60_000_000),
+            Quote("252670", "KODEX 인버스", 2_032, 32, 1.6, 2_000, 2_032, 1_995, 40_000, 80_000_000),
+        ]
+        for quote in history:
+            strategy._record_recent_quote(quote)
+
+        ok, setup_name, reason = strategy._passes_soft_bear_inverse_setup(history[-1], score=2.4)
+        self.assertTrue(ok)
+        self.assertEqual(setup_name, "soft_bear_inverse_breakdown")
+        self.assertIn("weak_rebound_failure", reason)
+
+    def test_order_fill_preserves_entry_metadata(self):
+        cfg = MomentumScalpConfig(
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+            enable_entry_confirmation=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 1
+
+        history = [
+            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
+            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
+            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
+            Quote("011700", "미원", 10_205, 205, 2.05, 10_000, 10_220, 9_950, 40_000, 400_000),
+        ]
+        for quote in history:
+            strategy._quotes_cache[quote.symbol] = quote
+            strategy._record_recent_quote(quote)
+
+        order = strategy._evaluate_buy(history[-1])
+        self.assertIsNotNone(order)
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="011700",
+                side=OrderSide.BUY,
+                quantity=order.quantity,
+                price=history[-1].current_price,
+            )
+        )
+
+        pos = strategy.positions["011700"]
+        self.assertEqual(pos.entry_setup_name, "neutral_pullback_reclaim")
+        self.assertEqual(pos.entry_reason, "pullback_reclaim")
+        self.assertEqual(pos.regime_label, "neutral")
+        self.assertEqual(pos.bear_score, 1)
+
+    def test_soft_bear_profile_can_disable_inverse_by_config(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                inverse_enabled=True,
+                inverse_max_positions=1,
+                soft_bear_inverse_max_positions=0,
+            ),
+        )
+        strategy._bear_score = 2
+
+        self.assertEqual(strategy._resolve_regime_profile_name(), "soft_bear")
+        self.assertEqual(strategy._regime_inverse_max_positions(), 0)
+
+    def test_stage1_blocks_new_neutral_long_entries(self):
+        cfg = MomentumScalpConfig(
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+            stage1_loss_threshold=-3_000,
+            profit_protect_threshold=999_999,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 1
+        strategy.daily_pnl.realized_net_pnl = -3_100
+
+        history = [
+            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
+            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
+            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
+            Quote("011700", "미원", 10_205, 205, 2.05, 10_000, 10_220, 9_950, 40_000, 400_000),
+        ]
+        for quote in history:
+            strategy._record_recent_quote(quote)
+
+        order = strategy._evaluate_buy(history[-1])
+        self.assertIsNone(order)
+
+    def test_dynamic_stop_amount_uses_tighter_notional_cap(self):
+        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
+        long_pos = PositionState(symbol="AAA", buy_price=10_000, quantity=20, invested_amount=200_000)
+        inverse_pos = PositionState(symbol="252670", buy_price=2_000, quantity=500, invested_amount=1_000_000)
+
+        self.assertEqual(strategy._long_stop_loss_amount(long_pos), -1_400)
+        self.assertEqual(strategy._inverse_stop_loss_amount(inverse_pos), -1_800)
 
     def test_bullish_marginal_signal_requires_full_confirmation(self):
         cfg = MomentumScalpConfig(
@@ -435,6 +680,62 @@ class RiskControlTests(unittest.TestCase):
         )
 
         self.assertTrue(fast_entry)
+
+    def test_neutral_strong_signal_can_fast_enter(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=True,
+            entry_confirmation_ticks=2,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 1
+
+        now = datetime.now()
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=71_000,
+            change=900,
+            change_rate=strategy._regime_min_change_rate() + 0.2,
+            open_price=70_100,
+            high_price=71_050,
+            low_price=70_000,
+            volume=300_000,
+            trade_amount=21_300_000_000,
+        )
+
+        fast_entry = strategy._can_confirm_entry(
+            quote=quote,
+            score=strategy._regime_min_momentum_score() + 0.4,
+            is_scale_in=False,
+            now=now,
+        )
+
+        self.assertTrue(fast_entry)
+
+    def test_soft_bear_pullback_filter_relaxes_for_mild_breakout(self):
+        cfg = MomentumScalpConfig(
+            enable_regime_adaptive=True,
+            enable_pullback_entry_filter=True,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        quote = Quote(
+            symbol="005930",
+            name="삼성전자",
+            current_price=10_220,
+            change=220,
+            change_rate=2.2,
+            open_price=10_000,
+            high_price=10_225,
+            low_price=9_980,
+            volume=500_000,
+            trade_amount=5_110_000_000,
+        )
+
+        strategy._bear_score = 2
+        self.assertTrue(strategy._passes_pullback_entry_filter(quote, is_scale_in=False))
+
+        strategy._bear_score = 3
+        self.assertFalse(strategy._passes_pullback_entry_filter(quote, is_scale_in=False))
 
     def test_bullish_trailing_stop_waits_for_meaningful_gain(self):
         cfg = MomentumScalpConfig(
@@ -750,10 +1051,11 @@ class RiskControlTests(unittest.TestCase):
             volume=500_000,
             trade_amount=30_000_000_000,
         )
+        strategy._bear_score = 3
 
         for symbol in ("252670", "005930"):
-            strategy._latest_tick_volumes[symbol] = 15_500
-            strategy._recent_tick_volumes[symbol] = deque([10_000, 10_000, 15_500], maxlen=12)
+            strategy._latest_tick_volumes[symbol] = 10_500
+            strategy._recent_tick_volumes[symbol] = deque([10_000, 10_000, 10_500], maxlen=12)
 
         self.assertTrue(strategy._is_volume_spike(inverse_quote, score=2.5))
         self.assertFalse(strategy._is_volume_spike(regular_quote, score=2.5))

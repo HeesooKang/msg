@@ -123,6 +123,60 @@ class MarketDataAPI:
             return pd.DataFrame()
         return pd.DataFrame(data)
 
+    def get_daily_minute_prices(
+        self,
+        symbol: str,
+        target_date: str,
+        end_time: str = "153000",
+        include_past: bool = True,
+        include_fake_ticks: bool = False,
+    ) -> pd.DataFrame:
+        """특정 거래일의 분봉 데이터를 조회한다.
+
+        주식일별분봉조회(v1_국내주식-213)를 사용한다.
+        한 번의 호출에 최대 120건까지만 반환되므로, 호출자는 마지막 분봉의
+        날짜/시간을 이용해 추가 페이지네이션을 수행해야 한다.
+        """
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": symbol,
+            "FID_INPUT_HOUR_1": end_time,
+            "FID_INPUT_DATE_1": target_date,
+            "FID_PW_DATA_INCU_YN": "Y" if include_past else "N",
+            "FID_FAKE_TICK_INCU_YN": "Y" if include_fake_ticks else "",
+        }
+
+        res = None
+        for attempt in range(4):
+            res = self.client.get(
+                api_url="/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+                tr_id="FHKST03010230",
+                params=params,
+            )
+            if res.success:
+                break
+
+            error_message = res.error_message or ""
+            is_rate_limited = "EGW00201" in error_message or "초당 거래건수를 초과" in error_message
+            if not is_rate_limited or attempt == 3:
+                logger.error("일별 분봉 조회 실패 [%s/%s]: %s", symbol, target_date, error_message)
+                return pd.DataFrame()
+
+            backoff = 1.0 + (attempt * 0.7)
+            logger.warning(
+                "일별 분봉 조회 재시도 [%s/%s]: 호출 제한 감지 (%d/4, %.1fs 후 재시도)",
+                symbol,
+                target_date,
+                attempt + 1,
+                backoff,
+            )
+            time.sleep(backoff)
+
+        data = res.output2
+        if not data:
+            return pd.DataFrame()
+        return pd.DataFrame(data)
+
     def get_fluctuation_ranking(
         self,
         count: int = 20,

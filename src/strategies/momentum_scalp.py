@@ -80,9 +80,20 @@ class MomentumScalpConfig:
     max_position_count: int = 0  # 0이면 seed_money/per_stock_amount 기준으로 자동 계산
     bull_max_position_count: Optional[int] = None
     neutral_max_position_count: Optional[int] = None
+    soft_bear_max_position_count: Optional[int] = None
     bear_max_position_count: Optional[int] = None
     per_stock_amount: int = 180_000      # 종목당 기본 할당액
     max_per_stock_amount: int = 500_000  # 종목당 최대 노출 (피라미딩 상한)
+    capital_utilization_pct: float = 1.0  # 총 노출 한도 비율 (기준자본 대비)
+    bull_capital_utilization_pct: Optional[float] = None
+    neutral_capital_utilization_pct: Optional[float] = None
+    soft_bear_capital_utilization_pct: Optional[float] = None
+    bear_capital_utilization_pct: Optional[float] = None
+    max_single_position_pct: float = 1.0  # 단일 종목 최대 노출 비율 (기준자본 대비)
+    bull_max_single_position_pct: Optional[float] = None
+    neutral_max_single_position_pct: Optional[float] = None
+    soft_bear_max_single_position_pct: Optional[float] = None
+    bear_max_single_position_pct: Optional[float] = None
     enable_pyramiding: bool = True
     scale_in_min_profit_pct: float = 0.3
     scale_in_score_bonus: float = 0.8
@@ -152,6 +163,31 @@ class MomentumScalpConfig:
     min_expected_rr_ratio: float = 0.85
     enable_cost_aware_profit_exit: bool = True
     min_profit_exit_net_pnl: int = 1
+    enable_setup_logging: bool = True
+    setup_recent_quote_window: int = 8
+    bull_breakout_hold_ticks: int = 2
+    bull_breakout_buffer_pct: float = 0.03
+    neutral_pullback_min_drop_pct: float = 0.25
+    neutral_pullback_max_drop_pct: float = 1.2
+    neutral_min_runup_from_open_pct: float = 0.8
+    neutral_reclaim_buffer_pct: float = 0.05
+    neutral_chase_block_proximity_pct: float = 0.10
+    soft_bear_inverse_pullback_min_drop_pct: float = 0.12
+    soft_bear_inverse_pullback_max_drop_pct: float = 0.8
+    soft_bear_inverse_min_runup_from_open_pct: float = 0.4
+    soft_bear_inverse_reclaim_buffer_pct: float = 0.05
+    soft_bear_inverse_min_change_rate: float = 0.9
+    soft_bear_inverse_min_momentum: float = 2.2
+    stage1_loss_threshold: int = -3_000
+    profit_protect_threshold: int = 8_000
+    loss_stage_exposure_scale: float = 0.5
+    profit_protect_exposure_scale: float = 0.6
+    long_stop_loss_notional_pct: float = 0.007
+    long_stop_loss_cap_amount: int = 2_500
+    inverse_stop_loss_notional_pct: float = 0.006
+    inverse_stop_loss_cap_amount: int = 1_800
+    stage1_inverse_score_bonus: float = 0.6
+    stage1_inverse_change_bonus: float = 0.2
     # 진입 보강
     enable_entry_confirmation: bool = True          # 1차 후보 후 재확인 대기
     entry_confirmation_ticks: int = 2               # 신규 진입 최소 확인 틱 수
@@ -181,6 +217,7 @@ class MomentumScalpConfig:
     inverse_enabled: bool = False
     inverse_etfs: List[str] = field(default_factory=lambda: DEFAULT_INVERSE_ETFS)
     inverse_max_positions: int = 2           # 인버스 최대 보유 수
+    soft_bear_inverse_max_positions: Optional[int] = None
     inverse_take_profit_pct: float = 1.0     # 인버스 익절 +1.0% (일반보다 빠르게)
     inverse_stop_loss_pct: float = -0.5      # 인버스 손절 -0.5% (타이트)
     inverse_trailing_stop_pct: float = -0.3  # 인버스 추적손절 (고점 -0.3%)
@@ -221,6 +258,11 @@ class PositionState:
     high_since_buy: int = 0
     is_restored: bool = False
     restored_at: Optional[datetime] = None
+    entry_setup_name: str = ""
+    entry_reason: str = ""
+    regime_label: str = ""
+    bear_score: int = 0
+    planned_risk_stage: str = ""
 
     def __post_init__(self):
         if self.invested_amount <= 0:
@@ -292,6 +334,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._halted = False
         self._avg_volumes: Dict[str, int] = {}
         self._quotes_cache: Dict[str, Quote] = {}
+        self._recent_quotes: Dict[str, deque] = {}
         self._sell_cooldown: Dict[str, datetime] = {}
         self._global_loss_cooldown_until: Optional[datetime] = None
         self._startup_rebalance_ticks: int = 0
@@ -322,6 +365,8 @@ class MomentumScalpStrategy(BaseStrategy):
         self._daily_breaker_pnl_offset: int = 0
         self._loaded_position_meta: Dict[str, dict] = {}
         self._simulated_now: Optional[datetime] = None
+        self._risk_stage_label: str = "normal"
+        self._pending_entry_meta: Dict[str, dict] = {}
 
     def set_simulated_now(self, now: Optional[datetime]):
         """백테스트에서 사용할 시뮬레이션 시각을 주입한다."""
@@ -332,6 +377,280 @@ class MomentumScalpStrategy(BaseStrategy):
 
     def _today(self) -> date:
         return self._now().date()
+
+    def _record_recent_quote(self, quote: Quote):
+        window = max(4, int(self.cfg.setup_recent_quote_window))
+        history = self._recent_quotes.setdefault(quote.symbol, deque(maxlen=window))
+        history.append(quote)
+
+    def _get_recent_quotes(self, symbol: str) -> List[Quote]:
+        return list(self._recent_quotes.get(symbol, ()))
+
+    def _current_total_net_pnl(self) -> int:
+        realized_net = self._effective_realized_net_for_breaker()
+        unrealized_net = self._estimate_unrealized_net_pnl()
+        return int(realized_net + unrealized_net)
+
+    def _is_loss_stage_active(self, total_net: Optional[int] = None) -> bool:
+        if total_net is None:
+            total_net = self._current_total_net_pnl()
+        return total_net <= int(self.cfg.stage1_loss_threshold)
+
+    def _is_profit_protect_active(self, total_net: Optional[int] = None) -> bool:
+        if total_net is None:
+            total_net = self._current_total_net_pnl()
+        return total_net >= int(self.cfg.profit_protect_threshold)
+
+    def _current_risk_stage(self, total_net: Optional[int] = None) -> str:
+        if total_net is None:
+            total_net = self._current_total_net_pnl()
+        if total_net <= int(self.cfg.daily_total_loss_limit or self.cfg.daily_loss_limit):
+            return "hard_stop"
+        if total_net >= int(self.cfg.daily_profit_target):
+            return "profit_target"
+        if self._is_loss_stage_active(total_net):
+            return "loss_stage1"
+        if self._is_profit_protect_active(total_net):
+            return "profit_protect"
+        return "normal"
+
+    def _risk_exposure_scale(self, total_net: Optional[int] = None) -> float:
+        scale = 1.0
+        if self._is_loss_stage_active(total_net):
+            scale = min(scale, float(self.cfg.loss_stage_exposure_scale))
+        if self._is_profit_protect_active(total_net):
+            scale = min(scale, float(self.cfg.profit_protect_exposure_scale))
+        return max(0.1, scale)
+
+    def _log_setup_reject(self, quote: Quote, reject_reason: str, message: str, *args):
+        if not self.cfg.enable_setup_logging:
+            return
+        self._log_entry_filter_once_per_minute(
+            quote.symbol,
+            reject_reason,
+            f"진입 거부[{reject_reason}] reject_reason={reject_reason}: " + message,
+            *args,
+        )
+
+    def _log_risk_stage_change(self, stage_label: str, total_net: int):
+        if stage_label == self._risk_stage_label:
+            return
+        self._risk_stage_label = stage_label
+        logger.info("리스크 단계 전환: %s (총손익 %s원)", stage_label, f"{total_net:,}")
+
+    @staticmethod
+    def _pct_move(base_price: int, price: int) -> float:
+        if base_price <= 0:
+            return 0.0
+        return (price - base_price) / base_price * 100
+
+    @staticmethod
+    def _loss_pct(peak_price: int, trough_price: int) -> float:
+        if peak_price <= 0:
+            return 0.0
+        return (peak_price - trough_price) / peak_price * 100
+
+    @staticmethod
+    def _extract_context_token(payload: str, key: str, default: str = "") -> str:
+        marker = f"{key}="
+        for chunk in str(payload or "").split():
+            if chunk.startswith(marker):
+                return chunk[len(marker):]
+        return default
+
+    def _build_entry_metadata(self, symbol: str, setup_name: str, payload: str) -> dict:
+        current_stage = self._current_risk_stage()
+        return {
+            "setup_name": setup_name or self._extract_context_token(payload, "setup_name", "unknown"),
+            "entry_reason": self._extract_context_token(payload, "entry_reason", setup_name or "unknown"),
+            "regime_label": self._resolve_regime_profile_name(),
+            "bear_score": int(self._bear_score),
+            "planned_risk_stage": current_stage,
+            "is_inverse": symbol in self._inverse_symbols,
+        }
+
+    def _append_entry_context(self, payload: str, metadata: dict) -> str:
+        base = str(payload or "").strip()
+        extra = (
+            f"regime_label={metadata.get('regime_label', '')} "
+            f"bear_score={int(metadata.get('bear_score', 0))} "
+            f"planned_risk_stage={metadata.get('planned_risk_stage', '')}"
+        )
+        return f"{base} {extra}".strip()
+
+    def _position_notional(self, pos: PositionState) -> int:
+        return max(0, int(pos.invested_amount or (pos.buy_price * pos.quantity)))
+
+    def _long_stop_loss_amount_for_notional(self, notional: int) -> int:
+        dynamic_stop = int(round(max(0, notional) * self.cfg.long_stop_loss_notional_pct))
+        stop_amount = min(max(1, dynamic_stop), max(1, int(self.cfg.long_stop_loss_cap_amount)))
+        return -stop_amount
+
+    def _inverse_stop_loss_amount_for_notional(self, notional: int) -> int:
+        dynamic_stop = int(round(max(0, notional) * self.cfg.inverse_stop_loss_notional_pct))
+        stop_amount = min(max(1, dynamic_stop), max(1, int(self.cfg.inverse_stop_loss_cap_amount)))
+        return -stop_amount
+
+    def _long_stop_loss_amount(self, pos: PositionState) -> int:
+        return self._long_stop_loss_amount_for_notional(self._position_notional(pos))
+
+    def _inverse_stop_loss_amount(self, pos: PositionState) -> int:
+        return self._inverse_stop_loss_amount_for_notional(self._position_notional(pos))
+
+    def _entry_stop_risk_amount(self, symbol: str, quantity: int, entry_price: int) -> int:
+        notional = max(0, int(quantity) * int(entry_price))
+        if symbol in self._inverse_symbols:
+            return abs(self._inverse_stop_loss_amount_for_notional(notional))
+        return abs(self._long_stop_loss_amount_for_notional(notional))
+
+    def _recent_price_path(self, symbol: str) -> List[int]:
+        return [q.current_price for q in self._get_recent_quotes(symbol) if q.current_price > 0]
+
+    def _recent_local_high(self, symbol: str) -> tuple[int, int]:
+        prices = self._recent_price_path(symbol)
+        if not prices:
+            return 0, -1
+        high_price = max(prices)
+        high_idx = max(idx for idx, price in enumerate(prices) if price == high_price)
+        return high_price, high_idx
+
+    def _recent_local_low_after_index(self, symbol: str, start_idx: int) -> int:
+        prices = self._recent_price_path(symbol)
+        if not prices:
+            return 0
+        tail = prices[start_idx:] if start_idx < len(prices) else prices[-1:]
+        if not tail:
+            return prices[-1]
+        return min(tail)
+
+    def _passes_bull_breakout_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
+        if not self._is_bullish_regime():
+            return False, "", "bull_only"
+        history = self._get_recent_quotes(quote.symbol)
+        hold_ticks = max(2, int(self.cfg.bull_breakout_hold_ticks))
+        if len(history) < hold_ticks + 1:
+            return False, "", "bull_breakout_wait"
+        if quote.change_rate < self._regime_bullish_min_change_rate():
+            return False, "", "bull_change_rate"
+        if score < self._regime_bullish_min_momentum_score():
+            return False, "", "bull_score"
+        if not self._is_volume_spike(quote, score=score):
+            return False, "", "bull_volume"
+
+        prices = [item.current_price for item in history]
+        prior_high = max(prices[:-1])
+        breakout_level = prior_high * (1 + (self.cfg.bull_breakout_buffer_pct / 100))
+        if quote.current_price < breakout_level:
+            return False, "", "bull_breakout_wait"
+
+        recent_hold = history[-hold_ticks:]
+        if any(item.current_price < breakout_level for item in recent_hold):
+            return False, "", "bull_breakout_wait"
+
+        reason = (
+            f"setup_name=bull_breakout entry_reason=local_high_breakout "
+            f"prior_high={prior_high} hold_ticks={hold_ticks}"
+        )
+        return True, "bull_breakout", reason
+
+    def _passes_neutral_pullback_reclaim_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
+        if self._resolve_regime_profile_name() != "neutral":
+            return False, "", "neutral_only"
+        history = self._get_recent_quotes(quote.symbol)
+        if len(history) < 4:
+            return False, "", "pullback_missing"
+        if quote.current_price <= 0 or quote.open_price <= 0:
+            return False, "", "pullback_missing"
+
+        prices = [item.current_price for item in history[:-1]]
+        if not prices:
+            return False, "", "pullback_missing"
+
+        local_high = max(prices)
+        local_high_idx = max(idx for idx, price in enumerate(prices) if price == local_high)
+        pullback_window = prices[local_high_idx + 1:]
+        runup_from_open = self._pct_move(quote.open_price, local_high)
+        proximity_to_day_high = self._loss_pct(max(quote.high_price, quote.current_price), quote.current_price)
+
+        if runup_from_open < self.cfg.neutral_min_runup_from_open_pct:
+            return False, "", "pullback_missing"
+        if not pullback_window:
+            if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
+                return False, "", "neutral_chase_block"
+            return False, "", "pullback_missing"
+
+        pullback_low = min(pullback_window)
+        pullback_drop = self._loss_pct(local_high, pullback_low)
+        if pullback_drop < self.cfg.neutral_pullback_min_drop_pct:
+            if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
+                return False, "", "neutral_chase_block"
+            return False, "", "pullback_missing"
+        if pullback_drop > self.cfg.neutral_pullback_max_drop_pct:
+            return False, "", "pullback_broken"
+        if self._pct_move(quote.open_price, quote.current_price) <= 0:
+            return False, "", "reclaim_failed"
+
+        reclaim_level = int(round(local_high * (1 - self.cfg.neutral_reclaim_buffer_pct / 100)))
+        if quote.current_price < reclaim_level:
+            return False, "", "reclaim_failed"
+        if score < self._regime_min_momentum_score():
+            return False, "", "neutral_score"
+        if quote.change_rate < self._regime_min_change_rate():
+            return False, "", "neutral_change_rate"
+        if not self._is_volume_spike(quote, score=score):
+            return False, "", "neutral_volume"
+
+        reason = (
+            f"setup_name=neutral_pullback_reclaim entry_reason=pullback_reclaim "
+            f"local_high={local_high} drop_pct={pullback_drop:.2f}"
+        )
+        return True, "neutral_pullback_reclaim", reason
+
+    def _passes_soft_bear_inverse_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
+        if self._resolve_regime_profile_name() != "soft_bear":
+            return False, "", "soft_bear_only"
+        history = self._get_recent_quotes(quote.symbol)
+        if len(history) < 4:
+            return False, "", "soft_bear_inverse_fail"
+        if quote.current_price <= 0 or quote.open_price <= 0:
+            return False, "", "soft_bear_inverse_fail"
+
+        prices = [item.current_price for item in history[:-1]]
+        if not prices:
+            return False, "", "soft_bear_inverse_fail"
+
+        local_high = max(prices)
+        local_high_idx = max(idx for idx, price in enumerate(prices) if price == local_high)
+        pullback_window = prices[local_high_idx + 1:]
+        if not pullback_window:
+            return False, "", "soft_bear_inverse_fail"
+
+        runup_from_open = self._pct_move(quote.open_price, local_high)
+        if runup_from_open < self.cfg.soft_bear_inverse_min_runup_from_open_pct:
+            return False, "", "soft_bear_inverse_fail"
+
+        pullback_low = min(pullback_window)
+        pullback_drop = self._loss_pct(local_high, pullback_low)
+        if pullback_drop < self.cfg.soft_bear_inverse_pullback_min_drop_pct:
+            return False, "", "soft_bear_inverse_fail"
+        if pullback_drop > self.cfg.soft_bear_inverse_pullback_max_drop_pct:
+            return False, "", "soft_bear_inverse_fail"
+
+        reclaim_level = int(round(local_high * (1 - self.cfg.soft_bear_inverse_reclaim_buffer_pct / 100)))
+        if quote.current_price < reclaim_level:
+            return False, "", "soft_bear_inverse_fail"
+        if quote.change_rate < self.cfg.soft_bear_inverse_min_change_rate:
+            return False, "", "soft_bear_inverse_fail"
+        if score < self.cfg.soft_bear_inverse_min_momentum:
+            return False, "", "soft_bear_inverse_fail"
+        if not self._is_volume_spike(quote, score=score):
+            return False, "", "soft_bear_inverse_fail"
+
+        reason = (
+            f"setup_name=soft_bear_inverse_breakdown entry_reason=weak_rebound_failure "
+            f"local_high={local_high} drop_pct={pullback_drop:.2f}"
+        )
+        return True, "soft_bear_inverse_breakdown", reason
 
     def initialize(self):
         today = self._today()
@@ -357,6 +676,9 @@ class MomentumScalpStrategy(BaseStrategy):
             self._entry_filter_log_cache = {}
             self._daily_breaker_pnl_offset = 0
             self._loaded_position_meta = {}
+            self._recent_quotes = {}
+            self._risk_stage_label = "normal"
+            self._pending_entry_meta = {}
         elif self._state_loaded_for_today and not self.cfg.use_restored_pnl_for_daily_breaker:
             restored_pnl = int(self.daily_pnl.realized_net_pnl)
             if restored_pnl != 0 or self.daily_pnl.trade_count > 0:
@@ -369,6 +691,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 )
         self._recent_tick_volumes = {}
         self._latest_tick_volumes = {}
+        self._recent_quotes = {}
         self._current_day = today
         self._session_start_at = None
         self._build_pool()
@@ -376,6 +699,12 @@ class MomentumScalpStrategy(BaseStrategy):
         regime_profile = self._build_regime_profile()
         self._log_regime_profiles()
         total_loss_limit = regime_profile["daily_total_loss_limit"]
+        capital_base = self._allocation_capital_base()
+        target_total_exposure = self._regime_target_total_exposure_amount()
+        max_single_position_amount = self._regime_max_single_position_amount()
+        target_long_slot_budget = int(
+            target_total_exposure / max(1, self._effective_max_position_count())
+        )
         blocked_windows = ", ".join(
             label for _, _, label in self._entry_block_windows
         ) if self._entry_block_windows else "없음"
@@ -386,8 +715,8 @@ class MomentumScalpStrategy(BaseStrategy):
                 logger.info("당일 하드스탑 우회 모드가 적용되어 거래를 계속 진행합니다.")
 
         logger.info("전략 초기화: 모멘텀 스캘핑")
-        logger.info("  시드: %s원, 종목당: %s원",
-                     f"{self.cfg.seed_money:,}", f"{self.cfg.per_stock_amount:,}")
+        logger.info("  시드: %s원, 기준자본: %s원, 기본 종목당: %s원",
+                     f"{self.cfg.seed_money:,}", f"{capital_base:,}", f"{self.cfg.per_stock_amount:,}")
         logger.info("  최대 동시 보유 수: %d종목", self._effective_max_position_count())
         logger.info("  익절: +%.1f%%, 개별손절: %s원, 추적손절: %.1f%%",
                      regime_profile["take_profit_pct"],
@@ -413,10 +742,13 @@ class MomentumScalpStrategy(BaseStrategy):
                     self.cfg.dynamic_entry_block_disable_bear_score,
                 )
         logger.info(
-            "  오늘 적용값 요약: 종목당 %s원(최대 %s원), 개별손절 %s원, 일손실한도 %s원, "
-            "보조손실컷 %s원, 진입임계(점수 %.2f/등락률 %.2f%%/최소가 %s원), 차단시간 [%s]",
-            f"{self.cfg.per_stock_amount:,}",
-            f"{self.cfg.max_per_stock_amount:,}",
+            "  오늘 적용값 요약: 총노출 %s원(%.0f%%), 종목당 목표 %s원, 종목당 최대 %s원(%.0f%%), "
+            "개별손절 %s원, 일손실한도 %s원, 보조손실컷 %s원, 진입임계(점수 %.2f/등락률 %.2f%%/최소가 %s원), 차단시간 [%s]",
+            f"{target_total_exposure:,}",
+            regime_profile["capital_utilization_pct"] * 100,
+            f"{target_long_slot_budget:,}",
+            f"{max_single_position_amount:,}",
+            regime_profile["max_single_position_pct"] * 100,
             f"{regime_profile['per_position_stop_loss']:,}",
             f"{regime_profile['daily_loss_limit']:,}",
             f"{total_loss_limit:,}",
@@ -455,25 +787,30 @@ class MomentumScalpStrategy(BaseStrategy):
                      self._bear_score, self.cfg.bear_market_mode)
         if self.cfg.inverse_enabled:
             logger.info("  인버스: 활성화 (임계=%d, 최대%d종목)",
-                         self.cfg.bearish_threshold, self.cfg.inverse_max_positions)
+                         self.cfg.bearish_threshold, self._regime_inverse_max_positions())
             logger.info(
                 "  인버스 진입 강화: 약세점수≥%d, 등락률≥%.2f%%, 모멘텀≥%.2f, "
                 "추적손절 발동이익≥%.2f%%, 거래량스파이크 완화=-%.2f",
-                max(self.cfg.bearish_threshold, self.cfg.inverse_min_bear_score),
-                self.cfg.inverse_min_change_rate,
-                self.cfg.inverse_min_momentum,
-                self.cfg.inverse_trailing_stop_activation_gain_pct,
+                max(self.cfg.bearish_threshold, self._regime_inverse_min_bear_score()),
+                self._regime_inverse_min_change_rate(),
+                self._regime_inverse_min_momentum(),
+                self._regime_inverse_trailing_stop_activation_gain_pct(),
                 self.cfg.inverse_volume_spike_ratio_offset,
             )
         logger.info("  풀 크기: %d종목", len(self._pool))
 
     def _log_regime_profiles(self):
+        capital_base = self._allocation_capital_base()
         bull_profile = self._build_regime_profile(profile_name="bull")
         neutral_profile = self._build_regime_profile(profile_name="neutral")
+        soft_bear_profile = self._build_regime_profile(profile_name="soft_bear")
         bear_profile = self._build_regime_profile(profile_name="bear")
         logger.info("레짐 프로파일 비교표 (활성=%s)", self._regime_profile_name)
         logger.info(
-            "  [강세] long 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
+            "  [강세] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
+            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
+            f"{int(capital_base * bull_profile['capital_utilization_pct']):,}",
+            f"{int(capital_base * bull_profile['max_single_position_pct']):,}",
             f"{bull_profile['take_profit_pct']:.2f}",
             f"{bull_profile['per_position_stop_loss']:,}",
             f"{bull_profile['trailing_stop_pct']:.2f}",
@@ -484,7 +821,10 @@ class MomentumScalpStrategy(BaseStrategy):
             bull_profile["inverse_max_hold_minutes"],
         )
         logger.info(
-            "  [중립] long 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
+            "  [중립] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
+            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
+            f"{int(capital_base * neutral_profile['capital_utilization_pct']):,}",
+            f"{int(capital_base * neutral_profile['max_single_position_pct']):,}",
             f"{neutral_profile['take_profit_pct']:.2f}",
             f"{neutral_profile['per_position_stop_loss']:,}",
             f"{neutral_profile['trailing_stop_pct']:.2f}",
@@ -495,7 +835,24 @@ class MomentumScalpStrategy(BaseStrategy):
             neutral_profile["inverse_max_hold_minutes"],
         )
         logger.info(
-            "  [약세] long 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
+            "  [완만약세] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
+            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
+            f"{int(capital_base * soft_bear_profile['capital_utilization_pct']):,}",
+            f"{int(capital_base * soft_bear_profile['max_single_position_pct']):,}",
+            f"{soft_bear_profile['take_profit_pct']:.2f}",
+            f"{soft_bear_profile['per_position_stop_loss']:,}",
+            f"{soft_bear_profile['trailing_stop_pct']:.2f}",
+            soft_bear_profile["max_position_holding_minutes"],
+            f"{soft_bear_profile['inverse_take_profit_pct']:.2f}",
+            f"{soft_bear_profile['inverse_stop_loss_pct']:.2f}",
+            f"{soft_bear_profile['inverse_trailing_stop_pct']:.2f}",
+            soft_bear_profile["inverse_max_hold_minutes"],
+        )
+        logger.info(
+            "  [약세] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
+            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
+            f"{int(capital_base * bear_profile['capital_utilization_pct']):,}",
+            f"{int(capital_base * bear_profile['max_single_position_pct']):,}",
             f"{bear_profile['take_profit_pct']:.2f}",
             f"{bear_profile['per_position_stop_loss']:,}",
             f"{bear_profile['trailing_stop_pct']:.2f}",
@@ -596,6 +953,11 @@ class MomentumScalpStrategy(BaseStrategy):
                 "invested_amount": pos.invested_amount,
                 "buy_time": pos.buy_time.isoformat(timespec="seconds"),
                 "high_since_buy": pos.high_since_buy,
+                "entry_setup_name": pos.entry_setup_name,
+                "entry_reason": pos.entry_reason,
+                "regime_label": pos.regime_label,
+                "bear_score": pos.bear_score,
+                "planned_risk_stage": pos.planned_risk_stage,
             }
         return payload
 
@@ -642,6 +1004,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
     def on_tick(self, quote: Quote) -> List[Order]:
         self._quotes_cache[quote.symbol] = quote
+        self._record_recent_quote(quote)
         if self._session_start_at is None:
             self._session_start_at = self._now()
         orders = []
@@ -676,6 +1039,7 @@ class MomentumScalpStrategy(BaseStrategy):
             self._session_start_at = now
         for q in quotes:
             self._quotes_cache[q.symbol] = q
+            self._record_recent_quote(q)
             self._update_tick_volume_state(q)
             self._refresh_entry_signal_if_stale(q.symbol, now)
 
@@ -711,91 +1075,59 @@ class MomentumScalpStrategy(BaseStrategy):
                     return self._liquidate_all()
                 return []
 
-        # 서킷 브레이커: 순실현손익 기준으로 판단
+        # 단계형 리스크 관리: 실현 + 미실현 합산 총손익 기준
         realized_net = self._effective_realized_net_for_breaker()
         unrealized_net = self._estimate_unrealized_net_pnl()
         total_net = realized_net + unrealized_net
+        risk_stage = self._current_risk_stage(total_net)
+        self._log_risk_stage_change(risk_stage, total_net)
         if not self._hard_stop_bypass_for_day:
-            daily_loss_limit = int(self._get_regime_value("daily_loss_limit", self.cfg.daily_loss_limit))
+            total_loss_limit = int(
+                self._get_regime_value(
+                    "daily_total_loss_limit",
+                    self.cfg.daily_total_loss_limit
+                    if self.cfg.daily_total_loss_limit is not None
+                    else self.cfg.daily_loss_limit,
+                )
+            )
             daily_profit_target = int(self._get_regime_value("daily_profit_target", self.cfg.daily_profit_target))
 
-            if realized_net <= daily_loss_limit:
-                if total_net > daily_loss_limit:
-                    logger.info(
-                        "일일 손실한도 보류: 순실현 %s원, 미실현추정 %s원, 합계 %s원 (한도 %s원)",
-                        f"{realized_net:,}",
-                        f"{unrealized_net:,}",
-                        f"{total_net:,}",
-                        f"{daily_loss_limit:,}",
-                    )
-                else:
-                    logger.warning(
-                        "일일 손실한도 도달! (순실현: %s원, 미실현추정: %s원, 합계: %s원) → 전량 청산 후 거래 중지",
-                        f"{realized_net:,}",
-                        f"{unrealized_net:,}",
-                        f"{total_net:,}",
-                    )
-                    self._alerts.send(
-                        event_key="daily_loss_limit_hit",
-                        title="일일 손실한도 도달",
-                        message=(
-                            f"순실현손익 {realized_net:,}원, 미실현추정 {unrealized_net:,}원, "
-                            f"합계 {total_net:,}원으로 손실한도에 도달했습니다. 전량 청산 후 거래를 중지합니다."
-                        ),
-                        level="error",
-                        cooldown_seconds=1800,
-                    )
-                    self._halted = True
-                    self._halt_date = self._today()
-                    return self._liquidate_all()
-
-            if realized_net >= daily_profit_target:
-                logger.info(
-                    "일일 목표 달성! (순실현: %s원) → 전량 청산 후 거래 중지",
+            if total_net <= total_loss_limit:
+                logger.warning(
+                    "일일 총손익 하드스탑 도달! (순실현: %s원, 미실현추정: %s원, 합계: %s원) → 전량 청산 후 거래 중지",
                     f"{realized_net:,}",
+                    f"{unrealized_net:,}",
+                    f"{total_net:,}",
                 )
                 self._alerts.send(
-                    event_key="daily_profit_target_hit",
-                    title="일일 목표 달성",
-                    message=f"순실현손익 {realized_net:,}원으로 목표를 달성했습니다. 전량 청산 후 거래를 중지합니다.",
-                    level="info",
+                    event_key="daily_total_loss_limit_hit",
+                    title="일일 총손익 하드스탑",
+                    message=(
+                        f"순실현 {realized_net:,}원, 미실현추정 {unrealized_net:,}원, "
+                        f"합계 {total_net:,}원으로 하드스탑에 도달했습니다."
+                    ),
+                    level="error",
                     cooldown_seconds=1800,
                 )
                 self._halted = True
                 self._halt_date = self._today()
                 return self._liquidate_all()
 
-            # 보조 손실컷: 순손익 추정(순실현 + 미실현 추정) 기준
-            if self.cfg.enable_unrealized_loss_guard:
-                total_loss_limit = (
-                    self._get_regime_value(
-                        "daily_total_loss_limit",
-                        self.cfg.daily_total_loss_limit
-                        if self.cfg.daily_total_loss_limit is not None
-                        else self.cfg.daily_loss_limit,
-                    )
+            if total_net >= daily_profit_target:
+                logger.info(
+                    "일일 총손익 목표 달성! (총손익: %s원) → 전량 청산 후 거래 중지",
+                    f"{total_net:,}",
                 )
-                if total_net <= total_loss_limit:
-                    logger.warning(
-                        "보조 손실컷 도달! (순실현: %s원, 미실현추정: %s원, 합계: %s원) "
-                        "→ 전량 청산 후 거래 중지",
-                        f"{realized_net:,}",
-                        f"{unrealized_net:,}",
-                        f"{total_net:,}",
-                    )
-                    self._alerts.send(
-                        event_key="daily_total_loss_limit_hit",
-                        title="보조 손실컷 도달",
-                        message=(
-                            f"순실현 {realized_net:,}원, 미실현추정 {unrealized_net:,}원, "
-                            f"합계 {total_net:,}원으로 보조 손실컷에 도달했습니다."
-                        ),
-                        level="error",
-                        cooldown_seconds=1800,
-                    )
-                    self._halted = True
-                    self._halt_date = self._today()
-                    return self._liquidate_all()
+                self._alerts.send(
+                    event_key="daily_profit_target_hit",
+                    title="일일 목표 달성",
+                    message=f"총손익 {total_net:,}원으로 목표를 달성했습니다. 전량 청산 후 거래를 중지합니다.",
+                    level="info",
+                    cooldown_seconds=1800,
+                )
+                self._halted = True
+                self._halt_date = self._today()
+                return self._liquidate_all()
         else:
             logger.info("당일 하드스탑 무시 모드: 일일 손익 브레이크는 비활성화됩니다.")
 
@@ -857,6 +1189,9 @@ class MomentumScalpStrategy(BaseStrategy):
 
         # 3) 인버스 매수 (인버스 포지션 카운트 기준)
         if self.cfg.inverse_enabled and self._bear_score >= self.cfg.bearish_threshold:
+            regime_inverse_max_positions = self._regime_inverse_max_positions()
+            if regime_inverse_max_positions <= 0:
+                return orders
             for q in quotes:
                 if q.symbol not in self._inverse_symbols:
                     continue
@@ -867,7 +1202,7 @@ class MomentumScalpStrategy(BaseStrategy):
                     1 for o in orders
                     if o.side == OrderSide.BUY and o.symbol in self._inverse_symbols
                 )
-                if inv_count + pending_inv >= self.cfg.inverse_max_positions:
+                if inv_count + pending_inv >= regime_inverse_max_positions:
                     break
                 if q.symbol not in self.positions:
                     order = self._evaluate_inverse_buy(q, pending_orders=orders)
@@ -879,6 +1214,7 @@ class MomentumScalpStrategy(BaseStrategy):
     def on_order_filled(self, result: OrderResult):
         if result.side == OrderSide.BUY:
             if not result.success:
+                self._pending_entry_meta.pop(result.symbol, None)
                 return
 
             fill_price = result.price
@@ -886,6 +1222,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 cached = self._quotes_cache.get(result.symbol)
                 fill_price = cached.current_price if cached else 0
             if fill_price <= 0:
+                self._pending_entry_meta.pop(result.symbol, None)
                 return
 
             buy_notional = fill_price * result.quantity
@@ -895,6 +1232,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 # 매수 수수료는 체결 시점에 확정 비용으로 반영
                 self.daily_pnl.realized_net_pnl -= buy_fee
 
+            entry_meta = dict(self._pending_entry_meta.pop(result.symbol, {}))
             existing = self.positions.get(result.symbol)
             if existing:
                 total_qty = existing.quantity + result.quantity
@@ -906,6 +1244,12 @@ class MomentumScalpStrategy(BaseStrategy):
                 existing.restored_at = None
                 if fill_price > existing.high_since_buy:
                     existing.high_since_buy = fill_price
+                if entry_meta and not existing.entry_setup_name:
+                    existing.entry_setup_name = str(entry_meta.get("setup_name", "") or "")
+                    existing.entry_reason = str(entry_meta.get("entry_reason", "") or "")
+                    existing.regime_label = str(entry_meta.get("regime_label", "") or "")
+                    existing.bear_score = int(entry_meta.get("bear_score", 0) or 0)
+                    existing.planned_risk_stage = str(entry_meta.get("planned_risk_stage", "") or "")
                 tag = "[INV] " if result.symbol in self._inverse_symbols else ""
                 logger.info(
                     "%s추가매수 체결: %s +%d주 @ %s원 (평단 %s원, 총 %d주)",
@@ -926,10 +1270,25 @@ class MomentumScalpStrategy(BaseStrategy):
                 invested_amount=fill_price * result.quantity,
                 is_restored=False,
                 restored_at=None,
+                entry_setup_name=str(entry_meta.get("setup_name", "") or ""),
+                entry_reason=str(entry_meta.get("entry_reason", "") or ""),
+                regime_label=str(entry_meta.get("regime_label", "") or ""),
+                bear_score=int(entry_meta.get("bear_score", 0) or 0),
+                planned_risk_stage=str(entry_meta.get("planned_risk_stage", "") or ""),
             )
             tag = "[INV] " if result.symbol in self._inverse_symbols else ""
-            logger.info("%s매수 체결: %s %d주 @ %s원",
-                        tag, result.symbol, result.quantity, f"{fill_price:,}")
+            logger.info(
+                "%s매수 체결: %s %d주 @ %s원 "
+                "(setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s)",
+                tag,
+                result.symbol,
+                result.quantity,
+                f"{fill_price:,}",
+                self.positions[result.symbol].entry_setup_name or "-",
+                self.positions[result.symbol].regime_label or "-",
+                self.positions[result.symbol].bear_score,
+                self.positions[result.symbol].planned_risk_stage or "-",
+            )
             self._save_daily_state()
 
         elif result.side == OrderSide.SELL:
@@ -984,9 +1343,17 @@ class MomentumScalpStrategy(BaseStrategy):
                 tag = "[INV] " if result.symbol in self._inverse_symbols else ""
                 logger.info(
                     "%s매도 체결: %s %d주 @ %s원 "
-                    "(총손익: %s원, 순손익: %s원, 누적순손익: %s원)",
-                    tag, result.symbol, result.quantity, f"{sell_price:,}",
-                    f"{gross_pnl:,}", f"{net_pnl:,}", f"{self.daily_pnl.realized_net_pnl:,}",
+                    "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, "
+                    "setup_name=%s, regime_label=%s)",
+                    tag,
+                    result.symbol,
+                    result.quantity,
+                    f"{sell_price:,}",
+                    f"{gross_pnl:,}",
+                    f"{net_pnl:,}",
+                    f"{self.daily_pnl.realized_net_pnl:,}",
+                    pos.entry_setup_name or "-",
+                    pos.regime_label or "-",
                 )
 
                 self._save_daily_state()
@@ -1010,14 +1377,49 @@ class MomentumScalpStrategy(BaseStrategy):
         override = None
         if profile_name == "bull":
             override = self.cfg.bull_max_position_count
+        elif profile_name == "soft_bear":
+            override = (
+                self.cfg.soft_bear_max_position_count
+                if self.cfg.soft_bear_max_position_count is not None
+                else self.cfg.bear_max_position_count
+            )
         elif profile_name == "bear":
             override = self.cfg.bear_max_position_count
         elif profile_name == "neutral":
             override = self.cfg.neutral_max_position_count
 
-        if override is None or override <= 0:
+        if override is None:
             return base_count
-        return int(override)
+        return max(0, int(override))
+
+    @staticmethod
+    def _clamp_ratio(value: Optional[float], fallback: float) -> float:
+        raw = fallback if value is None else value
+        return max(0.05, min(1.0, float(raw)))
+
+    def _resolve_profile_capital_utilization_pct(self, profile_name: str) -> float:
+        override = None
+        if profile_name == "bull":
+            override = self.cfg.bull_capital_utilization_pct
+        elif profile_name == "neutral":
+            override = self.cfg.neutral_capital_utilization_pct
+        elif profile_name == "soft_bear":
+            override = self.cfg.soft_bear_capital_utilization_pct
+        elif profile_name == "bear":
+            override = self.cfg.bear_capital_utilization_pct
+        return self._clamp_ratio(override, self.cfg.capital_utilization_pct)
+
+    def _resolve_profile_max_single_position_pct(self, profile_name: str) -> float:
+        override = None
+        if profile_name == "bull":
+            override = self.cfg.bull_max_single_position_pct
+        elif profile_name == "neutral":
+            override = self.cfg.neutral_max_single_position_pct
+        elif profile_name == "soft_bear":
+            override = self.cfg.soft_bear_max_single_position_pct
+        elif profile_name == "bear":
+            override = self.cfg.bear_max_single_position_pct
+        return self._clamp_ratio(override, self.cfg.max_single_position_pct)
 
     def _effective_max_position_count(self) -> int:
         """현재 레짐 기준의 동시 보유 가능한 최대 종목 수를 계산한다."""
@@ -1032,7 +1434,9 @@ class MomentumScalpStrategy(BaseStrategy):
             return "bull"
         if score == 1:
             return "neutral"
-        if score >= 2:
+        if score == 2:
+            return "soft_bear"
+        if score >= 3:
             return "bear"
         return "neutral"
 
@@ -1141,7 +1545,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 "volume_spike_ratio_min": self.cfg.volume_spike_ratio_min,
                 "volume_spike_abs_min": self.cfg.volume_spike_abs_min,
                 "take_profit_pct": self.cfg.take_profit_pct,
-                "per_position_stop_loss": self.cfg.per_position_stop_loss,
+                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
                 "trailing_stop_pct": self.cfg.trailing_stop_pct,
                 "trailing_stop_activation_gain_pct": self.cfg.trailing_stop_activation_gain_pct,
                 "max_position_holding_minutes": self.cfg.max_position_holding_minutes,
@@ -1152,6 +1556,8 @@ class MomentumScalpStrategy(BaseStrategy):
                 "min_expected_rr_ratio": self.cfg.min_expected_rr_ratio,
                 "per_stock_alloc_scale": 1.0,
                 "max_stock_alloc_scale": 1.0,
+                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("static"),
+                "max_single_position_pct": self._resolve_profile_max_single_position_pct("static"),
                 "daily_loss_limit": self.cfg.daily_loss_limit,
                 "daily_profit_target": self.cfg.daily_profit_target,
                 "daily_total_loss_limit": (
@@ -1166,6 +1572,10 @@ class MomentumScalpStrategy(BaseStrategy):
                 "inverse_trailing_stop_pct": self.cfg.inverse_trailing_stop_pct,
                 "inverse_trailing_stop_activation_gain_pct": self.cfg.inverse_trailing_stop_activation_gain_pct,
                 "inverse_max_hold_minutes": self.cfg.inverse_max_hold_minutes,
+                "inverse_max_positions": self.cfg.inverse_max_positions,
+                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
+                "inverse_min_momentum": self.cfg.inverse_min_momentum,
+                "inverse_min_bear_score": self.cfg.inverse_min_bear_score,
             }
             if not is_preview:
                 self._regime_profile_name = "static"
@@ -1177,135 +1587,148 @@ class MomentumScalpStrategy(BaseStrategy):
         else:
             if profile_name == "auto":
                 profile_name = self._resolve_regime_profile_name()
+        daily_total_loss_limit = (
+            self.cfg.daily_total_loss_limit
+            if self.cfg.daily_total_loss_limit is not None
+            else self.cfg.daily_loss_limit
+        )
+        soft_inverse_max_positions = self.cfg.soft_bear_inverse_max_positions
+        if soft_inverse_max_positions is None:
+            soft_inverse_max_positions = min(self.cfg.inverse_max_positions, 1)
 
-        if profile_name == "bull":
-            return {
+        base_profile = {
+            "daily_loss_limit": int(self.cfg.daily_loss_limit),
+            "daily_profit_target": int(self.cfg.daily_profit_target),
+            "daily_total_loss_limit": int(daily_total_loss_limit),
+            "min_bear_score_for_new_long": self.cfg.min_bear_score_for_new_long,
+            "bear_market_entry_score": self.cfg.bear_market_entry_score,
+            "inverse_take_profit_pct": 0.9,
+            "inverse_stop_loss_pct": -0.6,
+            "inverse_trailing_stop_pct": -0.3,
+            "inverse_trailing_stop_activation_gain_pct": 0.5,
+            "inverse_max_hold_minutes": max(30, self.cfg.inverse_max_hold_minutes),
+        }
+
+        profiles = {
+            "bull": {
                 "max_position_count": self._resolve_profile_max_position_count("bull"),
-                "min_change_rate": max(0.8, self.cfg.min_change_rate * 0.9),
-                "bullish_min_change_rate": max(0.8, self.cfg.bullish_min_change_rate * 0.9),
-                "min_momentum_score": max(3.0, self.cfg.min_momentum_score * 0.95),
+                "min_change_rate": max(0.45, self.cfg.bullish_min_change_rate),
+                "bullish_min_change_rate": max(0.45, self.cfg.bullish_min_change_rate),
+                "min_momentum_score": max(2.2, self.cfg.min_momentum_score * 0.8),
                 "bullish_min_momentum_score": max(
                     self.cfg.bullish_min_momentum_score_floor,
                     self.cfg.bullish_min_momentum_score,
                 ),
                 "volume_spike_ratio": max(1.0, self.cfg.volume_spike_ratio * 0.72),
-                "volume_spike_ratio_min": max(0.85, self.cfg.volume_spike_ratio_min * 0.85),
-                "volume_spike_abs_min": int(max(1_000, self.cfg.volume_spike_abs_min * 0.75)),
-                "take_profit_pct": self.cfg.take_profit_pct * 1.1,
-                "per_position_stop_loss": int(self.cfg.per_position_stop_loss * 1.2),
-                "trailing_stop_pct": self.cfg.trailing_stop_pct * 1.25,
-                "trailing_stop_activation_gain_pct": max(
-                    self.cfg.bullish_trailing_stop_activation_gain_pct_floor,
-                    self.cfg.trailing_stop_activation_gain_pct * 1.35,
-                ),
-                "max_position_holding_minutes": int(self.cfg.max_position_holding_minutes * 1.5),
-                "cooldown_seconds": max(60, int(self.cfg.cooldown_seconds * 0.6)),
-                "loss_trade_cooldown_seconds": max(30, int(self.cfg.loss_trade_cooldown_seconds * 0.7)),
-                "expected_move_pct": self.cfg.expected_move_pct * 1.35,
-                "min_expected_net_profit": self.cfg.min_expected_net_profit,
-                "min_expected_rr_ratio": max(0.78, self.cfg.min_expected_rr_ratio * 0.95),
-                "per_stock_alloc_scale": 1.15,
-                "max_stock_alloc_scale": 1.10,
-                "daily_loss_limit": int(self.cfg.daily_loss_limit * 1.6),
-                "daily_profit_target": int(self.cfg.daily_profit_target * 1.2),
-                "daily_total_loss_limit": int(
-                    (
-                        self.cfg.daily_total_loss_limit
-                        if self.cfg.daily_total_loss_limit is not None
-                        else self.cfg.daily_loss_limit
-                    ) * 1.4
-                ),
-                "min_bear_score_for_new_long": self.cfg.min_bear_score_for_new_long,
-                "bear_market_entry_score": self.cfg.bear_market_entry_score,
-                "inverse_take_profit_pct": max(0.45, self.cfg.inverse_take_profit_pct * 0.85),
-                "inverse_stop_loss_pct": max(-0.35, self.cfg.inverse_stop_loss_pct * 0.8),
-                "inverse_trailing_stop_pct": max(-0.25, self.cfg.inverse_trailing_stop_pct * 0.75),
-                "inverse_trailing_stop_activation_gain_pct": max(
-                    0.2, self.cfg.inverse_trailing_stop_activation_gain_pct * 0.8
-                ),
-                "inverse_max_hold_minutes": max(20, int(self.cfg.inverse_max_hold_minutes * 0.6)),
-            }
-
-        if profile_name == "bear":
-            return {
+                "volume_spike_ratio_min": max(0.85, self.cfg.volume_spike_ratio_min * 0.82),
+                "volume_spike_abs_min": int(max(1_000, self.cfg.volume_spike_abs_min * 0.60)),
+                "take_profit_pct": 1.6,
+                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
+                "trailing_stop_pct": -0.55,
+                "trailing_stop_activation_gain_pct": 1.0,
+                "max_position_holding_minutes": max(45, int(self.cfg.max_position_holding_minutes * 1.3)),
+                "cooldown_seconds": max(120, int(self.cfg.cooldown_seconds * 0.7)),
+                "loss_trade_cooldown_seconds": max(180, int(self.cfg.loss_trade_cooldown_seconds * 0.85)),
+                "expected_move_pct": 1.6,
+                "min_expected_net_profit": max(120, int(self.cfg.min_expected_net_profit * 0.75)),
+                "min_expected_rr_ratio": max(0.65, self.cfg.min_expected_rr_ratio),
+                "per_stock_alloc_scale": 1.0,
+                "max_stock_alloc_scale": 1.0,
+                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("bull"),
+                "max_single_position_pct": self._resolve_profile_max_single_position_pct("bull"),
+                "inverse_max_positions": self.cfg.inverse_max_positions,
+                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
+                "inverse_min_momentum": self.cfg.inverse_min_momentum,
+                "inverse_min_bear_score": max(3, self.cfg.inverse_min_bear_score),
+            },
+            "neutral": {
+                "max_position_count": self._resolve_profile_max_position_count("neutral"),
+                "min_change_rate": max(0.35, self.cfg.min_change_rate * 0.45),
+                "bullish_min_change_rate": max(0.45, self.cfg.bullish_min_change_rate),
+                "min_momentum_score": max(1.8, self.cfg.min_momentum_score * 0.58),
+                "bullish_min_momentum_score": max(2.2, self.cfg.bullish_min_momentum_score * 0.85),
+                "volume_spike_ratio": max(0.95, self.cfg.volume_spike_ratio * 0.68),
+                "volume_spike_ratio_min": max(0.90, self.cfg.volume_spike_ratio_min * 0.80),
+                "volume_spike_abs_min": int(max(1_500, self.cfg.volume_spike_abs_min * 0.60)),
+                "take_profit_pct": 1.0,
+                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
+                "trailing_stop_pct": -0.35,
+                "trailing_stop_activation_gain_pct": 0.7,
+                "max_position_holding_minutes": max(18, int(self.cfg.max_position_holding_minutes * 0.65)),
+                "cooldown_seconds": max(180, int(self.cfg.cooldown_seconds * 0.90)),
+                "loss_trade_cooldown_seconds": max(240, int(self.cfg.loss_trade_cooldown_seconds * 1.05)),
+                "expected_move_pct": 1.0,
+                "min_expected_net_profit": max(80, int(self.cfg.min_expected_net_profit * 0.45)),
+                "min_expected_rr_ratio": max(0.45, self.cfg.min_expected_rr_ratio * 0.8),
+                "per_stock_alloc_scale": 0.9,
+                "max_stock_alloc_scale": 0.9,
+                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("neutral"),
+                "max_single_position_pct": self._resolve_profile_max_single_position_pct("neutral"),
+                "inverse_max_positions": 0,
+                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
+                "inverse_min_momentum": self.cfg.inverse_min_momentum,
+                "inverse_min_bear_score": max(3, self.cfg.inverse_min_bear_score),
+            },
+            "soft_bear": {
+                "max_position_count": self._resolve_profile_max_position_count("soft_bear"),
+                "min_change_rate": max(0.50, self.cfg.min_change_rate),
+                "bullish_min_change_rate": max(0.50, self.cfg.bullish_min_change_rate),
+                "min_momentum_score": max(2.2, self.cfg.min_momentum_score * 0.75),
+                "bullish_min_momentum_score": max(2.4, self.cfg.bullish_min_momentum_score * 0.9),
+                "volume_spike_ratio": max(1.0, self.cfg.volume_spike_ratio * 0.72),
+                "volume_spike_ratio_min": max(0.95, self.cfg.volume_spike_ratio_min * 0.85),
+                "volume_spike_abs_min": int(max(2_000, self.cfg.volume_spike_abs_min * 0.72)),
+                "take_profit_pct": 0.9,
+                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
+                "trailing_stop_pct": -0.30,
+                "trailing_stop_activation_gain_pct": 0.6,
+                "max_position_holding_minutes": max(12, int(self.cfg.max_position_holding_minutes * 0.45)),
+                "cooldown_seconds": max(240, int(self.cfg.cooldown_seconds * 1.05)),
+                "loss_trade_cooldown_seconds": max(300, int(self.cfg.loss_trade_cooldown_seconds * 1.1)),
+                "expected_move_pct": 0.9,
+                "min_expected_net_profit": max(60, int(self.cfg.min_expected_net_profit * 0.35)),
+                "min_expected_rr_ratio": max(0.40, self.cfg.min_expected_rr_ratio * 0.7),
+                "per_stock_alloc_scale": 0.7,
+                "max_stock_alloc_scale": 0.7,
+                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("soft_bear"),
+                "max_single_position_pct": self._resolve_profile_max_single_position_pct("soft_bear"),
+                "inverse_max_positions": max(0, int(soft_inverse_max_positions)),
+                "inverse_min_change_rate": self.cfg.soft_bear_inverse_min_change_rate,
+                "inverse_min_momentum": self.cfg.soft_bear_inverse_min_momentum,
+                "inverse_min_bear_score": max(2, self.cfg.bearish_threshold),
+            },
+            "bear": {
                 "max_position_count": self._resolve_profile_max_position_count("bear"),
-                "min_change_rate": self.cfg.min_change_rate * (1.25 if self._bear_score >= 2 else 1.15),
-                "bullish_min_change_rate": self.cfg.bullish_min_change_rate * 1.2,
-                "min_momentum_score": self.cfg.min_momentum_score * 1.2,
-                "bullish_min_momentum_score": self.cfg.bullish_min_momentum_score * 1.08,
-                "volume_spike_ratio": self.cfg.volume_spike_ratio * (1.22 if self._bear_score >= 2 else 1.05),
-                "volume_spike_ratio_min": min(2.5, self.cfg.volume_spike_ratio_min * (1.14 if self._bear_score >= 2 else 1.05)),
-                "volume_spike_abs_min": int(self.cfg.volume_spike_abs_min * (1.4 if self._bear_score >= 2 else 1.2)),
-                "take_profit_pct": self.cfg.take_profit_pct * (0.84 if self._bear_score >= 2 else 0.9),
-                "per_position_stop_loss": int(self.cfg.per_position_stop_loss * 0.68),
-                "trailing_stop_pct": self.cfg.trailing_stop_pct * 0.86 if self._bear_score >= 2 else self.cfg.trailing_stop_pct * 0.93,
-                "trailing_stop_activation_gain_pct": self.cfg.trailing_stop_activation_gain_pct * 0.75,
-                "max_position_holding_minutes": int(self.cfg.max_position_holding_minutes * 0.62),
-                "cooldown_seconds": int(self.cfg.cooldown_seconds * 1.25),
-                "loss_trade_cooldown_seconds": int(self.cfg.loss_trade_cooldown_seconds * 1.35),
-                "expected_move_pct": self.cfg.expected_move_pct * (0.92 if self._bear_score >= 2 else 0.97),
-                "min_expected_net_profit": max(220, int(self.cfg.min_expected_net_profit * 0.85)),
-                "min_expected_rr_ratio": min(0.95, self.cfg.min_expected_rr_ratio * 1.05),
-                "per_stock_alloc_scale": 0.80 if self._bear_score >= 2 else 0.9,
-                "max_stock_alloc_scale": 0.72 if self._bear_score >= 2 else 0.85,
-                "daily_loss_limit": int(self.cfg.daily_loss_limit * 0.72),
-                "daily_profit_target": int(self.cfg.daily_profit_target * 0.82),
-                "daily_total_loss_limit": int(
-                    (
-                        self.cfg.daily_total_loss_limit
-                        if self.cfg.daily_total_loss_limit is not None
-                        else self.cfg.daily_loss_limit
-                    ) * 0.82
-                ),
-                "min_bear_score_for_new_long": max(1, self.cfg.min_bear_score_for_new_long + 1),
-                "bear_market_entry_score": self.cfg.bear_market_entry_score * 1.02,
-                "inverse_take_profit_pct": min(1.8, self.cfg.inverse_take_profit_pct * 1.3),
-                "inverse_stop_loss_pct": min(-0.9, self.cfg.inverse_stop_loss_pct * 1.3),
-                "inverse_trailing_stop_pct": min(-0.4, self.cfg.inverse_trailing_stop_pct * 1.3),
-                "inverse_trailing_stop_activation_gain_pct": min(
-                    1.0, self.cfg.inverse_trailing_stop_activation_gain_pct * 1.4
-                ),
-                "inverse_max_hold_minutes": int(self.cfg.inverse_max_hold_minutes * 1.6),
-            }
-
-        return {
-            "max_position_count": self._resolve_profile_max_position_count("neutral"),
-            "min_change_rate": self.cfg.min_change_rate * 1.05,
-            "bullish_min_change_rate": self.cfg.bullish_min_change_rate,
-            "min_momentum_score": self.cfg.min_momentum_score * 1.05,
-            "bullish_min_momentum_score": self.cfg.bullish_min_momentum_score * 1.01,
-            "volume_spike_ratio": self.cfg.volume_spike_ratio * 1.05,
-            "volume_spike_ratio_min": min(2.2, self.cfg.volume_spike_ratio_min * 1.02),
-            "volume_spike_abs_min": int(self.cfg.volume_spike_abs_min * 1.12),
-            "take_profit_pct": self.cfg.take_profit_pct * 0.95,
-            "per_position_stop_loss": int(self.cfg.per_position_stop_loss * 0.72),
-            "trailing_stop_pct": self.cfg.trailing_stop_pct * 0.9,
-            "trailing_stop_activation_gain_pct": self.cfg.trailing_stop_activation_gain_pct * 0.8,
-            "max_position_holding_minutes": int(self.cfg.max_position_holding_minutes * 0.72),
-            "cooldown_seconds": int(self.cfg.cooldown_seconds * 1.05),
-            "loss_trade_cooldown_seconds": int(self.cfg.loss_trade_cooldown_seconds * 1.1),
-            "expected_move_pct": self.cfg.expected_move_pct * 0.97,
-            "min_expected_net_profit": max(200, int(self.cfg.min_expected_net_profit * 0.85)),
-            "min_expected_rr_ratio": min(0.92, self.cfg.min_expected_rr_ratio * 1.0),
-            "per_stock_alloc_scale": 0.93,
-            "max_stock_alloc_scale": 0.82,
-            "daily_loss_limit": int(self.cfg.daily_loss_limit * 0.9),
-            "daily_profit_target": int(self.cfg.daily_profit_target * 0.9),
-            "daily_total_loss_limit": int(
-                (
-                    self.cfg.daily_total_loss_limit
-                    if self.cfg.daily_total_loss_limit is not None
-                    else self.cfg.daily_loss_limit
-                ) * 0.88
-            ),
-            "min_bear_score_for_new_long": self.cfg.min_bear_score_for_new_long + 1,
-            "bear_market_entry_score": self.cfg.bear_market_entry_score * 1.01,
-            "inverse_take_profit_pct": self.cfg.inverse_take_profit_pct,
-            "inverse_stop_loss_pct": self.cfg.inverse_stop_loss_pct,
-            "inverse_trailing_stop_pct": self.cfg.inverse_trailing_stop_pct,
-            "inverse_trailing_stop_activation_gain_pct": self.cfg.inverse_trailing_stop_activation_gain_pct,
-            "inverse_max_hold_minutes": self.cfg.inverse_max_hold_minutes,
+                "min_change_rate": max(0.60, self.cfg.min_change_rate),
+                "bullish_min_change_rate": max(0.60, self.cfg.bullish_min_change_rate),
+                "min_momentum_score": max(2.4, self.cfg.min_momentum_score * 0.78),
+                "bullish_min_momentum_score": max(2.6, self.cfg.bullish_min_momentum_score * 0.92),
+                "volume_spike_ratio": max(1.1, self.cfg.volume_spike_ratio * 0.82),
+                "volume_spike_ratio_min": max(1.0, self.cfg.volume_spike_ratio_min * 0.90),
+                "volume_spike_abs_min": int(max(2_400, self.cfg.volume_spike_abs_min * 0.82)),
+                "take_profit_pct": 0.9,
+                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
+                "trailing_stop_pct": -0.30,
+                "trailing_stop_activation_gain_pct": 0.6,
+                "max_position_holding_minutes": max(10, int(self.cfg.max_position_holding_minutes * 0.40)),
+                "cooldown_seconds": max(300, int(self.cfg.cooldown_seconds * 1.10)),
+                "loss_trade_cooldown_seconds": max(300, int(self.cfg.loss_trade_cooldown_seconds * 1.15)),
+                "expected_move_pct": 0.9,
+                "min_expected_net_profit": max(60, int(self.cfg.min_expected_net_profit * 0.35)),
+                "min_expected_rr_ratio": max(0.40, self.cfg.min_expected_rr_ratio * 0.7),
+                "per_stock_alloc_scale": 0.6,
+                "max_stock_alloc_scale": 0.6,
+                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("bear"),
+                "max_single_position_pct": self._resolve_profile_max_single_position_pct("bear"),
+                "inverse_max_positions": self.cfg.inverse_max_positions,
+                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
+                "inverse_min_momentum": self.cfg.inverse_min_momentum,
+                "inverse_min_bear_score": max(3, self.cfg.inverse_min_bear_score),
+            },
         }
+        profile = dict(base_profile)
+        profile.update(profiles.get(profile_name, profiles["neutral"]))
+        return profile
 
     def _get_regime_value(self, key: str, default):
         profile = self._build_regime_profile()
@@ -1381,11 +1804,47 @@ class MomentumScalpStrategy(BaseStrategy):
     def _regime_inverse_max_hold_minutes(self) -> int:
         return int(self._get_regime_value("inverse_max_hold_minutes", self.cfg.inverse_max_hold_minutes))
 
+    def _regime_inverse_max_positions(self) -> int:
+        return max(0, int(self._get_regime_value("inverse_max_positions", self.cfg.inverse_max_positions)))
+
+    def _regime_inverse_min_change_rate(self) -> float:
+        return float(self._get_regime_value("inverse_min_change_rate", self.cfg.inverse_min_change_rate))
+
+    def _regime_inverse_min_momentum(self) -> float:
+        return float(self._get_regime_value("inverse_min_momentum", self.cfg.inverse_min_momentum))
+
+    def _regime_inverse_min_bear_score(self) -> int:
+        return int(self._get_regime_value("inverse_min_bear_score", self.cfg.inverse_min_bear_score))
+
     def _regime_per_stock_alloc_scale(self) -> float:
         return float(self._get_regime_value("per_stock_alloc_scale", 1.0))
 
     def _regime_max_stock_alloc_scale(self) -> float:
         return float(self._get_regime_value("max_stock_alloc_scale", 1.0))
+
+    def _regime_capital_utilization_pct(self) -> float:
+        return self._clamp_ratio(
+            self._get_regime_value("capital_utilization_pct", self.cfg.capital_utilization_pct),
+            self.cfg.capital_utilization_pct,
+        )
+
+    def _regime_max_single_position_pct(self) -> float:
+        return self._clamp_ratio(
+            self._get_regime_value("max_single_position_pct", self.cfg.max_single_position_pct),
+            self.cfg.max_single_position_pct,
+        )
+
+    def _allocation_capital_base(self) -> int:
+        realized_net = int(self.daily_pnl.realized_net_pnl)
+        return max(0, self.cfg.seed_money + realized_net)
+
+    def _regime_target_total_exposure_amount(self) -> int:
+        capital_base = self._allocation_capital_base()
+        return int(capital_base * self._regime_capital_utilization_pct() * self._risk_exposure_scale())
+
+    def _regime_max_single_position_amount(self) -> int:
+        capital_base = self._allocation_capital_base()
+        return int(capital_base * self._regime_max_single_position_pct() * self._risk_exposure_scale())
 
     def _regime_volume_spike_ratio(self) -> float:
         return float(self._get_regime_value("volume_spike_ratio", self.cfg.volume_spike_ratio))
@@ -1440,6 +1899,11 @@ class MomentumScalpStrategy(BaseStrategy):
                 ),
                 is_restored=True,
                 restored_at=now,
+                entry_setup_name=str(snapshot.get("entry_setup_name", "") or ""),
+                entry_reason=str(snapshot.get("entry_reason", "") or ""),
+                regime_label=str(snapshot.get("regime_label", "") or ""),
+                bear_score=int(snapshot.get("bear_score", 0) or 0),
+                planned_risk_stage=str(snapshot.get("planned_risk_stage", "") or ""),
             )
 
         self.positions = synced
@@ -1764,6 +2228,9 @@ class MomentumScalpStrategy(BaseStrategy):
         quotes: List[Quote],
     ) -> List[tuple[float, Quote]]:
         candidates: List[tuple[float, Quote]] = []
+        profile_name = self._resolve_regime_profile_name()
+        if profile_name in {"soft_bear", "bear"}:
+            return candidates
         is_opening_guard = self._is_early_session_guard_active()
         for q in quotes:
             if q.symbol in self.positions:
@@ -1792,8 +2259,6 @@ class MomentumScalpStrategy(BaseStrategy):
                     score,
                     min_score,
                 )
-                continue
-            if not self._is_volume_spike(q, score=score):
                 continue
             candidates.append((score, q))
 
@@ -1927,6 +2392,8 @@ class MomentumScalpStrategy(BaseStrategy):
     ) -> bool:
         if now is None:
             now = self._now()
+        profile_name = self._resolve_regime_profile_name()
+
         if self._is_new_entry_window_blocked(now):
             return False
 
@@ -1940,6 +2407,26 @@ class MomentumScalpStrategy(BaseStrategy):
             o.side == OrderSide.BUY and o.symbol == quote.symbol
             for o in pending_orders or []
         ):
+            return False
+
+        if profile_name in {"soft_bear", "bear"}:
+            self._log_setup_reject(
+                quote,
+                "long_disabled",
+                "%s 레짐에서는 신규 롱을 열지 않습니다: %s",
+                profile_name,
+                quote.symbol,
+            )
+            return False
+
+        if self._is_loss_stage_active() and profile_name == "neutral":
+            self._log_setup_reject(
+                quote,
+                "risk_stage1_block",
+                "손실 1단계에서는 중립장 신규 롱을 차단합니다: %s (총손익 %s원)",
+                quote.symbol,
+                f"{self._current_total_net_pnl():,}",
+            )
             return False
 
         if self._bear_market and self.cfg.bear_market_mode == "B":
@@ -1986,6 +2473,7 @@ class MomentumScalpStrategy(BaseStrategy):
             if is_scale_in
             else self.cfg.entry_confirmation_ticks
         )
+        profile_name = self._resolve_regime_profile_name()
         if (
             self._is_bullish_regime()
             and not is_scale_in
@@ -2007,6 +2495,18 @@ class MomentumScalpStrategy(BaseStrategy):
                 + self.cfg.bullish_fast_entry_change_rate_bonus
             )
             if score >= fast_entry_min_score and quote.change_rate >= fast_entry_min_change:
+                required_ticks = 1
+        if (
+            not is_scale_in
+            and profile_name in {"neutral", "soft_bear"}
+            and required_ticks > 1
+        ):
+            extra_score = 0.30 if profile_name == "neutral" else 0.40
+            extra_change = 0.12 if profile_name == "neutral" else 0.18
+            if (
+                score >= self._regime_min_momentum_score() + extra_score
+                and quote.change_rate >= self._regime_min_change_rate() + extra_change
+            ):
                 required_ticks = 1
         if required_ticks <= 1:
             self._entry_signals.pop(quote.symbol, None)
@@ -2038,8 +2538,17 @@ class MomentumScalpStrategy(BaseStrategy):
             )
             return False
 
+        max_pullback_pct = self.cfg.entry_confirmation_max_pullback_pct
+        score_tolerance = self.cfg.entry_confirmation_min_score_tolerance
+        if profile_name == "neutral":
+            max_pullback_pct = min(max_pullback_pct, -0.8)
+            score_tolerance = max(score_tolerance, 0.55)
+        elif profile_name == "soft_bear":
+            max_pullback_pct = min(max_pullback_pct, -1.0)
+            score_tolerance = max(score_tolerance, 0.65)
+
         pullback_pct = (quote.current_price - signal.first_price) / signal.first_price * 100
-        if pullback_pct < self.cfg.entry_confirmation_max_pullback_pct:
+        if pullback_pct < max_pullback_pct:
             self._entry_signals[quote.symbol] = MomentumEntrySignal(
                 streak=1,
                 first_price=quote.current_price,
@@ -2051,11 +2560,11 @@ class MomentumScalpStrategy(BaseStrategy):
                 "진입 재확인 리셋(과도한 되돌림): %s %.2f%% < %.2f%%",
                 quote.symbol,
                 pullback_pct,
-                self.cfg.entry_confirmation_max_pullback_pct,
+                max_pullback_pct,
             )
             return False
 
-        if score + self.cfg.entry_confirmation_min_score_tolerance < signal.best_score:
+        if score + score_tolerance < signal.best_score:
             self._entry_signals[quote.symbol] = MomentumEntrySignal(
                 streak=1,
                 first_price=quote.current_price,
@@ -2109,40 +2618,56 @@ class MomentumScalpStrategy(BaseStrategy):
             return True
         if quote.current_price <= 0 or quote.open_price <= 0 or quote.high_price <= 0:
             return True
-        if quote.change_rate < self.cfg.pullback_activation_change_rate:
+        profile_name = self._resolve_regime_profile_name()
+        activation_change_rate = self.cfg.pullback_activation_change_rate
+        required_min_drop_pct = self.cfg.pullback_required_min_drop_pct
+        allowed_max_drop_pct = self.cfg.pullback_allowed_max_drop_pct
+        min_vs_open_pct = self.cfg.pullback_min_vs_open_pct
+        if profile_name == "neutral":
+            activation_change_rate = max(activation_change_rate, 2.3)
+            required_min_drop_pct = min(required_min_drop_pct, 0.12)
+            allowed_max_drop_pct = max(allowed_max_drop_pct, 1.6)
+            min_vs_open_pct = min(min_vs_open_pct, 0.18)
+        elif profile_name == "soft_bear":
+            activation_change_rate = max(activation_change_rate, 2.6)
+            required_min_drop_pct = min(required_min_drop_pct, 0.10)
+            allowed_max_drop_pct = max(allowed_max_drop_pct, 1.8)
+            min_vs_open_pct = min(min_vs_open_pct, 0.12)
+
+        if quote.change_rate < activation_change_rate:
             return True
 
         pullback_drop_pct = (quote.high_price - quote.current_price) / quote.high_price * 100
-        if pullback_drop_pct < self.cfg.pullback_required_min_drop_pct:
+        if pullback_drop_pct < required_min_drop_pct:
             self._log_entry_filter_once_per_minute(
                 quote.symbol,
                 "pullback_wait",
                 "눌림목 대기: %s 고점대비 조정 %.2f%% < 최소 %.2f%%",
                 quote.symbol,
                 pullback_drop_pct,
-                self.cfg.pullback_required_min_drop_pct,
+                required_min_drop_pct,
             )
             return False
-        if pullback_drop_pct > self.cfg.pullback_allowed_max_drop_pct:
+        if pullback_drop_pct > allowed_max_drop_pct:
             self._log_entry_filter_once_per_minute(
                 quote.symbol,
                 "pullback_broken",
                 "눌림목 이탈: %s 고점대비 조정 %.2f%% > 최대 %.2f%%",
                 quote.symbol,
                 pullback_drop_pct,
-                self.cfg.pullback_allowed_max_drop_pct,
+                allowed_max_drop_pct,
             )
             return False
 
         vs_open = (quote.current_price - quote.open_price) / quote.open_price * 100
-        if vs_open < self.cfg.pullback_min_vs_open_pct:
+        if vs_open < min_vs_open_pct:
             self._log_entry_filter_once_per_minute(
                 quote.symbol,
                 "pullback_vs_open",
                 "눌림목 취소: %s 시가대비 %.2f%% < 최소 %.2f%%",
                 quote.symbol,
                 vs_open,
-                self.cfg.pullback_min_vs_open_pct,
+                min_vs_open_pct,
             )
             return False
         return True
@@ -2190,9 +2715,11 @@ class MomentumScalpStrategy(BaseStrategy):
         is_scale_in = position is not None
 
         score = self._calc_momentum_score(quote) if score_hint is None else score_hint
-        if not self._is_volume_spike(quote, score=score):
-            return None
+        entry_reason = ""
+        setup_name = ""
         if is_scale_in:
+            if not self._is_volume_spike(quote, score=score):
+                return None
             if not self.cfg.enable_pyramiding:
                 return None
             pnl_pct = (quote.current_price - position.buy_price) / position.buy_price * 100
@@ -2204,18 +2731,34 @@ class MomentumScalpStrategy(BaseStrategy):
             if self._is_bullish_regime():
                 scale_threshold = (
                     self._regime_bullish_min_momentum_score() + self.cfg.scale_in_score_bonus
-                )
+            )
             if score < scale_threshold:
                 return None
         else:
-            entry_threshold = self._regime_min_momentum_score()
+            if not self._can_open_new_long(
+                quote,
+                pending_orders=pending_orders,
+                score=score,
+                now=now,
+            ):
+                return None
             if self._is_bullish_regime():
-                entry_threshold = self._regime_bullish_min_momentum_score()
-            if score < entry_threshold:
-                return None
-            if not self._passes_pullback_entry_filter(quote, is_scale_in=is_scale_in):
+                setup_ok, setup_name, setup_payload = self._passes_bull_breakout_setup(quote, score)
+            else:
+                setup_ok, setup_name, setup_payload = self._passes_neutral_pullback_reclaim_setup(quote, score)
+            if not setup_ok:
                 self._entry_signals.pop(quote.symbol, None)
+                if setup_payload:
+                    self._log_setup_reject(
+                        quote,
+                        setup_payload,
+                        "%s (%s)",
+                        quote.symbol,
+                        setup_payload,
+                    )
                 return None
+            entry_meta = self._build_entry_metadata(quote.symbol, setup_name, setup_payload)
+            entry_reason = self._append_entry_context(setup_payload, entry_meta)
 
         if quote.change_rate >= self.cfg.overheated_jump_change_pct:
             retrace_anchor = quote.open_price * (
@@ -2234,15 +2777,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 self._entry_signals.pop(quote.symbol, None)
                 return None
 
-        if not is_scale_in and not self._can_open_new_long(
-            quote,
-            pending_orders=pending_orders,
-            score=score,
-            now=now,
-        ):
-            return None
-
-        if not self._can_confirm_entry(
+        if is_scale_in and not self._can_confirm_entry(
             quote=quote,
             score=score,
             is_scale_in=is_scale_in,
@@ -2277,14 +2812,16 @@ class MomentumScalpStrategy(BaseStrategy):
                 f"{alloc:,}",
             )
         else:
+            self._pending_entry_meta[quote.symbol] = dict(entry_meta)
             logger.info(
-                "매수 신호: %s(%s) 점수=%.1f, %d주 @ %s원 (할당 %s원)",
+                "매수 신호: %s(%s) 점수=%.1f, %d주 @ %s원 (할당 %s원, %s)",
                 quote.name,
                 quote.symbol,
                 score,
                 quantity,
                 f"{quote.current_price:,}",
                 f"{alloc:,}",
+                entry_reason,
             )
 
         self._entry_signals.pop(quote.symbol, None)
@@ -2304,16 +2841,13 @@ class MomentumScalpStrategy(BaseStrategy):
         인버스 ETF는 시장 하락 시 상승하므로 모멘텀 점수가 자연스럽게 높아진다.
         """
         now = self._now()
+        profile_name = self._resolve_regime_profile_name()
         if self._is_new_entry_window_blocked(now):
             return None
         if quote.current_price <= 0 or quote.open_price <= 0:
             return None
-        if quote.change_rate < self.cfg.inverse_min_change_rate:
-            return None
-        if not self._is_volume_spike(quote):
-            return None
-
-        if self._bear_score < max(self.cfg.bearish_threshold, self.cfg.inverse_min_bear_score):
+        required_bear_score = max(self.cfg.bearish_threshold, self._regime_inverse_min_bear_score())
+        if self._bear_score < required_bear_score:
             return None
 
         if self._global_loss_cooldown_until and now < self._global_loss_cooldown_until:
@@ -2328,10 +2862,37 @@ class MomentumScalpStrategy(BaseStrategy):
             if elapsed < self._regime_cooldown_seconds():
                 return None
 
-        # 모멘텀 점수 (인버스도 상승 중이어야 진입)
         score = self._calc_momentum_score(quote)
-        if score < self.cfg.inverse_min_momentum:
+        min_change_rate = self._regime_inverse_min_change_rate()
+        min_momentum = self._regime_inverse_min_momentum()
+        if self._is_loss_stage_active():
+            min_change_rate += self.cfg.stage1_inverse_change_bonus
+            min_momentum += self.cfg.stage1_inverse_score_bonus
+        if quote.change_rate < min_change_rate:
             return None
+        if score < min_momentum:
+            return None
+
+        setup_name = "hard_bear_inverse_momentum"
+        entry_payload = f"setup_name=hard_bear_inverse_momentum entry_reason=bear_momentum score={score:.2f}"
+        if profile_name == "soft_bear":
+            setup_ok, setup_name, setup_payload = self._passes_soft_bear_inverse_setup(quote, score)
+            if not setup_ok:
+                if setup_payload:
+                    self._log_setup_reject(
+                        quote,
+                        setup_payload,
+                        "%s (%s)",
+                        quote.symbol,
+                        setup_payload,
+                    )
+                return None
+            entry_payload = setup_payload
+        elif not self._is_volume_spike(quote, score=score):
+            return None
+
+        entry_meta = self._build_entry_metadata(quote.symbol, setup_name, entry_payload)
+        entry_reason = self._append_entry_context(entry_payload, entry_meta)
 
         alloc = self._compute_buy_allocation(
             symbol=quote.symbol,
@@ -2348,9 +2909,16 @@ class MomentumScalpStrategy(BaseStrategy):
         ):
             return None
 
-        logger.info("[INV] 매수 신호: %s 약세점수=%d, 모멘텀=%.1f, %d주 @ %s원",
-                     quote.symbol, self._bear_score, score, quantity,
-                     f"{quote.current_price:,}")
+        self._pending_entry_meta[quote.symbol] = dict(entry_meta)
+        logger.info(
+            "[INV] 매수 신호: %s 약세점수=%d, 모멘텀=%.1f, %d주 @ %s원 (%s)",
+            quote.symbol,
+            self._bear_score,
+            score,
+            quantity,
+            f"{quote.current_price:,}",
+            entry_reason,
+        )
 
         return Order(
             symbol=quote.symbol,
@@ -2366,11 +2934,21 @@ class MomentumScalpStrategy(BaseStrategy):
         current_price: int,
         pending_orders: Optional[List[Order]] = None,
     ) -> int:
+        is_inverse = symbol in self._inverse_symbols
+        capital_base = self._allocation_capital_base()
+        target_total_exposure = self._regime_target_total_exposure_amount()
         total_exposure = self._get_total_exposure()
         stock_exposure = self._get_stock_exposure(symbol)
+        side_exposure = sum(
+            pos.buy_price * pos.quantity
+            for sym, pos in self.positions.items()
+            if (sym in self._inverse_symbols) == is_inverse
+        )
 
         pending_total = 0
         pending_stock = 0
+        pending_side = 0
+        pending_side_count = 0
         for order in pending_orders or []:
             if order.side != OrderSide.BUY:
                 continue
@@ -2381,16 +2959,44 @@ class MomentumScalpStrategy(BaseStrategy):
             pending_total += amount
             if order.symbol == symbol:
                 pending_stock += amount
+            if (order.symbol in self._inverse_symbols) == is_inverse:
+                pending_side += amount
+                if order.symbol not in self.positions:
+                    pending_side_count += 1
 
-        total_room = self.cfg.seed_money - (total_exposure + pending_total)
-        stock_room = self.cfg.max_per_stock_amount - (stock_exposure + pending_stock)
         if current_price <= 0:
             return 0
 
+        total_room = min(
+            capital_base - (total_exposure + pending_total),
+            target_total_exposure - (total_exposure + pending_total),
+        )
         per_stock_amount = int(self.cfg.per_stock_amount * self._regime_per_stock_alloc_scale())
         max_stock_amount = int(self.cfg.max_per_stock_amount * self._regime_max_stock_alloc_scale())
+        max_stock_amount = min(max_stock_amount, self._regime_max_single_position_amount())
         stock_room = max_stock_amount - (stock_exposure + pending_stock)
-        alloc = min(per_stock_amount, total_room, stock_room)
+
+        side_slot_limit = (
+            self._regime_inverse_max_positions()
+            if is_inverse
+            else self._effective_max_position_count()
+        )
+        if side_slot_limit <= 0:
+            return 0
+
+        open_side_count = sum(
+            1 for sym in self.positions if (sym in self._inverse_symbols) == is_inverse
+        )
+        remaining_side_slots = max(1, side_slot_limit - open_side_count - pending_side_count)
+        side_room_target = target_total_exposure - (side_exposure + pending_side)
+        if side_room_target <= 0:
+            return 0
+        side_budget_target = max(
+            per_stock_amount,
+            int(side_room_target / remaining_side_slots),
+        )
+
+        alloc = min(side_budget_target, total_room, stock_room)
         if alloc <= 0:
             return 0
 
@@ -2419,6 +3025,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
         pnl_pct = (quote.current_price - pos.buy_price) / pos.buy_price * 100
         pnl_amount = (quote.current_price - pos.buy_price) * pos.quantity
+        stop_amount = self._long_stop_loss_amount(pos)
 
         holding_minutes = (self._now() - pos.buy_time).total_seconds() / 60
         if holding_minutes >= self._regime_max_holding_minutes() and not pos.is_restored:
@@ -2438,11 +3045,11 @@ class MomentumScalpStrategy(BaseStrategy):
                         quote.symbol, pnl_pct, f"{pnl_amount:,}")
             return self._make_sell_order(pos)
 
-        # 개별 포지션 손절 (금액 기준)
-        if pnl_amount <= self._regime_per_position_stop_loss():
+        # 개별 포지션 손절 (포지션 노출 연동 금액 기준)
+        if pnl_amount <= stop_amount:
             logger.info("개별손절: %s %s원 (한도 %s원)",
                         quote.symbol, f"{pnl_amount:,}",
-                        f"{self._regime_per_position_stop_loss():,}")
+                        f"{stop_amount:,}")
             return self._make_sell_order(pos)
 
         # 추적손절 (고점 대비)
@@ -2483,6 +3090,8 @@ class MomentumScalpStrategy(BaseStrategy):
             return None
 
         pnl_pct = (quote.current_price - pos.buy_price) / pos.buy_price * 100
+        pnl_amount = (quote.current_price - pos.buy_price) * pos.quantity
+        stop_amount = self._inverse_stop_loss_amount(pos)
 
         # 1. 익절
         if pnl_pct >= self._regime_inverse_take_profit_pct():
@@ -2495,9 +3104,9 @@ class MomentumScalpStrategy(BaseStrategy):
             logger.info("[INV] 익절: %s %.2f%%", quote.symbol, pnl_pct)
             return self._make_sell_order(pos)
 
-        # 2. 손절 (-0.5%, 타이트)
-        if pnl_pct <= self._regime_inverse_stop_loss_pct():
-            logger.info("[INV] 손절: %s %.2f%%", quote.symbol, pnl_pct)
+        # 2. 손절 (포지션 노출 연동 금액 기준)
+        if pnl_amount <= stop_amount:
+            logger.info("[INV] 손절: %s %s원 (한도 %s원)", quote.symbol, f"{pnl_amount:,}", f"{stop_amount:,}")
             return self._make_sell_order(pos)
 
         # 3. 시간 초과 청산 (음의 복리 방지, 실거래 모드만)
@@ -2557,7 +3166,8 @@ class MomentumScalpStrategy(BaseStrategy):
 
         # 3. 고가 근접도 (0~1.0)
         price_range = quote.high_price - quote.low_price
-        if price_range > 0:
+        profile_name = self._resolve_regime_profile_name()
+        if price_range > 0 and profile_name == "bull":
             proximity = (quote.current_price - quote.low_price) / price_range
             if proximity >= 0.9:
                 score += 1.0
@@ -2662,7 +3272,7 @@ class MomentumScalpStrategy(BaseStrategy):
         sell_tax_slippage = self._calc_sell_tax_slippage_cost(sell_notional)
         expected_net = gross_expected - buy_fee - sell_fee - sell_tax_slippage
 
-        risk_amount = max(1, abs(self._regime_per_position_stop_loss()))
+        risk_amount = max(1, self._entry_stop_risk_amount(symbol, quantity, entry_price_with_slip))
         rr_ratio = expected_net / risk_amount
         passes = (
             expected_net >= self._regime_min_expected_net_profit()
