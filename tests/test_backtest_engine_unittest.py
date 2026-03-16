@@ -46,6 +46,7 @@ class DummyBacktestStrategy(BaseStrategy):
         if result.side == OrderSide.BUY:
             self.has_position = True
             self.positions[result.symbol] = SimpleNamespace(
+                entry_strategy_name="bull_breakout_strategy",
                 entry_setup_name="bull_breakout",
                 entry_reason="local_high_breakout",
                 regime_label="bull",
@@ -87,6 +88,7 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertEqual(len(result.daily_records), 1)
         self.assertEqual(result.daily_records[0].trade_count, 2)
         self.assertEqual([record.date for record in result.trade_records], ["20260102", "20260102"])
+        self.assertEqual(result.trade_records[0].strategy_name, "bull_breakout_strategy")
         self.assertEqual(result.trade_records[0].setup_name, "bull_breakout")
         self.assertEqual(result.trade_records[1].regime_label, "bull")
         self.assertTrue(strategy.simulated_times)

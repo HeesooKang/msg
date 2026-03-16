@@ -90,13 +90,13 @@ class PerformanceReportingTests(unittest.TestCase):
                     [
                         "2026-03-11 10:01:00 [INFO] kis_trader.strategy.momentum: "
                         "매수 신호: 미원(011700) 점수=2.5, 10주 @ 10,000원 "
-                        "(할당 100,000원, setup_name=neutral_pullback_reclaim "
+                        "(할당 100,000원, strategy_name=neutral_pullback_strategy setup_name=neutral_pullback_reclaim "
                         "entry_reason=pullback_reclaim regime_label=neutral bear_score=1 planned_risk_stage=normal)",
                         "2026-03-11 10:02:00 [INFO] kis_trader.strategy.momentum: "
                         "진입 거부[neutral_chase_block] reject_reason=neutral_chase_block: 011700 (neutral_chase_block)",
                         "2026-03-11 10:30:00 [INFO] kis_trader.strategy.momentum: "
                         "매도 체결: 011700 10주 @ 10,150원 (총손익: 1,500원, 순손익: 1,200원, 누적순손익: 1,200원, "
-                        "setup_name=neutral_pullback_reclaim, regime_label=neutral)",
+                        "strategy_name=neutral_pullback_strategy, setup_name=neutral_pullback_reclaim, regime_label=neutral)",
                     ]
                 ),
                 encoding="utf-8",
@@ -112,7 +112,9 @@ class PerformanceReportingTests(unittest.TestCase):
             )
 
         self.assertEqual(scorecard["log_analysis"]["entries"]["by_setup"]["neutral_pullback_reclaim"], 1)
+        self.assertEqual(scorecard["log_analysis"]["entries"]["by_strategy"]["neutral_pullback_strategy"], 1)
         self.assertEqual(scorecard["log_analysis"]["rejections"]["by_reason"]["neutral_chase_block"], 1)
+        self.assertEqual(scorecard["log_analysis"]["strategy_pnl"]["neutral_pullback_strategy"]["net_pnl"], 1_200)
         self.assertEqual(scorecard["log_analysis"]["setup_pnl"]["neutral_pullback_reclaim"]["net_pnl"], 1_200)
         self.assertEqual(scorecard["log_analysis"]["symbols"]["top_winners"][0]["symbol"], "011700")
 

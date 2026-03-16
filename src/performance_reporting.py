@@ -284,10 +284,14 @@ def analyze_trading_log(
             break
 
     entry_by_setup: Dict[str, int] = defaultdict(int)
+    entry_by_strategy: Dict[str, int] = defaultdict(int)
     entry_by_reason: Dict[str, int] = defaultdict(int)
     entry_by_regime: Dict[str, int] = defaultdict(int)
     reject_by_reason: Dict[str, int] = defaultdict(int)
     setup_pnl: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0, "wins": 0, "losses": 0}
+    )
+    strategy_pnl: Dict[str, Dict[str, int]] = defaultdict(
         lambda: {"closed_trades": 0, "net_pnl": 0, "wins": 0, "losses": 0}
     )
     regime_pnl: Dict[str, int] = defaultdict(int)
@@ -320,7 +324,9 @@ def analyze_trading_log(
         regime_match = _REGIME_LABEL_RE.search(message)
         if "매수 신호:" in message and setup_match:
             setup_name = setup_match.group(1)
+            strategy_name = _extract_context_token(message, "strategy_name", "unknown_strategy")
             entry_by_setup[setup_name] += 1
+            entry_by_strategy[strategy_name] += 1
             if entry_reason_match:
                 entry_by_reason[entry_reason_match.group(1)] += 1
             regime_label = regime_match.group(1) if regime_match else "unknown"
@@ -328,6 +334,7 @@ def analyze_trading_log(
             symbol = _extract_signal_symbol(message)
             if symbol:
                 active_entries[symbol] = {
+                    "strategy_name": strategy_name,
                     "setup_name": setup_name,
                     "regime_label": regime_label,
                 }
@@ -337,18 +344,28 @@ def analyze_trading_log(
             if not symbol:
                 continue
             entry_meta = active_entries.pop(symbol, {})
+            strategy_name = entry_meta.get("strategy_name") or _extract_context_token(
+                message,
+                "strategy_name",
+                "unknown_strategy",
+            )
             setup_name = entry_meta.get("setup_name") or _extract_context_token(message, "setup_name", "unknown")
             regime_label = entry_meta.get("regime_label") or _extract_context_token(message, "regime_label", "unknown")
             net_pnl = _extract_sell_net_pnl(message)
             metrics = setup_pnl[setup_name]
             metrics["closed_trades"] += 1
             metrics["net_pnl"] += net_pnl
+            strategy_metrics = strategy_pnl[strategy_name]
+            strategy_metrics["closed_trades"] += 1
+            strategy_metrics["net_pnl"] += net_pnl
             regime_pnl[regime_label] += net_pnl
             symbol_pnl[symbol] += net_pnl
             if net_pnl > 0:
                 metrics["wins"] += 1
+                strategy_metrics["wins"] += 1
             elif net_pnl < 0:
                 metrics["losses"] += 1
+                strategy_metrics["losses"] += 1
 
     sorted_symbols = sorted(symbol_pnl.items(), key=lambda item: (item[1], item[0]), reverse=True)
     top_winners = [
@@ -365,12 +382,17 @@ def analyze_trading_log(
         "entries": {
             "total": int(sum(entry_by_setup.values())),
             "by_setup": dict(sorted(entry_by_setup.items())),
+            "by_strategy": dict(sorted(entry_by_strategy.items())),
             "by_entry_reason": dict(sorted(entry_by_reason.items())),
             "by_regime": dict(sorted(entry_by_regime.items())),
         },
         "rejections": {
             "total": int(sum(reject_by_reason.values())),
             "by_reason": dict(sorted(reject_by_reason.items())),
+        },
+        "strategy_pnl": {
+            strategy: metrics
+            for strategy, metrics in sorted(strategy_pnl.items())
         },
         "setup_pnl": {
             setup: metrics
@@ -428,6 +450,7 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
 
     entries = log_analysis.get("entries", {})
     rejections = log_analysis.get("rejections", {})
+    strategy_pnl = log_analysis.get("strategy_pnl", {})
     setup_pnl = log_analysis.get("setup_pnl", {})
     regime_pnl = log_analysis.get("regime_pnl", {})
     symbols = log_analysis.get("symbols", {})
@@ -437,9 +460,17 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
             f"{key} {_safe_int(value)}건"
             for key, value in entries.get("by_setup", {}).items()
         ) or "-"
+        strategy_entry_summary = ", ".join(
+            f"{key} {_safe_int(value)}건"
+            for key, value in entries.get("by_strategy", {}).items()
+        ) or "-"
         rejection_summary = ", ".join(
             f"{key} {_safe_int(value)}건"
             for key, value in rejections.get("by_reason", {}).items()
+        ) or "-"
+        strategy_pnl_summary = ", ".join(
+            f"{key} {_format_currency(value.get('net_pnl'))} / {_safe_int(value.get('closed_trades'))}건"
+            for key, value in strategy_pnl.items()
         ) or "-"
         setup_pnl_summary = ", ".join(
             f"{key} {_format_currency(value.get('net_pnl'))} / {_safe_int(value.get('closed_trades'))}건"
@@ -463,8 +494,10 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
                 f"- 분석 로그: {log_analysis.get('log_path') or '-'}",
                 f"- 진입 신호 수: {_safe_int(entries.get('total'))}건",
                 f"- 진입 셋업별: {setup_entry_summary}",
+                f"- 진입 전략별: {strategy_entry_summary}",
                 f"- 차단 사유 수: {_safe_int(rejections.get('total'))}건",
                 f"- 차단 사유별: {rejection_summary}",
+                f"- 전략별 순손익: {strategy_pnl_summary}",
                 f"- 셋업별 순손익: {setup_pnl_summary}",
                 f"- 레짐별 순손익: {regime_pnl_summary}",
                 f"- 종목별 상위: {top_winners_summary}",

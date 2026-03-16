@@ -22,6 +22,7 @@ class TradeRecord:
     quantity: int
     price: int
     pnl: int = 0
+    strategy_name: str = ""
     setup_name: str = ""
     entry_reason: str = ""
     regime_label: str = ""
@@ -200,6 +201,7 @@ class BacktestEngine:
                     result.trade_records.append(TradeRecord(
                         date=day, symbol=symbol, side="sell",
                         quantity=pos["qty"], price=fill_price, pnl=net_pnl,
+                        strategy_name=str(pos.get("strategy_name", "") or ""),
                         setup_name=str(pos.get("setup_name", "") or ""),
                         entry_reason=str(pos.get("entry_reason", "") or ""),
                         regime_label=str(pos.get("regime_label", "") or ""),
@@ -338,6 +340,7 @@ class BacktestEngine:
                 result.trade_records.append(TradeRecord(
                     date=trade_date, symbol=order.symbol, side="buy",
                     quantity=order.quantity, price=fill_price,
+                    strategy_name=str(self._positions[order.symbol].get("strategy_name", "") or ""),
                     setup_name=str(self._positions[order.symbol].get("setup_name", "") or ""),
                     entry_reason=str(self._positions[order.symbol].get("entry_reason", "") or ""),
                     regime_label=str(self._positions[order.symbol].get("regime_label", "") or ""),
@@ -380,6 +383,7 @@ class BacktestEngine:
                 result.trade_records.append(TradeRecord(
                     date=trade_date, symbol=order.symbol, side="sell",
                     quantity=order.quantity, price=fill_price, pnl=net_pnl,
+                    strategy_name=str(pos.get("strategy_name", "") or ""),
                     setup_name=str(pos.get("setup_name", "") or ""),
                     entry_reason=str(pos.get("entry_reason", "") or ""),
                     regime_label=str(pos.get("regime_label", "") or ""),
@@ -408,6 +412,7 @@ class BacktestEngine:
 
         inverse_symbols = getattr(self.strategy, "_inverse_symbols", set()) or set()
         return {
+            "strategy_name": str(getattr(pos, "entry_strategy_name", "") or ""),
             "setup_name": str(getattr(pos, "entry_setup_name", "") or ""),
             "entry_reason": str(getattr(pos, "entry_reason", "") or ""),
             "regime_label": str(getattr(pos, "regime_label", "") or ""),

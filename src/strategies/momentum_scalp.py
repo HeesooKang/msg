@@ -24,6 +24,7 @@ from src.market_data import MarketDataAPI
 from src.models import Order, OrderResult, OrderSide, OrderType, Position, Quote
 from src.notifications import AlertManager
 from src.strategy import BaseStrategy
+from src.strategies.regime_router import RegimeStrategyRouter
 
 logger = logging.getLogger("kis_trader.strategy.momentum")
 
@@ -164,14 +165,28 @@ class MomentumScalpConfig:
     enable_cost_aware_profit_exit: bool = True
     min_profit_exit_net_pnl: int = 1
     enable_setup_logging: bool = True
+    enable_shadow_blocked_candidate_tracking: bool = True
+    shadow_blocked_candidate_window_minutes: int = 20
     setup_recent_quote_window: int = 8
     bull_breakout_hold_ticks: int = 2
     bull_breakout_buffer_pct: float = 0.03
     neutral_pullback_min_drop_pct: float = 0.25
     neutral_pullback_max_drop_pct: float = 1.2
+    neutral_pullback_min_ticks: int = 2
     neutral_min_runup_from_open_pct: float = 0.8
     neutral_reclaim_buffer_pct: float = 0.05
     neutral_chase_block_proximity_pct: float = 0.10
+    neutral_entry_start_minutes_after_open: int = 35
+    neutral_entry_confirmation_ticks: int = 3
+    neutral_max_losses_per_day: int = 1
+    neutral_post_loss_cooldown_minutes: int = 30
+    neutral_post_loss_reentry_limit: int = 1
+    neutral_post_loss_min_drop_bonus_pct: float = 0.30
+    neutral_post_loss_min_runup_bonus_pct: float = 0.50
+    neutral_post_loss_reclaim_buffer_bonus_pct: float = 0.05
+    neutral_post_loss_score_bonus: float = 0.35
+    neutral_post_loss_change_rate_bonus: float = 0.15
+    neutral_post_loss_extra_pullback_ticks: int = 1
     soft_bear_inverse_pullback_min_drop_pct: float = 0.12
     soft_bear_inverse_pullback_max_drop_pct: float = 0.8
     soft_bear_inverse_min_runup_from_open_pct: float = 0.4
@@ -258,6 +273,7 @@ class PositionState:
     high_since_buy: int = 0
     is_restored: bool = False
     restored_at: Optional[datetime] = None
+    entry_strategy_name: str = ""
     entry_setup_name: str = ""
     entry_reason: str = ""
     regime_label: str = ""
@@ -269,6 +285,26 @@ class PositionState:
             self.invested_amount = self.buy_price * self.quantity
         if self.high_since_buy == 0:
             self.high_since_buy = self.buy_price
+
+
+@dataclass
+class ShadowBlockedCandidate:
+    """실제 진입은 하지 않지만 결과를 추적할 차단 후보."""
+
+    symbol: str
+    blocked_at: datetime
+    reject_reason: str
+    regime_label: str
+    entry_price: int
+    hypothetical_quantity: int
+    notional: int
+    target_pct: float
+    stop_loss_pct: float
+    max_price: int
+    min_price: int
+    last_price: int
+    first_hit_outcome: str = ""
+    first_hit_at: Optional[datetime] = None
 
 
 @dataclass
@@ -367,6 +403,11 @@ class MomentumScalpStrategy(BaseStrategy):
         self._simulated_now: Optional[datetime] = None
         self._risk_stage_label: str = "normal"
         self._pending_entry_meta: Dict[str, dict] = {}
+        self._neutral_loss_count_today: int = 0
+        self._neutral_last_loss_at: Optional[datetime] = None
+        self._neutral_post_loss_reentries_today: int = 0
+        self._shadow_blocked_candidates: Dict[str, ShadowBlockedCandidate] = {}
+        self._regime_router = RegimeStrategyRouter()
 
     def set_simulated_now(self, now: Optional[datetime]):
         """백테스트에서 사용할 시뮬레이션 시각을 주입한다."""
@@ -432,6 +473,122 @@ class MomentumScalpStrategy(BaseStrategy):
             *args,
         )
 
+    def _track_shadow_blocked_candidate(self, quote: Quote, reject_reason: str) -> None:
+        if not self.cfg.enable_shadow_blocked_candidate_tracking:
+            return
+        if reject_reason != "neutral_loss_limit_block":
+            return
+        if quote.current_price <= 0:
+            return
+        if quote.symbol in self._shadow_blocked_candidates:
+            return
+
+        allocation = self._compute_buy_allocation(
+            symbol=quote.symbol,
+            current_price=quote.current_price,
+        )
+        quantity = allocation // quote.current_price
+        if quantity <= 0:
+            quantity = 1
+        notional = max(quote.current_price, quantity * quote.current_price)
+        target_pct = float(self._build_regime_profile("neutral")["take_profit_pct"])
+        stop_loss_pct = abs(self._long_stop_loss_amount_for_notional(notional)) / max(1, notional) * 100
+
+        self._shadow_blocked_candidates[quote.symbol] = ShadowBlockedCandidate(
+            symbol=quote.symbol,
+            blocked_at=self._now(),
+            reject_reason=reject_reason,
+            regime_label=self._resolve_regime_profile_name(),
+            entry_price=quote.current_price,
+            hypothetical_quantity=quantity,
+            notional=notional,
+            target_pct=target_pct,
+            stop_loss_pct=stop_loss_pct,
+            max_price=quote.current_price,
+            min_price=quote.current_price,
+            last_price=quote.current_price,
+        )
+        logger.info(
+            "그림자 후보 추적 시작: %s shadow_reason=%s regime_label=%s entry=%s원 qty=%d "
+            "target=%.2f%% stop=%.2f%% window=%d분",
+            quote.symbol,
+            reject_reason,
+            self._resolve_regime_profile_name(),
+            f"{quote.current_price:,}",
+            quantity,
+            target_pct,
+            stop_loss_pct,
+            max(1, int(self.cfg.shadow_blocked_candidate_window_minutes)),
+        )
+
+    def _finalize_shadow_blocked_candidate(self, candidate: ShadowBlockedCandidate) -> None:
+        mfe_pct = self._pct_move(candidate.entry_price, candidate.max_price)
+        mae_pct = self._pct_move(candidate.entry_price, candidate.min_price)
+        close_return_pct = self._pct_move(candidate.entry_price, candidate.last_price)
+
+        if candidate.first_hit_outcome:
+            outcome = candidate.first_hit_outcome
+        elif close_return_pct > 0:
+            outcome = "close_up"
+        elif close_return_pct < 0:
+            outcome = "close_down"
+        else:
+            outcome = "flat"
+
+        logger.info(
+            "그림자 후보 종료: %s shadow_reason=%s regime_label=%s entry=%s원 last=%s원 max=%s원 "
+            "min=%s원 MFE=%.2f%% MAE=%.2f%% close=%.2f%% outcome=%s",
+            candidate.symbol,
+            candidate.reject_reason,
+            candidate.regime_label,
+            f"{candidate.entry_price:,}",
+            f"{candidate.last_price:,}",
+            f"{candidate.max_price:,}",
+            f"{candidate.min_price:,}",
+            mfe_pct,
+            mae_pct,
+            close_return_pct,
+            outcome,
+        )
+
+    def _update_shadow_blocked_candidates(
+        self,
+        quotes: List[Quote],
+        now: Optional[datetime] = None,
+    ) -> None:
+        if not self.cfg.enable_shadow_blocked_candidate_tracking:
+            return
+        if not self._shadow_blocked_candidates:
+            return
+        if now is None:
+            now = self._now()
+
+        quote_map = {quote.symbol: quote for quote in quotes}
+        expiry = timedelta(minutes=max(1, int(self.cfg.shadow_blocked_candidate_window_minutes)))
+        finalize_symbols: List[str] = []
+
+        for symbol, candidate in self._shadow_blocked_candidates.items():
+            quote = quote_map.get(symbol) or self._quotes_cache.get(symbol)
+            if quote and quote.current_price > 0:
+                candidate.last_price = quote.current_price
+                candidate.max_price = max(candidate.max_price, quote.current_price)
+                candidate.min_price = min(candidate.min_price, quote.current_price)
+                move_pct = self._pct_move(candidate.entry_price, quote.current_price)
+                if not candidate.first_hit_outcome:
+                    if move_pct >= candidate.target_pct:
+                        candidate.first_hit_outcome = "take_profit_first"
+                        candidate.first_hit_at = now
+                    elif move_pct <= -candidate.stop_loss_pct:
+                        candidate.first_hit_outcome = "stop_loss_first"
+                        candidate.first_hit_at = now
+
+            if now >= candidate.blocked_at + expiry or (now.hour > 15 or (now.hour == 15 and now.minute >= 15)):
+                self._finalize_shadow_blocked_candidate(candidate)
+                finalize_symbols.append(symbol)
+
+        for symbol in finalize_symbols:
+            self._shadow_blocked_candidates.pop(symbol, None)
+
     def _log_risk_stage_change(self, stage_label: str, total_net: int):
         if stage_label == self._risk_stage_label:
             return
@@ -458,9 +615,16 @@ class MomentumScalpStrategy(BaseStrategy):
                 return chunk[len(marker):]
         return default
 
-    def _build_entry_metadata(self, symbol: str, setup_name: str, payload: str) -> dict:
+    def _build_entry_metadata(
+        self,
+        symbol: str,
+        setup_name: str,
+        payload: str,
+        strategy_name: str = "",
+    ) -> dict:
         current_stage = self._current_risk_stage()
         return {
+            "strategy_name": strategy_name or self._extract_context_token(payload, "strategy_name", "unknown"),
             "setup_name": setup_name or self._extract_context_token(payload, "setup_name", "unknown"),
             "entry_reason": self._extract_context_token(payload, "entry_reason", setup_name or "unknown"),
             "regime_label": self._resolve_regime_profile_name(),
@@ -472,14 +636,66 @@ class MomentumScalpStrategy(BaseStrategy):
     def _append_entry_context(self, payload: str, metadata: dict) -> str:
         base = str(payload or "").strip()
         extra = (
+            f"strategy_name={metadata.get('strategy_name', '')} "
             f"regime_label={metadata.get('regime_label', '')} "
             f"bear_score={int(metadata.get('bear_score', 0))} "
             f"planned_risk_stage={metadata.get('planned_risk_stage', '')}"
         )
         return f"{base} {extra}".strip()
 
+    def _minutes_since_market_open(self, now: Optional[datetime] = None) -> int:
+        if now is None:
+            now = self._now()
+        return (now.hour * 60 + now.minute) - (9 * 60)
+
+    def _is_neutral_entry_window_open(self, now: Optional[datetime] = None) -> bool:
+        return self._minutes_since_market_open(now) >= int(
+            self.cfg.neutral_entry_start_minutes_after_open
+        )
+
     def _position_notional(self, pos: PositionState) -> int:
         return max(0, int(pos.invested_amount or (pos.buy_price * pos.quantity)))
+
+    def _neutral_loss_limit(self) -> int:
+        return max(1, int(self.cfg.neutral_max_losses_per_day))
+
+    def _neutral_post_loss_cooldown_until(self) -> Optional[datetime]:
+        if self._neutral_last_loss_at is None:
+            return None
+        return self._neutral_last_loss_at + timedelta(
+            minutes=max(0, int(self.cfg.neutral_post_loss_cooldown_minutes))
+        )
+
+    def _is_neutral_post_loss_retry_available(self, now: Optional[datetime] = None) -> bool:
+        if now is None:
+            now = self._now()
+        if self._neutral_loss_count_today != self._neutral_loss_limit():
+            return False
+        if int(self.cfg.neutral_post_loss_reentry_limit) <= 0:
+            return False
+        if self._neutral_post_loss_reentries_today >= int(self.cfg.neutral_post_loss_reentry_limit):
+            return False
+        cooldown_until = self._neutral_post_loss_cooldown_until()
+        if cooldown_until is None:
+            return False
+        return now >= cooldown_until
+
+    def _neutral_retry_thresholds(self) -> dict:
+        return {
+            "min_drop_pct": self.cfg.neutral_pullback_min_drop_pct + self.cfg.neutral_post_loss_min_drop_bonus_pct,
+            "min_runup_pct": (
+                self.cfg.neutral_min_runup_from_open_pct + self.cfg.neutral_post_loss_min_runup_bonus_pct
+            ),
+            "reclaim_buffer_pct": (
+                self.cfg.neutral_reclaim_buffer_pct + self.cfg.neutral_post_loss_reclaim_buffer_bonus_pct
+            ),
+            "min_score": self._regime_min_momentum_score() + self.cfg.neutral_post_loss_score_bonus,
+            "min_change_rate": self._regime_min_change_rate() + self.cfg.neutral_post_loss_change_rate_bonus,
+            "min_pullback_ticks": max(
+                1,
+                int(self.cfg.neutral_pullback_min_ticks) + int(self.cfg.neutral_post_loss_extra_pullback_ticks),
+            ),
+        }
 
     def _long_stop_loss_amount_for_notional(self, notional: int) -> int:
         dynamic_stop = int(round(max(0, notional) * self.cfg.long_stop_loss_notional_pct))
@@ -556,6 +772,8 @@ class MomentumScalpStrategy(BaseStrategy):
     def _passes_neutral_pullback_reclaim_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
         if self._resolve_regime_profile_name() != "neutral":
             return False, "", "neutral_only"
+        if not self._is_neutral_entry_window_open():
+            return False, "", "neutral_too_early"
         history = self._get_recent_quotes(quote.symbol)
         if len(history) < 4:
             return False, "", "pullback_missing"
@@ -571,17 +789,36 @@ class MomentumScalpStrategy(BaseStrategy):
         pullback_window = prices[local_high_idx + 1:]
         runup_from_open = self._pct_move(quote.open_price, local_high)
         proximity_to_day_high = self._loss_pct(max(quote.high_price, quote.current_price), quote.current_price)
+        min_pullback_ticks = max(1, int(self.cfg.neutral_pullback_min_ticks))
+        min_pullback_drop_pct = self.cfg.neutral_pullback_min_drop_pct
+        min_runup_from_open_pct = self.cfg.neutral_min_runup_from_open_pct
+        reclaim_buffer_pct = self.cfg.neutral_reclaim_buffer_pct
+        min_score = self._regime_min_momentum_score()
+        min_change_rate = self._regime_min_change_rate()
 
-        if runup_from_open < self.cfg.neutral_min_runup_from_open_pct:
+        if self._is_neutral_post_loss_retry_available():
+            retry_thresholds = self._neutral_retry_thresholds()
+            min_pullback_ticks = retry_thresholds["min_pullback_ticks"]
+            min_pullback_drop_pct = retry_thresholds["min_drop_pct"]
+            min_runup_from_open_pct = retry_thresholds["min_runup_pct"]
+            reclaim_buffer_pct = retry_thresholds["reclaim_buffer_pct"]
+            min_score = retry_thresholds["min_score"]
+            min_change_rate = retry_thresholds["min_change_rate"]
+
+        if runup_from_open < min_runup_from_open_pct:
             return False, "", "pullback_missing"
         if not pullback_window:
+            if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
+                return False, "", "neutral_chase_block"
+            return False, "", "pullback_missing"
+        if len(pullback_window) < min_pullback_ticks:
             if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
                 return False, "", "neutral_chase_block"
             return False, "", "pullback_missing"
 
         pullback_low = min(pullback_window)
         pullback_drop = self._loss_pct(local_high, pullback_low)
-        if pullback_drop < self.cfg.neutral_pullback_min_drop_pct:
+        if pullback_drop < min_pullback_drop_pct:
             if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
                 return False, "", "neutral_chase_block"
             return False, "", "pullback_missing"
@@ -590,19 +827,19 @@ class MomentumScalpStrategy(BaseStrategy):
         if self._pct_move(quote.open_price, quote.current_price) <= 0:
             return False, "", "reclaim_failed"
 
-        reclaim_level = int(round(local_high * (1 - self.cfg.neutral_reclaim_buffer_pct / 100)))
+        reclaim_level = int(round(local_high * (1 + reclaim_buffer_pct / 100)))
         if quote.current_price < reclaim_level:
             return False, "", "reclaim_failed"
-        if score < self._regime_min_momentum_score():
+        if score < min_score:
             return False, "", "neutral_score"
-        if quote.change_rate < self._regime_min_change_rate():
+        if quote.change_rate < min_change_rate:
             return False, "", "neutral_change_rate"
         if not self._is_volume_spike(quote, score=score):
             return False, "", "neutral_volume"
 
         reason = (
             f"setup_name=neutral_pullback_reclaim entry_reason=pullback_reclaim "
-            f"local_high={local_high} drop_pct={pullback_drop:.2f}"
+            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f}"
         )
         return True, "neutral_pullback_reclaim", reason
 
@@ -652,6 +889,27 @@ class MomentumScalpStrategy(BaseStrategy):
         )
         return True, "soft_bear_inverse_breakdown", reason
 
+    def _passes_hard_bear_inverse_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
+        if self._resolve_regime_profile_name() != "bear":
+            return False, "", "bear_only"
+        min_change_rate = self._regime_inverse_min_change_rate()
+        min_momentum = self._regime_inverse_min_momentum()
+        if self._is_loss_stage_active():
+            min_change_rate += self.cfg.stage1_inverse_change_bonus
+            min_momentum += self.cfg.stage1_inverse_score_bonus
+        if quote.change_rate < min_change_rate:
+            return False, "", "bear_inverse_change_rate"
+        if score < min_momentum:
+            return False, "", "bear_inverse_score"
+        if not self._is_volume_spike(quote, score=score):
+            return False, "", "bear_inverse_volume"
+
+        payload = (
+            "setup_name=hard_bear_inverse_momentum "
+            f"entry_reason=bear_momentum score={score:.2f}"
+        )
+        return True, "hard_bear_inverse_momentum", payload
+
     def initialize(self):
         today = self._today()
         self._state_loaded_for_today = False
@@ -679,6 +937,10 @@ class MomentumScalpStrategy(BaseStrategy):
             self._recent_quotes = {}
             self._risk_stage_label = "normal"
             self._pending_entry_meta = {}
+            self._neutral_loss_count_today = 0
+            self._neutral_last_loss_at = None
+            self._neutral_post_loss_reentries_today = 0
+            self._shadow_blocked_candidates = {}
         elif self._state_loaded_for_today and not self.cfg.use_restored_pnl_for_daily_breaker:
             restored_pnl = int(self.daily_pnl.realized_net_pnl)
             if restored_pnl != 0 or self.daily_pnl.trade_count > 0:
@@ -692,6 +954,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._recent_tick_volumes = {}
         self._latest_tick_volumes = {}
         self._recent_quotes = {}
+        self._shadow_blocked_candidates = {}
         self._current_day = today
         self._session_start_at = None
         self._build_pool()
@@ -894,6 +1157,9 @@ class MomentumScalpStrategy(BaseStrategy):
                 largest_win_net=payload.get("largest_win_net", 0),
                 largest_loss_net=payload.get("largest_loss_net", 0),
             )
+            self._neutral_loss_count_today = int(payload.get("neutral_loss_count", 0) or 0)
+            self._neutral_post_loss_reentries_today = int(payload.get("neutral_post_loss_reentries", 0) or 0)
+            self._neutral_last_loss_at = self._parse_state_datetime(payload.get("neutral_last_loss_at"))
             raw_halt_date = payload.get("halt_date")
             if isinstance(raw_halt_date, str):
                 try:
@@ -935,6 +1201,11 @@ class MomentumScalpStrategy(BaseStrategy):
                 "losing_net_pnl_sum": self.daily_pnl.losing_net_pnl_sum,
                 "largest_win_net": self.daily_pnl.largest_win_net,
                 "largest_loss_net": self.daily_pnl.largest_loss_net,
+                "neutral_loss_count": self._neutral_loss_count_today,
+                "neutral_last_loss_at": self._neutral_last_loss_at.isoformat(timespec="seconds")
+                if self._neutral_last_loss_at
+                else None,
+                "neutral_post_loss_reentries": self._neutral_post_loss_reentries_today,
                 "halted": self._halted,
                 "halt_date": self._halt_date.isoformat() if self._halt_date else None,
                 "open_positions": self._serialize_open_positions_for_state(),
@@ -953,6 +1224,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 "invested_amount": pos.invested_amount,
                 "buy_time": pos.buy_time.isoformat(timespec="seconds"),
                 "high_since_buy": pos.high_since_buy,
+                "entry_strategy_name": pos.entry_strategy_name,
                 "entry_setup_name": pos.entry_setup_name,
                 "entry_reason": pos.entry_reason,
                 "regime_label": pos.regime_label,
@@ -1046,6 +1318,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._clear_restored_positions_after_grace(now)
         self._cleanup_stale_entry_signals(now)
         self._check_market_regime(quotes=quotes)
+        self._update_shadow_blocked_candidates(quotes, now=now)
 
         # 거래 중지 상태면 주문 없음
         if self._halted:
@@ -1245,6 +1518,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 if fill_price > existing.high_since_buy:
                     existing.high_since_buy = fill_price
                 if entry_meta and not existing.entry_setup_name:
+                    existing.entry_strategy_name = str(entry_meta.get("strategy_name", "") or "")
                     existing.entry_setup_name = str(entry_meta.get("setup_name", "") or "")
                     existing.entry_reason = str(entry_meta.get("entry_reason", "") or "")
                     existing.regime_label = str(entry_meta.get("regime_label", "") or "")
@@ -1263,6 +1537,15 @@ class MomentumScalpStrategy(BaseStrategy):
                 self._save_daily_state()
                 return
 
+            if bool(entry_meta.get("neutral_post_loss_retry")):
+                self._neutral_post_loss_reentries_today += 1
+                logger.info(
+                    "중립장 손실 후 재도전 사용: %d/%d (%s)",
+                    self._neutral_post_loss_reentries_today,
+                    max(0, int(self.cfg.neutral_post_loss_reentry_limit)),
+                    result.symbol,
+                )
+
             self.positions[result.symbol] = PositionState(
                 symbol=result.symbol,
                 buy_price=fill_price,
@@ -1270,6 +1553,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 invested_amount=fill_price * result.quantity,
                 is_restored=False,
                 restored_at=None,
+                entry_strategy_name=str(entry_meta.get("strategy_name", "") or ""),
                 entry_setup_name=str(entry_meta.get("setup_name", "") or ""),
                 entry_reason=str(entry_meta.get("entry_reason", "") or ""),
                 regime_label=str(entry_meta.get("regime_label", "") or ""),
@@ -1279,11 +1563,12 @@ class MomentumScalpStrategy(BaseStrategy):
             tag = "[INV] " if result.symbol in self._inverse_symbols else ""
             logger.info(
                 "%s매수 체결: %s %d주 @ %s원 "
-                "(setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s)",
+                "(strategy_name=%s, setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s)",
                 tag,
                 result.symbol,
                 result.quantity,
                 f"{fill_price:,}",
+                self.positions[result.symbol].entry_strategy_name or "-",
                 self.positions[result.symbol].entry_setup_name or "-",
                 self.positions[result.symbol].regime_label or "-",
                 self.positions[result.symbol].bear_score,
@@ -1333,6 +1618,20 @@ class MomentumScalpStrategy(BaseStrategy):
                 else:
                     self.daily_pnl.breakeven_count += 1
 
+                if (
+                    net_pnl < 0
+                    and pos.regime_label == "neutral"
+                    and result.symbol not in self._inverse_symbols
+                ):
+                    self._neutral_loss_count_today += 1
+                    self._neutral_last_loss_at = self._now()
+                    logger.info(
+                        "중립장 손실 카운트 증가: %d/%d (%s)",
+                        self._neutral_loss_count_today,
+                        max(1, int(self.cfg.neutral_max_losses_per_day)),
+                        result.symbol,
+                    )
+
                 if net_pnl < 0:
                     self._global_loss_cooldown_until = self._now() + timedelta(
                         seconds=self._regime_loss_cooldown_seconds()
@@ -1344,7 +1643,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 logger.info(
                     "%s매도 체결: %s %d주 @ %s원 "
                     "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, "
-                    "setup_name=%s, regime_label=%s)",
+                    "strategy_name=%s, setup_name=%s, regime_label=%s)",
                     tag,
                     result.symbol,
                     result.quantity,
@@ -1352,6 +1651,7 @@ class MomentumScalpStrategy(BaseStrategy):
                     f"{gross_pnl:,}",
                     f"{net_pnl:,}",
                     f"{self.daily_pnl.realized_net_pnl:,}",
+                    pos.entry_strategy_name or "-",
                     pos.entry_setup_name or "-",
                     pos.regime_label or "-",
                 )
@@ -1899,6 +2199,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 ),
                 is_restored=True,
                 restored_at=now,
+                entry_strategy_name=str(snapshot.get("entry_strategy_name", "") or ""),
                 entry_setup_name=str(snapshot.get("entry_setup_name", "") or ""),
                 entry_reason=str(snapshot.get("entry_reason", "") or ""),
                 regime_label=str(snapshot.get("regime_label", "") or ""),
@@ -2419,6 +2720,72 @@ class MomentumScalpStrategy(BaseStrategy):
             )
             return False
 
+        if profile_name == "neutral":
+            neutral_loss_limit = self._neutral_loss_limit()
+            if self._neutral_loss_count_today > neutral_loss_limit:
+                self._track_shadow_blocked_candidate(quote, "neutral_loss_limit_block")
+                self._log_setup_reject(
+                    quote,
+                    "neutral_loss_limit_block",
+                    "중립장 손실 한도 초과로 신규 롱을 차단합니다: %s (손실 %d/%d회)",
+                    quote.symbol,
+                    self._neutral_loss_count_today,
+                    neutral_loss_limit,
+                )
+                return False
+            if self._neutral_loss_count_today == neutral_loss_limit:
+                cooldown_until = self._neutral_post_loss_cooldown_until()
+                if cooldown_until is None:
+                    self._track_shadow_blocked_candidate(quote, "neutral_loss_limit_block")
+                    self._log_setup_reject(
+                        quote,
+                        "neutral_loss_limit_block",
+                        "중립장 손실 기준은 찼지만 손실 시각 정보가 없어 신규 롱을 차단합니다: %s",
+                        quote.symbol,
+                    )
+                    return False
+                if cooldown_until and now < cooldown_until:
+                    self._log_setup_reject(
+                        quote,
+                        "neutral_loss_cooldown",
+                        "중립장 손실 후 쿨다운 중입니다: %s (재허용 %s)",
+                        quote.symbol,
+                        cooldown_until.strftime("%H:%M:%S"),
+                    )
+                    return False
+                if self._neutral_post_loss_reentries_today >= int(self.cfg.neutral_post_loss_reentry_limit):
+                    self._track_shadow_blocked_candidate(quote, "neutral_loss_limit_block")
+                    self._log_setup_reject(
+                        quote,
+                        "neutral_loss_limit_block",
+                        "중립장 손실 후 재도전 한도를 모두 사용했습니다: %s (%d/%d회)",
+                        quote.symbol,
+                        self._neutral_post_loss_reentries_today,
+                        int(self.cfg.neutral_post_loss_reentry_limit),
+                    )
+                    return False
+                retry_thresholds = self._neutral_retry_thresholds()
+                if score is not None and score < retry_thresholds["min_score"]:
+                    self._log_setup_reject(
+                        quote,
+                        "neutral_post_loss_quality_block",
+                        "중립장 재도전 A급 점수 미달: %s (점수 %.2f < %.2f)",
+                        quote.symbol,
+                        score,
+                        retry_thresholds["min_score"],
+                    )
+                    return False
+                if quote.change_rate < retry_thresholds["min_change_rate"]:
+                    self._log_setup_reject(
+                        quote,
+                        "neutral_post_loss_quality_block",
+                        "중립장 재도전 A급 등락률 미달: %s (등락률 %.2f%% < %.2f%%)",
+                        quote.symbol,
+                        quote.change_rate,
+                        retry_thresholds["min_change_rate"],
+                    )
+                    return False
+
         if self._is_loss_stage_active() and profile_name == "neutral":
             self._log_setup_reject(
                 quote,
@@ -2498,16 +2865,9 @@ class MomentumScalpStrategy(BaseStrategy):
                 required_ticks = 1
         if (
             not is_scale_in
-            and profile_name in {"neutral", "soft_bear"}
-            and required_ticks > 1
+            and profile_name == "neutral"
         ):
-            extra_score = 0.30 if profile_name == "neutral" else 0.40
-            extra_change = 0.12 if profile_name == "neutral" else 0.18
-            if (
-                score >= self._regime_min_momentum_score() + extra_score
-                and quote.change_rate >= self._regime_min_change_rate() + extra_change
-            ):
-                required_ticks = 1
+            required_ticks = max(required_ticks, int(self.cfg.neutral_entry_confirmation_ticks))
         if required_ticks <= 1:
             self._entry_signals.pop(quote.symbol, None)
             return True
@@ -2716,6 +3076,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
         score = self._calc_momentum_score(quote) if score_hint is None else score_hint
         entry_reason = ""
+        strategy_name = ""
         setup_name = ""
         if is_scale_in:
             if not self._is_volume_spike(quote, score=score):
@@ -2742,23 +3103,29 @@ class MomentumScalpStrategy(BaseStrategy):
                 now=now,
             ):
                 return None
-            if self._is_bullish_regime():
-                setup_ok, setup_name, setup_payload = self._passes_bull_breakout_setup(quote, score)
-            else:
-                setup_ok, setup_name, setup_payload = self._passes_neutral_pullback_reclaim_setup(quote, score)
-            if not setup_ok:
+            decision = self._regime_router.evaluate_long_entry(self, quote, score)
+            if not decision.allowed:
                 self._entry_signals.pop(quote.symbol, None)
-                if setup_payload:
+                if decision.reject_reason:
                     self._log_setup_reject(
                         quote,
-                        setup_payload,
+                        decision.reject_reason,
                         "%s (%s)",
                         quote.symbol,
-                        setup_payload,
+                        decision.reject_reason,
                     )
                 return None
-            entry_meta = self._build_entry_metadata(quote.symbol, setup_name, setup_payload)
-            entry_reason = self._append_entry_context(setup_payload, entry_meta)
+            strategy_name = decision.strategy_name
+            setup_name = decision.setup_name
+            entry_meta = self._build_entry_metadata(
+                quote.symbol,
+                setup_name,
+                decision.payload,
+                strategy_name=strategy_name,
+            )
+            if self._resolve_regime_profile_name() == "neutral" and self._is_neutral_post_loss_retry_available(now):
+                entry_meta["neutral_post_loss_retry"] = True
+            entry_reason = self._append_entry_context(decision.payload, entry_meta)
 
         if quote.change_rate >= self.cfg.overheated_jump_change_pct:
             retrace_anchor = quote.open_price * (
@@ -2863,36 +3230,25 @@ class MomentumScalpStrategy(BaseStrategy):
                 return None
 
         score = self._calc_momentum_score(quote)
-        min_change_rate = self._regime_inverse_min_change_rate()
-        min_momentum = self._regime_inverse_min_momentum()
-        if self._is_loss_stage_active():
-            min_change_rate += self.cfg.stage1_inverse_change_bonus
-            min_momentum += self.cfg.stage1_inverse_score_bonus
-        if quote.change_rate < min_change_rate:
-            return None
-        if score < min_momentum:
-            return None
-
-        setup_name = "hard_bear_inverse_momentum"
-        entry_payload = f"setup_name=hard_bear_inverse_momentum entry_reason=bear_momentum score={score:.2f}"
-        if profile_name == "soft_bear":
-            setup_ok, setup_name, setup_payload = self._passes_soft_bear_inverse_setup(quote, score)
-            if not setup_ok:
-                if setup_payload:
-                    self._log_setup_reject(
-                        quote,
-                        setup_payload,
-                        "%s (%s)",
-                        quote.symbol,
-                        setup_payload,
-                    )
-                return None
-            entry_payload = setup_payload
-        elif not self._is_volume_spike(quote, score=score):
+        decision = self._regime_router.evaluate_inverse_entry(self, quote, score)
+        if not decision.allowed:
+            if decision.reject_reason:
+                self._log_setup_reject(
+                    quote,
+                    decision.reject_reason,
+                    "%s (%s)",
+                    quote.symbol,
+                    decision.reject_reason,
+                )
             return None
 
-        entry_meta = self._build_entry_metadata(quote.symbol, setup_name, entry_payload)
-        entry_reason = self._append_entry_context(entry_payload, entry_meta)
+        entry_meta = self._build_entry_metadata(
+            quote.symbol,
+            decision.setup_name,
+            decision.payload,
+            strategy_name=decision.strategy_name,
+        )
+        entry_reason = self._append_entry_context(decision.payload, entry_meta)
 
         alloc = self._compute_buy_allocation(
             symbol=quote.symbol,
@@ -3017,7 +3373,7 @@ class MomentumScalpStrategy(BaseStrategy):
             return 0
         return pos.buy_price * pos.quantity
 
-    def _evaluate_sell(self, quote: Quote) -> Optional[Order]:
+    def _default_long_exit(self, quote: Quote) -> Optional[Order]:
         """익절/손절/추적손절 판단 (일반 주식)."""
         pos = self.positions.get(quote.symbol)
         if not pos:
@@ -3073,11 +3429,14 @@ class MomentumScalpStrategy(BaseStrategy):
 
         return None
 
+    def _evaluate_sell(self, quote: Quote) -> Optional[Order]:
+        return self._regime_router.evaluate_long_exit(self, quote)
+
     def _effective_realized_net_for_breaker(self) -> int:
         """일일 브레이커 판단에 사용할 순실현손익을 반환한다."""
         return int(self.daily_pnl.realized_net_pnl - self._daily_breaker_pnl_offset)
 
-    def _evaluate_inverse_sell(self, quote: Quote) -> Optional[Order]:
+    def _default_inverse_exit(self, quote: Quote) -> Optional[Order]:
         """인버스 ETF 매도 판단 (타이트한 리스크 관리).
 
         인버스 ETF는 음의 복리 위험이 있으므로:
@@ -3141,6 +3500,9 @@ class MomentumScalpStrategy(BaseStrategy):
                 return self._make_sell_order(pos)
 
         return None
+
+    def _evaluate_inverse_sell(self, quote: Quote) -> Optional[Order]:
+        return self._regime_router.evaluate_inverse_exit(self, quote)
 
     def _calc_momentum_score(self, quote: Quote) -> float:
         """모멘텀 점수를 계산한다 (0~5)."""
