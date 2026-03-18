@@ -6,7 +6,7 @@ from unittest.mock import patch
 from src.api_client import KISClient
 from src.config import Config
 from src.market_data import MarketDataAPI
-from src.models import OrderResult, OrderSide, Position, Quote
+from src.models import OrderResult, OrderSide, Position, Quote, RankingItem
 from src.strategies.momentum_scalp import (
     MomentumScalpConfig,
     MomentumScalpStrategy,
@@ -35,6 +35,14 @@ class DummyClient:
     def get(self, **kwargs):
         self.calls += 1
         return self.response
+
+
+class DummyRankingMarketData:
+    def __init__(self, items):
+        self.items = items
+
+    def get_fluctuation_ranking(self, **kwargs):
+        return list(self.items)
 
 
 class RiskControlTests(unittest.TestCase):
@@ -112,6 +120,56 @@ class RiskControlTests(unittest.TestCase):
 
         alloc = strategy._compute_buy_allocation("AAA", current_price=10_000)
         self.assertEqual(alloc, 330_000)
+
+    def test_momentum_allocation_allows_expensive_single_share_for_bull_a_grade(self):
+        cfg = MomentumScalpConfig(
+            seed_money=1_000_000,
+            per_stock_amount=200_000,
+            max_per_stock_amount=350_000,
+            bull_max_single_position_pct=0.25,
+            allow_expensive_single_share_override=True,
+            expensive_single_share_min_price=120_000,
+            expensive_single_share_cap_multiplier=1.5,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 0
+
+        blocked = strategy._compute_buy_allocation("AAA", current_price=320_000)
+        allowed = strategy._compute_buy_allocation(
+            "AAA",
+            current_price=320_000,
+            allow_expensive_single_share_override=True,
+        )
+
+        self.assertEqual(blocked, 0)
+        self.assertEqual(allowed, 320_000)
+
+    def test_momentum_allocation_supports_priority_bull_concentration(self):
+        cfg = MomentumScalpConfig(
+            seed_money=1_000_000,
+            max_position_count=2,
+            bull_max_position_count=2,
+            per_stock_amount=200_000,
+            max_per_stock_amount=350_000,
+            capital_utilization_pct=0.70,
+            bull_max_single_position_pct=0.35,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 0
+
+        base_alloc = strategy._compute_buy_allocation("AAA", current_price=60_000)
+        priority_alloc = strategy._compute_buy_allocation(
+            "AAA",
+            current_price=60_000,
+            per_stock_amount_multiplier=3.0,
+            max_per_stock_amount_multiplier=3.0,
+            max_single_position_pct_override=0.65,
+            side_slot_override=1,
+        )
+
+        self.assertEqual(base_alloc, 350_000)
+        self.assertEqual(priority_alloc, 650_000)
+        self.assertGreater(priority_alloc, base_alloc)
 
     def test_api_client_keeps_ctca_tr_id_in_paper(self):
         config = Config(
@@ -732,6 +790,387 @@ class RiskControlTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.strategy_name, "bull_breakout_strategy")
         self.assertIn("entry_grade=A", decision.payload)
+
+    def test_bull_breakout_requires_higher_score_in_late_session(self):
+        cfg = MomentumScalpConfig(
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+            bullish_min_momentum_score=3.0,
+            bullish_min_momentum_score_floor=3.0,
+            bull_breakout_hold_ticks=2,
+            bull_breakout_buffer_pct=0.03,
+            bull_breakout_late_entry_start_minutes_after_open=255,
+            bull_breakout_late_entry_score_bonus=0.35,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 0
+        strategy.set_simulated_now(datetime(2026, 3, 18, 13, 45))
+
+        history = [
+            Quote("090710", "휴림로봇", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 80_000, 800_000_000),
+            Quote("090710", "휴림로봇", 10_100, 100, 1.0, 10_000, 10_100, 9_950, 120_000, 1_212_000_000),
+            Quote("090710", "휴림로봇", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 180_000, 1_836_000_000),
+            Quote("090710", "휴림로봇", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 240_000, 2_452_800_000),
+            Quote("090710", "휴림로봇", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 300_000, 3_072_000_000),
+        ]
+        for quote in history:
+            strategy._record_recent_quote(quote)
+            strategy._quotes_cache[quote.symbol] = quote
+
+        for symbol, change_rate, volume in (
+            ("005930", 0.8, 150_000),
+            ("000660", 0.9, 140_000),
+            ("035420", 1.1, 130_000),
+        ):
+            quote = Quote(
+                symbol,
+                symbol,
+                10_000,
+                100,
+                change_rate,
+                9_900,
+                10_050,
+                9_850,
+                volume,
+                1_000_000_000,
+            )
+            strategy._quotes_cache[symbol] = quote
+
+        ok, _, reject = strategy._passes_bull_breakout_setup(history[-1], score=3.0)
+        self.assertFalse(ok)
+        self.assertEqual(reject, "bull_late_day_score")
+
+    def test_strong_bull_override_caps_soft_bear_to_neutral(self):
+        cfg = MomentumScalpConfig(
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+            strong_bull_override_index_gap_pct=1.5,
+            strong_bull_override_avg_change_rate_threshold=2.0,
+            strong_bull_override_max_decliner_ratio=0.25,
+            strong_bull_override_min_quote_count=8,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.market_data = object()
+        now = datetime(2026, 3, 18, 12, 30)
+        strategy.set_simulated_now(now)
+        strategy._bear_score = 2
+        strategy._last_regime_check_at = now - timedelta(seconds=30)
+        strategy._last_index_regime_check_at = now
+        strategy._cached_index_regime_score = 2
+        strategy._cached_index_regime_info = (5850.0, 5700.0, 5620.0)
+
+        quotes = []
+        for idx in range(8):
+            quotes.append(
+                Quote(
+                    symbol=f"A{idx:03d}",
+                    name=f"A{idx:03d}",
+                    current_price=10_000 + idx,
+                    change=300,
+                    change_rate=3.0,
+                    open_price=9_700,
+                    high_price=10_050 + idx,
+                    low_price=9_650,
+                    volume=200_000 + idx * 1_000,
+                    trade_amount=2_500_000_000 + idx * 10_000_000,
+                )
+            )
+
+        strategy._check_market_regime(quotes=quotes)
+
+        self.assertEqual(strategy._bear_score, 1)
+        self.assertTrue(strategy._strong_bull_override_active)
+
+    def test_bull_post_loss_requires_stronger_score(self):
+        cfg = MomentumScalpConfig(
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+            enable_backtest_score_entry_fallback=False,
+            bullish_min_momentum_score=3.0,
+            bullish_min_momentum_score_floor=3.0,
+            bull_breakout_hold_ticks=2,
+            bull_breakout_buffer_pct=0.03,
+            bull_post_loss_score_bonus=0.30,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy._bear_score = 0
+        strategy.set_simulated_now(datetime(2026, 3, 18, 11, 0))
+
+        history = [
+            Quote("090710", "휴림로봇", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 80_000, 800_000_000),
+            Quote("090710", "휴림로봇", 10_100, 100, 1.0, 10_000, 10_100, 9_950, 120_000, 1_212_000_000),
+            Quote("090710", "휴림로봇", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 180_000, 1_836_000_000),
+            Quote("090710", "휴림로봇", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 240_000, 2_452_800_000),
+            Quote("090710", "휴림로봇", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 300_000, 3_072_000_000),
+        ]
+        for quote in history:
+            strategy._record_recent_quote(quote)
+            strategy._quotes_cache[quote.symbol] = quote
+
+        for symbol, change_rate, volume in (
+            ("005930", 0.8, 150_000),
+            ("000660", 0.9, 140_000),
+            ("035420", 1.1, 130_000),
+        ):
+            quote = Quote(
+                symbol,
+                symbol,
+                10_000,
+                100,
+                change_rate,
+                9_900,
+                10_050,
+                9_850,
+                volume,
+                1_000_000_000,
+            )
+            strategy._quotes_cache[symbol] = quote
+
+        allowed_order = strategy._evaluate_buy(history[-1], score_hint=3.0)
+        self.assertIsNotNone(allowed_order)
+
+        strategy._bull_loss_count_today = 1
+        blocked_order = strategy._evaluate_buy(history[-1], score_hint=3.0)
+        self.assertIsNone(blocked_order)
+
+    def test_build_pool_mixes_in_high_turnover_cached_leader(self):
+        cfg = MomentumScalpConfig(
+            dynamic_pool_size=2,
+            dynamic_pool_ranking_fetch_count=4,
+            dynamic_pool_turnover_slots=1,
+            dynamic_pool_quote_trade_amount_slots=1,
+            dynamic_pool_quote_min_change_rate=0.8,
+            enable_pool_persistence_gate=False,
+        )
+        ranking_items = [
+            RankingItem("AAA", "AAA", 10_000, 5.0, 10_000, 1),
+            RankingItem("BBB", "BBB", 9_000, 4.5, 12_000, 2),
+            RankingItem("CCC", "CCC", 8_000, 4.0, 150_000, 3),
+            RankingItem("DDD", "DDD", 7_000, 3.5, 11_000, 4),
+        ]
+        strategy = MomentumScalpStrategy(
+            market_data=DummyRankingMarketData(ranking_items),
+            config=cfg,
+        )
+        strategy._quotes_cache["ZZZ"] = Quote(
+            "ZZZ",
+            "ZZZ",
+            12_000,
+            360,
+            3.1,
+            11_640,
+            12_120,
+            11_600,
+            500_000,
+            6_000_000_000,
+        )
+
+        strategy._build_pool()
+
+        self.assertIn("AAA", strategy._pool)
+        self.assertIn("CCC", strategy._pool)
+        self.assertIn("ZZZ", strategy._pool)
+
+    def test_build_pool_directly_includes_turnover_leader_with_persistence_gate(self):
+        cfg = MomentumScalpConfig(
+            dynamic_pool_size=2,
+            dynamic_pool_ranking_fetch_count=4,
+            dynamic_pool_turnover_slots=2,
+            dynamic_pool_quote_trade_amount_slots=0,
+            dynamic_pool_direct_turnover_slots=1,
+            dynamic_pool_direct_quote_leader_slots=0,
+            enable_pool_persistence_gate=True,
+            momentum_pool_persistence_window=3,
+            momentum_pool_min_appearances=2,
+        )
+        ranking_items = [
+            RankingItem("AAA", "AAA", 10_000, 5.0, 10_000, 1),
+            RankingItem("BBB", "BBB", 9_000, 4.5, 12_000, 2),
+            RankingItem("CCC", "CCC", 40_000, 4.0, 150_000, 3),
+            RankingItem("DDD", "DDD", 7_000, 3.5, 11_000, 4),
+        ]
+        strategy = MomentumScalpStrategy(
+            market_data=DummyRankingMarketData(ranking_items),
+            config=cfg,
+        )
+
+        strategy._build_pool()
+
+        self.assertIn("CCC", strategy._pool)
+
+    def test_bull_a_grade_initial_entry_uses_scaled_allocation(self):
+        base_kwargs = dict(
+            seed_money=1_000_000,
+            max_position_count=2,
+            per_stock_amount=220_000,
+            max_per_stock_amount=500_000,
+            capital_utilization_pct=0.60,
+            bull_max_single_position_pct=0.42,
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+            enable_backtest_score_entry_fallback=False,
+            bullish_min_momentum_score=3.0,
+            bullish_min_momentum_score_floor=3.0,
+            bull_breakout_hold_ticks=2,
+            bull_breakout_buffer_pct=0.03,
+            bull_priority_turnover_rank_max=1,
+        )
+        scaled_strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(**base_kwargs, bull_breakout_initial_entry_scale=0.5),
+        )
+        full_strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(**base_kwargs, bull_breakout_initial_entry_scale=1.0),
+        )
+        scaled_strategy._bear_score = 0
+        full_strategy._bear_score = 0
+        now = datetime(2026, 3, 18, 11, 5)
+        scaled_strategy.set_simulated_now(now)
+        full_strategy.set_simulated_now(now)
+
+        history = [
+            Quote("090710", "휴림로봇", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 80_000, 800_000_000),
+            Quote("090710", "휴림로봇", 10_100, 100, 1.0, 10_000, 10_100, 9_950, 120_000, 1_212_000_000),
+            Quote("090710", "휴림로봇", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 180_000, 1_836_000_000),
+            Quote("090710", "휴림로봇", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 240_000, 2_452_800_000),
+            Quote("090710", "휴림로봇", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 300_000, 3_072_000_000),
+        ]
+        for quote in history:
+            scaled_strategy._record_recent_quote(quote)
+            scaled_strategy._quotes_cache[quote.symbol] = quote
+            full_strategy._record_recent_quote(quote)
+            full_strategy._quotes_cache[quote.symbol] = quote
+
+        for symbol, price, change_rate, volume in (
+            ("005930", 70_000, 0.8, 50_000),
+            ("000660", 10_000, 0.9, 140_000),
+            ("035420", 10_000, 1.1, 130_000),
+        ):
+            quote = Quote(
+                symbol,
+                symbol,
+                price,
+                100,
+                change_rate,
+                price - 100,
+                price + 50,
+                price - 150,
+                volume,
+                price * volume,
+            )
+            scaled_strategy._quotes_cache[symbol] = quote
+            full_strategy._quotes_cache[symbol] = quote
+
+        scaled_order = scaled_strategy._evaluate_buy(history[-1])
+        full_order = full_strategy._evaluate_buy(history[-1])
+        self.assertIsNotNone(scaled_order)
+        self.assertIsNotNone(full_order)
+        self.assertLess(scaled_order.quantity, full_order.quantity)
+
+    def test_bull_priority_entry_sizes_top_leader_more_aggressively(self):
+        base_kwargs = dict(
+            seed_money=1_000_000,
+            max_position_count=2,
+            bull_max_position_count=2,
+            per_stock_amount=200_000,
+            max_per_stock_amount=350_000,
+            capital_utilization_pct=0.70,
+            bull_max_single_position_pct=0.35,
+            enable_volume_spike_filter=False,
+            enable_expected_net_filter=False,
+            enable_pool_persistence_gate=False,
+            enable_backtest_score_entry_fallback=False,
+            bullish_min_momentum_score=3.0,
+            bullish_min_momentum_score_floor=3.0,
+            bull_breakout_hold_ticks=2,
+            bull_breakout_buffer_pct=0.03,
+        )
+        priority_strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                **base_kwargs,
+                bull_priority_turnover_rank_max=2,
+                bull_priority_per_stock_amount_multiplier=3.0,
+                bull_priority_max_per_stock_amount_multiplier=3.0,
+                bull_priority_max_single_position_pct=0.65,
+                bull_priority_effective_slots=1,
+                bull_priority_initial_entry_scale=0.85,
+            ),
+        )
+        plain_strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                **base_kwargs,
+                bull_priority_turnover_rank_max=1,
+                bull_priority_per_stock_amount_multiplier=1.0,
+                bull_priority_max_per_stock_amount_multiplier=1.0,
+                bull_priority_max_single_position_pct=0.35,
+                bull_priority_effective_slots=2,
+                bull_priority_initial_entry_scale=0.65,
+            ),
+        )
+        priority_strategy._bear_score = 0
+        plain_strategy._bear_score = 0
+        now = datetime(2026, 3, 18, 10, 30)
+        priority_strategy.set_simulated_now(now)
+        plain_strategy.set_simulated_now(now)
+
+        leader_history = [
+            Quote("263750", "펄어비스", 60_000, 0, 0.0, 60_000, 60_000, 59_500, 30_000, 1_800_000_000),
+            Quote("263750", "펄어비스", 60_800, 800, 1.33, 60_000, 60_800, 59_500, 45_000, 2_736_000_000),
+            Quote("263750", "펄어비스", 61_400, 1_400, 2.33, 60_000, 61_400, 59_500, 60_000, 3_684_000_000),
+            Quote("263750", "펄어비스", 61_800, 1_800, 3.00, 60_000, 61_800, 59_500, 72_000, 4_449_600_000),
+            Quote("263750", "펄어비스", 62_000, 2_000, 3.33, 60_000, 62_000, 59_500, 78_000, 4_836_000_000),
+        ]
+        for quote in leader_history:
+            priority_strategy._record_recent_quote(quote)
+            priority_strategy._quotes_cache[quote.symbol] = quote
+            plain_strategy._record_recent_quote(quote)
+            plain_strategy._quotes_cache[quote.symbol] = quote
+
+        higher_turnover = Quote(
+            "005930",
+            "삼성전자",
+            70_000,
+            700,
+            1.0,
+            69_300,
+            70_100,
+            69_000,
+            80_000,
+            5_600_000_000,
+        )
+        for strategy in (priority_strategy, plain_strategy):
+            strategy._quotes_cache[higher_turnover.symbol] = higher_turnover
+            for symbol, change_rate, price, volume in (
+                ("000660", 0.9, 40_000, 20_000),
+                ("035420", 1.1, 25_000, 18_000),
+            ):
+                quote = Quote(
+                    symbol,
+                    symbol,
+                    price,
+                    100,
+                    change_rate,
+                    price - 200,
+                    price + 100,
+                    price - 300,
+                    volume,
+                    price * volume,
+                )
+                strategy._quotes_cache[symbol] = quote
+
+        priority_order = priority_strategy._evaluate_buy(leader_history[-1])
+        plain_order = plain_strategy._evaluate_buy(leader_history[-1])
+
+        self.assertIsNotNone(priority_order)
+        self.assertIsNotNone(plain_order)
+        self.assertGreater(priority_order.quantity, plain_order.quantity)
 
     def test_neutral_first_entry_requires_stronger_quality_than_later_entries(self):
         cfg = MomentumScalpConfig(

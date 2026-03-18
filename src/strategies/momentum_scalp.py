@@ -139,6 +139,12 @@ class MomentumScalpConfig:
     # 종목 풀
     static_watchlist: List[str] = field(default_factory=lambda: DEFAULT_STATIC_WATCHLIST)
     dynamic_pool_size: int = 15
+    dynamic_pool_ranking_fetch_count: int = 30
+    dynamic_pool_turnover_slots: int = 6
+    dynamic_pool_quote_trade_amount_slots: int = 4
+    dynamic_pool_direct_turnover_slots: int = 3
+    dynamic_pool_direct_quote_leader_slots: int = 2
+    dynamic_pool_quote_min_change_rate: float = 0.8
     pool_refresh_interval: int = 300     # 초
 
     # 필터
@@ -159,9 +165,29 @@ class MomentumScalpConfig:
     bullish_volume_spike_abs_min_ratio: float = 0.6
     bull_bias_avg_change_rate_threshold: float = 0.8
     bull_bias_max_decliner_ratio: float = 0.45
+    strong_bull_override_index_gap_pct: float = 1.5
+    strong_bull_override_avg_change_rate_threshold: float = 2.0
+    strong_bull_override_max_decliner_ratio: float = 0.25
+    strong_bull_override_min_quote_count: int = 8
     bull_leader_top_n: int = 5
     bull_leader_relative_strength_pp: float = 0.4
     bull_partial_exit_ratio: float = 0.5
+    bull_priority_turnover_rank_max: int = 2
+    bull_priority_per_stock_amount_multiplier: float = 3.0
+    bull_priority_max_per_stock_amount_multiplier: float = 3.0
+    bull_priority_max_single_position_pct: float = 0.65
+    bull_priority_effective_slots: int = 1
+    bull_priority_initial_entry_scale: float = 0.85
+    bull_breakout_late_entry_start_minutes_after_open: int = 255
+    bull_breakout_late_entry_score_bonus: float = 0.35
+    bull_breakout_late_entry_change_rate_bonus: float = 0.2
+    bull_breakout_initial_entry_scale: float = 0.65
+    bull_post_loss_score_bonus: float = 0.30
+    bull_post_loss_change_rate_bonus: float = 0.20
+    bull_post_loss_breakout_buffer_bonus_pct: float = 0.05
+    allow_expensive_single_share_override: bool = True
+    expensive_single_share_min_price: int = 50_000
+    expensive_single_share_cap_multiplier: float = 1.5
 
     min_momentum_score: float = 3.5
     enable_expected_net_filter: bool = True
@@ -410,6 +436,8 @@ class MomentumScalpStrategy(BaseStrategy):
         self._sell_cooldown: Dict[str, datetime] = {}
         self._symbol_cooldown_until: Dict[str, datetime] = {}
         self._strategy_cooldown_until: Dict[str, datetime] = {}
+        self._bull_loss_count_today: int = 0
+        self._bull_last_loss_at: Optional[datetime] = None
         self._startup_rebalance_ticks: int = 0
         self._startup_rebalance_active: bool = False
         self._bear_score: int = 0
@@ -423,6 +451,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._cached_index_regime_score: int = 0
         self._cached_index_regime_info: Optional[tuple[float, float, float]] = None
         self._cached_index_regime_error: Optional[Exception] = None
+        self._strong_bull_override_active: bool = False
         self._regime_profile_name: str = "neutral"
         self._session_start_at: Optional[datetime] = None
         self._state_path = Path(self.cfg.daily_state_path) if self.cfg.daily_state_path else None
@@ -741,6 +770,15 @@ class MomentumScalpStrategy(BaseStrategy):
                 return chunk[len(marker):]
         return default
 
+    def _extract_context_int(self, payload: str, key: str, default: int = 0) -> int:
+        raw = MomentumScalpStrategy._extract_context_token(payload, key, "")
+        if not raw:
+            return default
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return default
+
     def _build_entry_metadata(
         self,
         symbol: str,
@@ -758,6 +796,7 @@ class MomentumScalpStrategy(BaseStrategy):
             "planned_risk_stage": current_stage,
             "is_inverse": symbol in self._inverse_symbols,
             "entry_grade": self._extract_context_token(payload, "entry_grade", ""),
+            "turnover_rank": self._extract_context_int(payload, "turnover_rank", 0),
         }
 
     def _append_entry_context(self, payload: str, metadata: dict) -> str:
@@ -770,6 +809,8 @@ class MomentumScalpStrategy(BaseStrategy):
         )
         if metadata.get("entry_grade"):
             extra += f" entry_grade={metadata.get('entry_grade', '')}"
+        if metadata.get("turnover_rank"):
+            extra += f" turnover_rank={int(metadata.get('turnover_rank', 0))}"
         return f"{base} {extra}".strip()
 
     def _current_profile_entry_strategy_name(self, is_inverse: bool) -> str:
@@ -870,6 +911,11 @@ class MomentumScalpStrategy(BaseStrategy):
     def _is_neutral_entry_window_open(self, now: Optional[datetime] = None) -> bool:
         return self._minutes_since_market_open(now) >= int(
             self.cfg.neutral_entry_start_minutes_after_open
+        )
+
+    def _is_bull_late_entry_window(self, now: Optional[datetime] = None) -> bool:
+        return self._minutes_since_market_open(now) >= int(
+            self.cfg.bull_breakout_late_entry_start_minutes_after_open
         )
 
     def _position_notional(self, pos: PositionState) -> int:
@@ -1088,13 +1134,38 @@ class MomentumScalpStrategy(BaseStrategy):
         leader_ok, leader_reject, leader_payload = self._passes_bull_leader_filter(quote)
         if not leader_ok:
             return False, "", leader_reject
+        if self._is_bull_late_entry_window():
+            late_day_min_score = self._regime_bullish_min_momentum_score() + float(
+                self.cfg.bull_breakout_late_entry_score_bonus
+            )
+            if score < late_day_min_score:
+                return False, "", "bull_late_day_score"
+            late_day_min_change = self._regime_bullish_min_change_rate() + float(
+                self.cfg.bull_breakout_late_entry_change_rate_bonus
+            )
+            if quote.change_rate < late_day_min_change:
+                return False, "", "bull_late_day_change"
+        if self._bull_loss_count_today > 0:
+            post_loss_min_score = self._regime_bullish_min_momentum_score() + float(
+                self.cfg.bull_post_loss_score_bonus
+            )
+            if score < post_loss_min_score:
+                return False, "", "bull_post_loss_score"
+            post_loss_min_change = self._regime_bullish_min_change_rate() + float(
+                self.cfg.bull_post_loss_change_rate_bonus
+            )
+            if quote.change_rate < post_loss_min_change:
+                return False, "", "bull_post_loss_change"
 
         prices = [item.current_price for item in history]
         prior_prices = prices[:-hold_ticks] if len(prices) > hold_ticks else prices[:-1]
         if not prior_prices:
             return False, "", "bull_breakout_wait"
         prior_high = max(prior_prices)
-        breakout_level = prior_high * (1 + (self.cfg.bull_breakout_buffer_pct / 100))
+        breakout_buffer_pct = float(self.cfg.bull_breakout_buffer_pct)
+        if self._bull_loss_count_today > 0:
+            breakout_buffer_pct += float(self.cfg.bull_post_loss_breakout_buffer_bonus_pct)
+        breakout_level = prior_high * (1 + (breakout_buffer_pct / 100))
         if quote.current_price < breakout_level:
             return False, "", "bull_breakout_wait"
 
@@ -1329,6 +1400,8 @@ class MomentumScalpStrategy(BaseStrategy):
             self._neutral_loss_count_today = 0
             self._neutral_last_loss_at = None
             self._neutral_post_loss_reentries_today = 0
+            self._bull_loss_count_today = 0
+            self._bull_last_loss_at = None
             self._shadow_blocked_candidates = {}
         elif self._state_loaded_for_today and not self.cfg.use_restored_pnl_for_daily_breaker:
             restored_pnl = int(self.daily_pnl.realized_net_pnl)
@@ -1549,6 +1622,8 @@ class MomentumScalpStrategy(BaseStrategy):
             self._neutral_loss_count_today = int(payload.get("neutral_loss_count", 0) or 0)
             self._neutral_post_loss_reentries_today = int(payload.get("neutral_post_loss_reentries", 0) or 0)
             self._neutral_last_loss_at = self._parse_state_datetime(payload.get("neutral_last_loss_at"))
+            self._bull_loss_count_today = int(payload.get("bull_loss_count", 0) or 0)
+            self._bull_last_loss_at = self._parse_state_datetime(payload.get("bull_last_loss_at"))
             raw_halt_date = payload.get("halt_date")
             if isinstance(raw_halt_date, str):
                 try:
@@ -1595,6 +1670,10 @@ class MomentumScalpStrategy(BaseStrategy):
                 if self._neutral_last_loss_at
                 else None,
                 "neutral_post_loss_reentries": self._neutral_post_loss_reentries_today,
+                "bull_loss_count": self._bull_loss_count_today,
+                "bull_last_loss_at": self._bull_last_loss_at.isoformat(timespec="seconds")
+                if self._bull_last_loss_at
+                else None,
                 "halted": self._halted,
                 "halt_date": self._halt_date.isoformat() if self._halt_date else None,
                 "open_positions": self._serialize_open_positions_for_state(),
@@ -2016,6 +2095,14 @@ class MomentumScalpStrategy(BaseStrategy):
                     )
 
                 if net_pnl < 0 and not is_partial_exit:
+                    if pos.entry_strategy_name == "bull_breakout_strategy":
+                        self._bull_loss_count_today += 1
+                        self._bull_last_loss_at = self._now()
+                        logger.info(
+                            "bull 손실 카운트 증가: %d회 (%s)",
+                            self._bull_loss_count_today,
+                            result.symbol,
+                        )
                     self._apply_loss_cooldowns(result.symbol, pos.entry_strategy_name)
 
                 self._sell_cooldown[result.symbol] = self._now()
@@ -2156,6 +2243,8 @@ class MomentumScalpStrategy(BaseStrategy):
             return "static"
         score = self._bear_score if bear_score is None else bear_score
         if score <= 0:
+            return "bull"
+        if score == 1 and self._strong_bull_override_active:
             return "bull"
         if score == 1:
             return "neutral"
@@ -2663,6 +2752,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
         pool = set(self.cfg.static_watchlist)
         appeared: set[str] = set()
+        direct_dynamic: set[str] = set()
 
         # 인버스 ETF 추가
         if self.cfg.inverse_enabled:
@@ -2672,16 +2762,57 @@ class MomentumScalpStrategy(BaseStrategy):
         if self.market_data:
             try:
                 rising = self.market_data.get_fluctuation_ranking(
-                    count=self.cfg.dynamic_pool_size,
+                    count=max(self.cfg.dynamic_pool_size, self.cfg.dynamic_pool_ranking_fetch_count),
                     min_change_rate=self.cfg.min_change_rate,
                     max_change_rate=self.cfg.max_change_rate,
                     min_price=self.cfg.min_price,
                     min_volume=self.cfg.min_volume,
                 )
-                for item in rising:
+                by_rank = rising[: max(0, int(self.cfg.dynamic_pool_size))]
+                by_turnover = sorted(
+                    rising,
+                    key=lambda item: (
+                        max(0, int(item.current_price)) * max(0, int(item.volume)),
+                        float(item.change_rate),
+                        -int(item.rank or 0),
+                    ),
+                    reverse=True,
+                )[: max(0, int(self.cfg.dynamic_pool_turnover_slots))]
+                cache_leaders = sorted(
+                    [
+                        quote
+                        for quote in self._quotes_cache.values()
+                        if (
+                            quote.symbol not in self._inverse_symbols
+                            and quote.current_price >= self.cfg.min_price
+                            and quote.change_rate >= self.cfg.dynamic_pool_quote_min_change_rate
+                            and quote.trade_amount > 0
+                        )
+                    ],
+                    key=lambda quote: (
+                        int(quote.trade_amount),
+                        float(quote.change_rate),
+                        int(quote.volume),
+                    ),
+                    reverse=True,
+                )[: max(0, int(self.cfg.dynamic_pool_quote_trade_amount_slots))]
+                for item in by_rank:
                     appeared.add(item.symbol)
-                logger.info("동적 풀 갱신: 등락률 상위 %d개 추가 (총 %d종목)",
-                            len(rising), len(pool))
+                for item in by_turnover:
+                    appeared.add(item.symbol)
+                for quote in cache_leaders:
+                    appeared.add(quote.symbol)
+                for item in by_turnover[: max(0, int(self.cfg.dynamic_pool_direct_turnover_slots))]:
+                    direct_dynamic.add(item.symbol)
+                for quote in cache_leaders[: max(0, int(self.cfg.dynamic_pool_direct_quote_leader_slots))]:
+                    direct_dynamic.add(quote.symbol)
+                logger.info(
+                    "동적 풀 갱신: 등락률 %d개 + 거래대금 %d개 + 실시간 리더 %d개 (총 %d종목)",
+                    len(by_rank),
+                    len(by_turnover),
+                    len(cache_leaders),
+                    len(pool),
+                )
             except Exception as e:
                 logger.warning("등락률 순위 조회 실패, 정적 풀만 사용: %s", e)
 
@@ -2693,12 +2824,16 @@ class MomentumScalpStrategy(BaseStrategy):
                 for sym in appeared
                 if self._is_pool_persistent(sym)
             }
+            for sym in direct_dynamic:
+                pool.add(sym)
             for sym in appeared:
                 if sym in persistent:
                     pool.add(sym)
             if appeared:
                 logger.info("풀 지속성 반영: %d개 동적 후보 중 %d개 채택",
                             len(appeared), len(persistent))
+            if direct_dynamic:
+                logger.info("강한 리더 즉시 편입: %d개", len(direct_dynamic))
         else:
             pool.update(appeared)
 
@@ -2738,8 +2873,36 @@ class MomentumScalpStrategy(BaseStrategy):
         """약세점수 기반 완화 모드 판정."""
         return self._bear_score <= 0 or self._is_bull_bias_market()
 
+    def _meets_strong_bull_override(
+        self,
+        *,
+        index_info: Optional[tuple[float, float, float]],
+        quote_avg_change: Optional[float],
+        quote_decline_ratio: Optional[float],
+        quote_count: int,
+    ) -> bool:
+        if index_info is None:
+            return False
+        current, ma20, ma5 = index_info
+        if current <= 0 or ma20 <= 0 or ma5 <= 0:
+            return False
+        if current <= ma20 or current <= ma5:
+            return False
+        gap_pct = ((current - ma20) / ma20) * 100 if ma20 > 0 else 0.0
+        if gap_pct < float(self.cfg.strong_bull_override_index_gap_pct):
+            return False
+        if quote_count < max(1, int(self.cfg.strong_bull_override_min_quote_count)):
+            return False
+        if quote_avg_change is None or quote_avg_change < float(self.cfg.strong_bull_override_avg_change_rate_threshold):
+            return False
+        if quote_decline_ratio is None or quote_decline_ratio > float(self.cfg.strong_bull_override_max_decliner_ratio):
+            return False
+        return True
+
     def _is_bull_bias_market(self) -> bool:
-        if self._resolve_regime_profile_name() != "neutral":
+        if self._strong_bull_override_active:
+            return True
+        if self._bear_score != 1:
             return False
         index_info = self._cached_index_regime_info
         if index_info:
@@ -2784,6 +2947,7 @@ class MomentumScalpStrategy(BaseStrategy):
             return
 
         if not self.market_data:
+            self._strong_bull_override_active = False
             fallback_score = 0 if quote_score is None else max(0, min(int(quote_score), 3))
             self._bear_score = fallback_score
             self._bear_market = fallback_score >= 2
@@ -2892,6 +3056,11 @@ class MomentumScalpStrategy(BaseStrategy):
             quote_avg_change = 0.0
         if quote_decline_ratio is None:
             quote_decline_ratio = 0.0
+        quote_count = (
+            len([q for q in quotes if q.symbol not in self._inverse_symbols])
+            if quotes is not None
+            else len(self._active_pool_quotes(include_inverse=False))
+        )
 
         raw_final_score = float(index_score)
         if quote_score is not None:
@@ -2910,17 +3079,35 @@ class MomentumScalpStrategy(BaseStrategy):
         final_score = round((raw_final_score * 0.75) + (prev_score * 0.25))
         final_score = max(0, min(4, int(final_score)))
 
+        strong_bull_override = self._meets_strong_bull_override(
+            index_info=index_info,
+            quote_avg_change=quote_avg_change,
+            quote_decline_ratio=quote_decline_ratio,
+            quote_count=quote_count,
+        )
+        if strong_bull_override and final_score >= 2:
+            logger.info(
+                "강세 오버라이드 적용: score %d -> 1 (KOSPI-MA20 %.2f%%, 평균등락 %.2f%%, 하락비율 %.1f%%, 표본 %d개)",
+                final_score,
+                ((index_info[0] - index_info[1]) / index_info[1]) * 100 if index_info[1] > 0 else 0.0,
+                quote_avg_change,
+                quote_decline_ratio * 100,
+                quote_count,
+            )
+            final_score = 1
+
         final_score = max(0, min(final_score, 3))
         self._bear_score = final_score
         self._bear_market = final_score >= 2
+        self._strong_bull_override_active = strong_bull_override
         self._last_regime_check_at = now
 
         if index_info is not None and quote_score is not None:
             logger.info(
                 "시장 레짐 계산: index=%d(가중 %.2f), quote=%d(평균%.2f%%, 하락비율%.1f%%), 최종=%d(이전=%s, 원시=%.2f), "
                 "지수=%s, KOSPI: %.1f, MA20: %.1f, MA5: %.1f",
-                final_score,
-                raw_final_score,
+                index_score,
+                index_weight,
                 quote_score,
                 quote_avg_change,
                 quote_decline_ratio * 100,
@@ -3670,11 +3857,57 @@ class MomentumScalpStrategy(BaseStrategy):
         ):
             return None
 
+        entry_grade = str(entry_meta.get("entry_grade", "") or "").upper()
+        turnover_rank = int(entry_meta.get("turnover_rank", 0) or 0)
+        bull_priority_entry = (
+            not is_scale_in
+            and strategy_name == "bull_breakout_strategy"
+            and entry_grade == "A"
+            and 0 < turnover_rank <= max(1, int(self.cfg.bull_priority_turnover_rank_max))
+        )
+
         alloc = self._compute_buy_allocation(
             symbol=quote.symbol,
             current_price=quote.current_price,
             pending_orders=pending_orders,
+            allow_expensive_single_share_override=(
+                not is_scale_in
+                and strategy_name == "bull_breakout_strategy"
+                and entry_grade == "A"
+            ),
+            per_stock_amount_multiplier=(
+                float(self.cfg.bull_priority_per_stock_amount_multiplier)
+                if bull_priority_entry
+                else 1.0
+            ),
+            max_per_stock_amount_multiplier=(
+                float(self.cfg.bull_priority_max_per_stock_amount_multiplier)
+                if bull_priority_entry
+                else 1.0
+            ),
+            max_single_position_pct_override=(
+                float(self.cfg.bull_priority_max_single_position_pct)
+                if bull_priority_entry
+                else None
+            ),
+            side_slot_override=(
+                int(self.cfg.bull_priority_effective_slots)
+                if bull_priority_entry
+                else None
+            ),
         )
+        if (
+            not is_scale_in
+            and strategy_name == "bull_breakout_strategy"
+            and entry_grade == "A"
+        ):
+            initial_scale = (
+                float(self.cfg.bull_priority_initial_entry_scale)
+                if bull_priority_entry
+                else float(self.cfg.bull_breakout_initial_entry_scale)
+            )
+            initial_scale = min(1.0, max(0.1, initial_scale))
+            alloc = min(alloc, max(quote.current_price, int(alloc * initial_scale)))
         quantity = alloc // quote.current_price
 
         if quantity <= 0:
@@ -3836,6 +4069,11 @@ class MomentumScalpStrategy(BaseStrategy):
         symbol: str,
         current_price: int,
         pending_orders: Optional[List[Order]] = None,
+        allow_expensive_single_share_override: bool = False,
+        per_stock_amount_multiplier: float = 1.0,
+        max_per_stock_amount_multiplier: float = 1.0,
+        max_single_position_pct_override: Optional[float] = None,
+        side_slot_override: Optional[int] = None,
     ) -> int:
         is_inverse = symbol in self._inverse_symbols
         capital_base = self._allocation_capital_base()
@@ -3874,9 +4112,25 @@ class MomentumScalpStrategy(BaseStrategy):
             capital_base - (total_exposure + pending_total),
             target_total_exposure - (total_exposure + pending_total),
         )
-        per_stock_amount = int(self.cfg.per_stock_amount * self._regime_per_stock_alloc_scale())
-        max_stock_amount = int(self.cfg.max_per_stock_amount * self._regime_max_stock_alloc_scale())
-        max_stock_amount = min(max_stock_amount, self._regime_max_single_position_amount())
+        per_stock_amount = int(
+            self.cfg.per_stock_amount
+            * self._regime_per_stock_alloc_scale()
+            * max(0.1, float(per_stock_amount_multiplier))
+        )
+        max_stock_amount = int(
+            self.cfg.max_per_stock_amount
+            * self._regime_max_stock_alloc_scale()
+            * max(0.1, float(max_per_stock_amount_multiplier))
+        )
+        if max_single_position_pct_override is None:
+            max_stock_amount = min(max_stock_amount, self._regime_max_single_position_amount())
+        else:
+            override_cap = int(
+                capital_base
+                * max(0.0, float(max_single_position_pct_override))
+                * self._risk_exposure_scale()
+            )
+            max_stock_amount = min(max_stock_amount, override_cap)
         stock_room = max_stock_amount - (stock_exposure + pending_stock)
 
         side_slot_limit = (
@@ -3891,6 +4145,8 @@ class MomentumScalpStrategy(BaseStrategy):
             1 for sym in self.positions if (sym in self._inverse_symbols) == is_inverse
         )
         remaining_side_slots = max(1, side_slot_limit - open_side_count - pending_side_count)
+        if side_slot_override is not None:
+            remaining_side_slots = max(1, min(remaining_side_slots, int(side_slot_override)))
         side_room_target = target_total_exposure - (side_exposure + pending_side)
         if side_room_target <= 0:
             return 0
@@ -3900,11 +4156,23 @@ class MomentumScalpStrategy(BaseStrategy):
         )
 
         alloc = min(side_budget_target, total_room, stock_room)
+        expensive_single_share_allowed = (
+            allow_expensive_single_share_override
+            and self.cfg.allow_expensive_single_share_override
+            and current_price >= int(self.cfg.expensive_single_share_min_price)
+            and total_room >= current_price
+            and (stock_exposure + pending_stock) <= 0
+            and current_price <= int(max_stock_amount * float(self.cfg.expensive_single_share_cap_multiplier))
+        )
         if alloc <= 0:
+            if expensive_single_share_allowed:
+                return current_price
             return 0
 
         # 비싼 종목(할당액 < 현재가)도 1주라도 살 수 있으면 최소 1주 주문을 허용한다.
         if alloc < current_price:
+            if expensive_single_share_allowed:
+                return current_price
             if total_room >= current_price and stock_room >= current_price:
                 return current_price
             return 0
