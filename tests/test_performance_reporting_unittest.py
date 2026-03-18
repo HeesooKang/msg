@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from src.performance_reporting import (
     build_daily_scorecard,
+    evaluate_strategy_gates,
     evaluate_real_trading_readiness,
     update_performance_reports,
 )
@@ -136,6 +137,10 @@ class PerformanceReportingTests(unittest.TestCase):
             ),
             positions={},
             _halted=False,
+            cfg=SimpleNamespace(
+                strategy_gate_window_days=5,
+                strategy_gate_min_closed_trades=4,
+            ),
         )
         balance = SimpleNamespace(
             total_eval_amount=9_800_000,
@@ -159,12 +164,71 @@ class PerformanceReportingTests(unittest.TestCase):
 
             self.assertTrue(paths["scorecard"]["json"].exists())
             self.assertTrue(paths["scorecard"]["md"].exists())
+            self.assertTrue(paths["strategy_gates"]["json"].exists())
+            self.assertTrue(paths["strategy_gates"]["md"].exists())
             self.assertTrue(paths["readiness"]["json"].exists())
             self.assertTrue(paths["readiness"]["md"].exists())
 
             payload = json.loads(paths["scorecard"]["json"].read_text(encoding="utf-8"))
             self.assertEqual(payload["pnl"]["session_pnl"], 900)
             self.assertIn("paper_gate", payload)
+
+    def test_evaluate_strategy_gates_disables_negative_expectancy_strategy(self):
+        scorecards = [
+            {
+                "date": "2026-03-10",
+                "log_analysis": {
+                    "strategy_pnl": {
+                        "neutral_pullback_strategy": {
+                            "closed_trades": 2,
+                            "net_pnl": -800,
+                            "wins": 0,
+                            "losses": 2,
+                        }
+                    },
+                    "strategy_hourly_pnl": {
+                        "neutral_pullback_strategy": {
+                            "10": {"closed_trades": 2, "net_pnl": -800, "expectancy": -400.0}
+                        }
+                    },
+                    "shadow_blocked": {
+                        "neutral_pullback_strategy": {
+                            "total": 1,
+                            "outcomes": {"take_profit_first": 1},
+                            "by_reason": {"neutral_loss_limit_block": 1},
+                        }
+                    },
+                },
+            },
+            {
+                "date": "2026-03-11",
+                "log_analysis": {
+                    "strategy_pnl": {
+                        "neutral_pullback_strategy": {
+                            "closed_trades": 2,
+                            "net_pnl": -600,
+                            "wins": 1,
+                            "losses": 1,
+                        }
+                    },
+                    "strategy_hourly_pnl": {
+                        "neutral_pullback_strategy": {
+                            "11": {"closed_trades": 2, "net_pnl": -600, "expectancy": -300.0}
+                        }
+                    },
+                    "shadow_blocked": {},
+                },
+            },
+        ]
+
+        payload = evaluate_strategy_gates(scorecards, window_days=5, min_closed_trades=4)
+
+        strategy_gate = payload["strategies"]["neutral_pullback_strategy"]
+        self.assertFalse(strategy_gate["enabled"])
+        self.assertEqual(strategy_gate["reason"], "negative_expectancy")
+        self.assertEqual(strategy_gate["closed_trades"], 4)
+        self.assertAlmostEqual(strategy_gate["expectancy"], -350.0)
+        self.assertIn("10", strategy_gate["hour_bucket_expectancy"])
 
     def test_readiness_passes_when_sample_profit_factor_and_expectancy_are_good(self):
         scorecards = []

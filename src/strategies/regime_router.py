@@ -93,8 +93,8 @@ class NeutralPullbackSubStrategy(RegimeSubStrategy):
         )
 
 
-class SoftBearDefenseSubStrategy(RegimeSubStrategy):
-    name = "soft_bear_defense_strategy"
+class SoftBearInverseSubStrategy(RegimeSubStrategy):
+    name = "soft_bear_inverse_strategy"
     profile_name = "soft_bear"
 
     def evaluate_inverse_entry(
@@ -138,7 +138,7 @@ class RegimeStrategyRouter:
         self._profile_strategies: Dict[str, RegimeSubStrategy] = {
             "bull": BullBreakoutSubStrategy(),
             "neutral": NeutralPullbackSubStrategy(),
-            "soft_bear": SoftBearDefenseSubStrategy(),
+            "soft_bear": SoftBearInverseSubStrategy(),
             "bear": HardBearInverseSubStrategy(),
         }
         self._name_strategies: Dict[str, RegimeSubStrategy] = {
@@ -169,6 +169,9 @@ class RegimeStrategyRouter:
         quote: Quote,
         score: float,
     ) -> EntryDecision:
+        strategy_name = strategy._current_profile_entry_strategy_name(is_inverse=False)
+        if strategy_name and strategy_name in self._name_strategies:
+            return self._name_strategies[strategy_name].evaluate_long_entry(strategy, quote, score)
         profile_name = strategy._resolve_regime_profile_name()
         return self.strategy_for_profile(profile_name).evaluate_long_entry(strategy, quote, score)
 

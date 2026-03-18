@@ -278,17 +278,25 @@ class IntradayBacktestEngine:
                 filled_count += 1
                 continue
 
-            pos = self._positions.pop(order.symbol, None)
+            pos = self._positions.get(order.symbol)
             if not pos:
+                continue
+            sell_qty = max(0, min(int(order.quantity or 0), int(pos.get("qty", 0) or 0)))
+            if sell_qty <= 0:
                 continue
 
             fill_price = int(q.current_price * (1 - self.slippage_bps / 10000))
-            gross_proceeds = fill_price * order.quantity
+            gross_proceeds = fill_price * sell_qty
             sell_commission = int(gross_proceeds * self.commission_rate)
             sell_tax = int(gross_proceeds * self.tax_rate)
             net_proceeds = gross_proceeds - sell_commission - sell_tax
-            buy_comm = pos.get("buy_comm", 0)
-            net_pnl = net_proceeds - (pos["price"] * order.quantity + buy_comm)
+            original_qty = int(pos.get("qty", 0) or 0)
+            buy_comm_total = int(pos.get("buy_comm", 0) or 0)
+            if sell_qty >= original_qty:
+                allocated_buy_comm = buy_comm_total
+            else:
+                allocated_buy_comm = int(round(buy_comm_total * (sell_qty / max(1, original_qty))))
+            net_pnl = net_proceeds - (pos["price"] * sell_qty + allocated_buy_comm)
 
             self._capital += net_proceeds
             self._daily_pnl += net_pnl
@@ -302,16 +310,21 @@ class IntradayBacktestEngine:
                     success=True,
                     symbol=order.symbol,
                     side=OrderSide.SELL,
-                    quantity=order.quantity,
+                    quantity=sell_qty,
                     price=fill_price,
                 )
             )
+            if sell_qty >= original_qty:
+                self._positions.pop(order.symbol, None)
+            else:
+                pos["qty"] = original_qty - sell_qty
+                pos["buy_comm"] = max(0, buy_comm_total - allocated_buy_comm)
             result.trade_records.append(
                 TradeRecord(
                     date=trade_date,
                     symbol=order.symbol,
                     side="sell",
-                    quantity=order.quantity,
+                    quantity=sell_qty,
                     price=fill_price,
                     pnl=net_pnl,
                 )

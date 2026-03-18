@@ -63,8 +63,10 @@
 ├── dev
 ├── docs/
 │   ├── live-trading-checklist.md
-│   ├── slack-alert-setup.md
-│   └── slack-setup-checklist.md
+│   ├── kakao-alert-setup.md
+│   └── kakao-setup-checklist.md
+├── scripts/
+│   └── kakao_oauth_helper.py
 ├── src/
 │   ├── account.py
 │   ├── api_client.py
@@ -131,9 +133,44 @@ LOG_LEVEL=INFO
 OFF_HOURS_CHECK_INTERVAL_SECONDS=1800
 
 ALLOW_DAILY_HARD_STOP_BYPASS=false
+
+ALERTS_ENABLED=true
+ALERT_CHANNEL=kakao
+KAKAO_REST_API_KEY=...
+KAKAO_CLIENT_SECRET=...
+KAKAO_REDIRECT_URI=...
+KAKAO_REFRESH_TOKEN=...
+KAKAO_MESSAGE_WEB_URL=...
+KAKAO_MESSAGE_MOBILE_WEB_URL=...
 ```
 
 `TRADING_MODE=paper`이면 모의투자 계정 정보를, `TRADING_MODE=real`이면 실계좌 정보를 사용합니다.
+
+카카오 알림을 쓰려면 `KAKAO_REFRESH_TOKEN`과 메시지 링크용 URL이 추가로 필요합니다.
+
+## 카카오 알림 설정
+
+카카오 알림은 `나에게 보내기` API를 사용합니다.
+
+1회 토큰 발급용 URL 생성:
+
+```bash
+./dev py scripts/kakao_oauth_helper.py auth-url \
+  --rest-api-key "$KAKAO_REST_API_KEY" \
+  --redirect-uri "$KAKAO_REDIRECT_URI"
+```
+
+로그인 후 받은 `code`를 토큰으로 교환:
+
+```bash
+./dev py scripts/kakao_oauth_helper.py exchange-code \
+  --rest-api-key "$KAKAO_REST_API_KEY" \
+  --client-secret "$KAKAO_CLIENT_SECRET" \
+  --redirect-uri "$KAKAO_REDIRECT_URI" \
+  --code "인가코드"
+```
+
+반환된 `refresh_token`을 `.env`의 `KAKAO_REFRESH_TOKEN`에 넣고 봇을 재시작하면 됩니다.
 
 ## 자주 쓰는 명령
 
@@ -269,8 +306,8 @@ paper 누적 성과 기준 실계좌 전환 가능 여부
 ## 문서
 
 - [실투자 전환 체크리스트](docs/live-trading-checklist.md)
-- [슬랙 알림 설정](docs/slack-alert-setup.md)
-- [슬랙 설정 체크리스트](docs/slack-setup-checklist.md)
+- [카카오 알림 설정](docs/kakao-alert-setup.md)
+- [카카오 설정 체크리스트](docs/kakao-setup-checklist.md)
 
 ## 참고 저장소
 

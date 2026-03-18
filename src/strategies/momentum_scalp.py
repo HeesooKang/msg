@@ -16,6 +16,7 @@ from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from statistics import median
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -156,6 +157,11 @@ class MomentumScalpConfig:
     bullish_min_momentum_score_floor: float = 3.4
     bullish_volume_spike_ratio_adjustment: float = 0.30
     bullish_volume_spike_abs_min_ratio: float = 0.6
+    bull_bias_avg_change_rate_threshold: float = 0.8
+    bull_bias_max_decliner_ratio: float = 0.45
+    bull_leader_top_n: int = 5
+    bull_leader_relative_strength_pp: float = 0.4
+    bull_partial_exit_ratio: float = 0.5
 
     min_momentum_score: float = 3.5
     enable_expected_net_filter: bool = True
@@ -187,12 +193,39 @@ class MomentumScalpConfig:
     neutral_post_loss_score_bonus: float = 0.35
     neutral_post_loss_change_rate_bonus: float = 0.15
     neutral_post_loss_extra_pullback_ticks: int = 1
+    enable_neutral_leader_filter: bool = True
+    neutral_leader_top_n: int = 8
+    neutral_leader_relative_strength_pp: float = 0.5
+    neutral_leader_max_reclaim_ticks: int = 6
+    neutral_first_entry_score_bonus: float = 0.35
+    neutral_first_entry_change_rate_bonus: float = 0.15
+    neutral_first_entry_min_drop_bonus_pct: float = 0.15
+    neutral_first_entry_min_runup_bonus_pct: float = 0.30
+    neutral_first_entry_reclaim_buffer_bonus_pct: float = 0.02
+    neutral_first_entry_max_turnover_rank: int = 4
+    neutral_first_entry_max_reclaim_ticks: int = 3
+    neutral_strategy_cooldown_minutes: int = 10
     soft_bear_inverse_pullback_min_drop_pct: float = 0.12
     soft_bear_inverse_pullback_max_drop_pct: float = 0.8
     soft_bear_inverse_min_runup_from_open_pct: float = 0.4
-    soft_bear_inverse_reclaim_buffer_pct: float = 0.05
+    soft_bear_inverse_reclaim_buffer_pct: float = 0.03
     soft_bear_inverse_min_change_rate: float = 0.9
     soft_bear_inverse_min_momentum: float = 2.2
+    soft_bear_inverse_min_runup_pct: float = 0.6
+    soft_bear_inverse_min_drop_pct: float = 0.15
+    soft_bear_inverse_max_drop_pct: float = 0.8
+    soft_bear_strategy_cooldown_minutes: int = 8
+    stage1_neutral_score_bonus: float = 0.55
+    stage1_neutral_change_rate_bonus: float = 0.20
+    stage1_neutral_min_drop_bonus_pct: float = 0.10
+    stage1_neutral_min_runup_bonus_pct: float = 0.20
+    stage1_neutral_reclaim_buffer_bonus_pct: float = 0.02
+    stage1_neutral_max_turnover_rank: int = 4
+    stage1_neutral_max_reclaim_ticks: int = 3
+    strategy_gate_window_days: int = 5
+    strategy_gate_min_closed_trades: int = 4
+    strategy_gate_path: str = "reports/strategy-gates.json"
+    enable_backtest_score_entry_fallback: bool = False
     stage1_loss_threshold: int = -3_000
     profit_protect_threshold: int = 8_000
     loss_stage_exposure_scale: float = 0.5
@@ -279,6 +312,8 @@ class PositionState:
     regime_label: str = ""
     bear_score: int = 0
     planned_risk_stage: str = ""
+    entry_grade: str = ""
+    partial_exit_done: bool = False
 
     def __post_init__(self):
         if self.invested_amount <= 0:
@@ -295,6 +330,7 @@ class ShadowBlockedCandidate:
     blocked_at: datetime
     reject_reason: str
     regime_label: str
+    strategy_name: str
     entry_price: int
     hypothetical_quantity: int
     notional: int
@@ -372,7 +408,8 @@ class MomentumScalpStrategy(BaseStrategy):
         self._quotes_cache: Dict[str, Quote] = {}
         self._recent_quotes: Dict[str, deque] = {}
         self._sell_cooldown: Dict[str, datetime] = {}
-        self._global_loss_cooldown_until: Optional[datetime] = None
+        self._symbol_cooldown_until: Dict[str, datetime] = {}
+        self._strategy_cooldown_until: Dict[str, datetime] = {}
         self._startup_rebalance_ticks: int = 0
         self._startup_rebalance_active: bool = False
         self._bear_score: int = 0
@@ -408,6 +445,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._neutral_post_loss_reentries_today: int = 0
         self._shadow_blocked_candidates: Dict[str, ShadowBlockedCandidate] = {}
         self._regime_router = RegimeStrategyRouter()
+        self._strategy_gate_state: Dict[str, dict] = {}
 
     def set_simulated_now(self, now: Optional[datetime]):
         """백테스트에서 사용할 시뮬레이션 시각을 주입한다."""
@@ -463,6 +501,91 @@ class MomentumScalpStrategy(BaseStrategy):
             scale = min(scale, float(self.cfg.profit_protect_exposure_scale))
         return max(0.1, scale)
 
+    def _current_daily_total_loss_limit(self) -> int:
+        return int(
+            self._get_regime_value(
+                "daily_total_loss_limit",
+                self.cfg.daily_total_loss_limit
+                if self.cfg.daily_total_loss_limit is not None
+                else self.cfg.daily_loss_limit,
+            )
+        )
+
+    def _current_daily_profit_target(self) -> int:
+        return int(self._get_regime_value("daily_profit_target", self.cfg.daily_profit_target))
+
+    def _trigger_daily_hard_stop(
+        self,
+        realized_net: int,
+        unrealized_net: int,
+        total_net: int,
+        *,
+        liquidate: bool,
+    ) -> List[Order]:
+        logger.warning(
+            "일일 총손익 하드스탑 도달! (순실현: %s원, 미실현추정: %s원, 합계: %s원) → 전량 청산 후 거래 중지",
+            f"{realized_net:,}",
+            f"{unrealized_net:,}",
+            f"{total_net:,}",
+        )
+        self._alerts.send(
+            event_key="daily_total_loss_limit_hit",
+            title="일일 총손익 하드스탑",
+            message=(
+                f"순실현 {realized_net:,}원, 미실현추정 {unrealized_net:,}원, "
+                f"합계 {total_net:,}원으로 하드스탑에 도달했습니다."
+            ),
+            level="error",
+            cooldown_seconds=1800,
+        )
+        self._halted = True
+        self._halt_date = self._today()
+        if liquidate:
+            return self._liquidate_all()
+        return []
+
+    def _trigger_daily_profit_target(
+        self,
+        total_net: int,
+        *,
+        liquidate: bool,
+    ) -> List[Order]:
+        logger.info(
+            "일일 총손익 목표 달성! (총손익: %s원) → 전량 청산 후 거래 중지",
+            f"{total_net:,}",
+        )
+        self._alerts.send(
+            event_key="daily_profit_target_hit",
+            title="일일 목표 달성",
+            message=f"총손익 {total_net:,}원으로 목표를 달성했습니다. 전량 청산 후 거래를 중지합니다.",
+            level="info",
+            cooldown_seconds=1800,
+        )
+        self._halted = True
+        self._halt_date = self._today()
+        if liquidate:
+            return self._liquidate_all()
+        return []
+
+    def _evaluate_daily_breakers(self, *, liquidate: bool) -> Optional[List[Order]]:
+        if self._hard_stop_bypass_for_day:
+            return None
+
+        realized_net = self._effective_realized_net_for_breaker()
+        unrealized_net = self._estimate_unrealized_net_pnl()
+        total_net = realized_net + unrealized_net
+
+        if total_net <= self._current_daily_total_loss_limit():
+            return self._trigger_daily_hard_stop(
+                realized_net,
+                unrealized_net,
+                total_net,
+                liquidate=liquidate,
+            )
+        if total_net >= self._current_daily_profit_target():
+            return self._trigger_daily_profit_target(total_net, liquidate=liquidate)
+        return None
+
     def _log_setup_reject(self, quote: Quote, reject_reason: str, message: str, *args):
         if not self.cfg.enable_setup_logging:
             return
@@ -499,6 +622,7 @@ class MomentumScalpStrategy(BaseStrategy):
             blocked_at=self._now(),
             reject_reason=reject_reason,
             regime_label=self._resolve_regime_profile_name(),
+            strategy_name=self._current_profile_entry_strategy_name(is_inverse=False),
             entry_price=quote.current_price,
             hypothetical_quantity=quantity,
             notional=notional,
@@ -509,11 +633,12 @@ class MomentumScalpStrategy(BaseStrategy):
             last_price=quote.current_price,
         )
         logger.info(
-            "그림자 후보 추적 시작: %s shadow_reason=%s regime_label=%s entry=%s원 qty=%d "
+            "그림자 후보 추적 시작: %s shadow_reason=%s regime_label=%s strategy_name=%s entry=%s원 qty=%d "
             "target=%.2f%% stop=%.2f%% window=%d분",
             quote.symbol,
             reject_reason,
             self._resolve_regime_profile_name(),
+            self._current_profile_entry_strategy_name(is_inverse=False),
             f"{quote.current_price:,}",
             quantity,
             target_pct,
@@ -536,11 +661,12 @@ class MomentumScalpStrategy(BaseStrategy):
             outcome = "flat"
 
         logger.info(
-            "그림자 후보 종료: %s shadow_reason=%s regime_label=%s entry=%s원 last=%s원 max=%s원 "
+            "그림자 후보 종료: %s shadow_reason=%s regime_label=%s strategy_name=%s entry=%s원 last=%s원 max=%s원 "
             "min=%s원 MFE=%.2f%% MAE=%.2f%% close=%.2f%% outcome=%s",
             candidate.symbol,
             candidate.reject_reason,
             candidate.regime_label,
+            candidate.strategy_name,
             f"{candidate.entry_price:,}",
             f"{candidate.last_price:,}",
             f"{candidate.max_price:,}",
@@ -631,6 +757,7 @@ class MomentumScalpStrategy(BaseStrategy):
             "bear_score": int(self._bear_score),
             "planned_risk_stage": current_stage,
             "is_inverse": symbol in self._inverse_symbols,
+            "entry_grade": self._extract_context_token(payload, "entry_grade", ""),
         }
 
     def _append_entry_context(self, payload: str, metadata: dict) -> str:
@@ -641,7 +768,99 @@ class MomentumScalpStrategy(BaseStrategy):
             f"bear_score={int(metadata.get('bear_score', 0))} "
             f"planned_risk_stage={metadata.get('planned_risk_stage', '')}"
         )
+        if metadata.get("entry_grade"):
+            extra += f" entry_grade={metadata.get('entry_grade', '')}"
         return f"{base} {extra}".strip()
+
+    def _current_profile_entry_strategy_name(self, is_inverse: bool) -> str:
+        profile_name = self._resolve_regime_profile_name()
+        if not is_inverse and profile_name == "neutral" and self._is_bull_bias_market():
+            return "bull_breakout_strategy"
+        strategy_name = self._regime_router.strategy_for_profile(profile_name).name
+        if is_inverse:
+            return strategy_name
+        if profile_name in {"soft_bear", "bear"}:
+            return ""
+        return strategy_name
+
+    def _load_strategy_gates(self) -> None:
+        self._strategy_gate_state = {}
+        if self.market_data is None:
+            return
+        gate_path_raw = str(getattr(self.cfg, "strategy_gate_path", "") or "").strip()
+        if not gate_path_raw:
+            return
+        gate_path = Path(gate_path_raw)
+        if not gate_path.exists():
+            return
+        try:
+            payload = json.loads(gate_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("전략 자동 게이트 로드 실패(무시): %s", exc)
+            return
+
+        strategies = payload.get("strategies")
+        if not isinstance(strategies, dict):
+            return
+        self._strategy_gate_state = {
+            str(name): dict(meta)
+            for name, meta in strategies.items()
+            if isinstance(meta, dict)
+        }
+        disabled = [
+            f"{name}(exp={float(meta.get('expectancy', 0.0)):.2f}, trades={int(meta.get('closed_trades', 0) or 0)})"
+            for name, meta in sorted(self._strategy_gate_state.items())
+            if not bool(meta.get("enabled", True))
+        ]
+        if disabled:
+            logger.info("전략 자동 게이트 비활성화 적용: %s", ", ".join(disabled))
+
+    def _is_strategy_gate_enabled(self, strategy_name: str) -> bool:
+        if not strategy_name:
+            return True
+        gate = self._strategy_gate_state.get(strategy_name)
+        if not gate:
+            return True
+        return bool(gate.get("enabled", True))
+
+    def _symbol_cooldown_remaining(self, symbol: str, now: Optional[datetime] = None) -> Optional[datetime]:
+        if now is None:
+            now = self._now()
+        cooldown_until = self._symbol_cooldown_until.get(symbol)
+        if cooldown_until and now < cooldown_until:
+            return cooldown_until
+        if cooldown_until and now >= cooldown_until:
+            self._symbol_cooldown_until.pop(symbol, None)
+        return None
+
+    def _strategy_cooldown_remaining(self, strategy_name: str, now: Optional[datetime] = None) -> Optional[datetime]:
+        if now is None:
+            now = self._now()
+        if not strategy_name:
+            return None
+        cooldown_until = self._strategy_cooldown_until.get(strategy_name)
+        if cooldown_until and now < cooldown_until:
+            return cooldown_until
+        if cooldown_until and now >= cooldown_until:
+            self._strategy_cooldown_until.pop(strategy_name, None)
+        return None
+
+    def _apply_loss_cooldowns(self, symbol: str, strategy_name: str) -> None:
+        now = self._now()
+        self._symbol_cooldown_until[symbol] = now + timedelta(
+            seconds=max(10, self._regime_loss_cooldown_seconds())
+        )
+        if strategy_name == "neutral_pullback_strategy":
+            minutes = max(1, int(self.cfg.neutral_strategy_cooldown_minutes))
+            if self._neutral_loss_count_today >= 2:
+                minutes *= 2
+            self._strategy_cooldown_until[strategy_name] = now + timedelta(minutes=minutes)
+        elif strategy_name == "soft_bear_inverse_strategy":
+            minutes = max(1, int(self.cfg.soft_bear_strategy_cooldown_minutes))
+            self._strategy_cooldown_until[strategy_name] = now + timedelta(minutes=minutes)
+        elif strategy_name == "bull_breakout_strategy":
+            minutes = max(1, int(round(self._regime_loss_cooldown_seconds() / 60)))
+            self._strategy_cooldown_until[strategy_name] = now + timedelta(minutes=minutes)
 
     def _minutes_since_market_open(self, now: Optional[datetime] = None) -> int:
         if now is None:
@@ -697,6 +916,11 @@ class MomentumScalpStrategy(BaseStrategy):
             ),
         }
 
+    def _is_neutral_first_entry_attempt(self) -> bool:
+        if self.daily_pnl.trade_count > 0:
+            return False
+        return not any(not pos.is_inverse for pos in self.positions.values())
+
     def _long_stop_loss_amount_for_notional(self, notional: int) -> int:
         dynamic_stop = int(round(max(0, notional) * self.cfg.long_stop_loss_notional_pct))
         stop_amount = min(max(1, dynamic_stop), max(1, int(self.cfg.long_stop_loss_cap_amount)))
@@ -739,6 +963,115 @@ class MomentumScalpStrategy(BaseStrategy):
             return prices[-1]
         return min(tail)
 
+    def _active_pool_quotes(self, include_inverse: bool = False) -> List[Quote]:
+        candidates: List[Quote] = []
+        seen: set[str] = set()
+        pool_symbols = list(self._pool) if self._pool else list(self._quotes_cache.keys())
+        for symbol in pool_symbols:
+            quote = self._quotes_cache.get(symbol)
+            if quote is None or quote.current_price <= 0:
+                continue
+            if not include_inverse and symbol in self._inverse_symbols:
+                continue
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            candidates.append(quote)
+        return candidates
+
+    def _passes_neutral_leader_filter(
+        self,
+        quote: Quote,
+        reclaim_speed_ticks: int,
+        *,
+        max_turnover_rank: Optional[int] = None,
+        max_reclaim_ticks: Optional[int] = None,
+        relative_strength_bonus_pp: float = 0.0,
+    ) -> tuple[bool, str]:
+        active_quotes = self._active_pool_quotes(include_inverse=False)
+        active_quotes_by_symbol = {item.symbol: item for item in active_quotes}
+        active_quotes_by_symbol[quote.symbol] = quote
+        active_quotes = list(active_quotes_by_symbol.values())
+
+        if quote.current_price <= quote.open_price:
+            return False, "neutral_non_leader"
+
+        if not active_quotes:
+            return False, "neutral_non_leader"
+
+        traded_values = sorted(
+            (
+                item.symbol,
+                max(0, int(item.current_price)) * max(0, int(item.volume)),
+            )
+            for item in active_quotes
+        )
+        ranked_turnover = sorted(traded_values, key=lambda item: (item[1], item[0]), reverse=True)
+        turnover_rank = next(
+            (idx for idx, (symbol, _) in enumerate(ranked_turnover, start=1) if symbol == quote.symbol),
+            len(ranked_turnover) + 1,
+        )
+        turnover_rank_limit = max_turnover_rank
+        if turnover_rank_limit is None:
+            turnover_rank_limit = int(self.cfg.neutral_leader_top_n)
+        if turnover_rank > max(1, int(turnover_rank_limit)):
+            return False, "neutral_low_turnover_rank"
+
+        if len(active_quotes) > 1:
+            median_change_rate = float(median(item.change_rate for item in active_quotes))
+            min_strength = (
+                median_change_rate
+                + float(self.cfg.neutral_leader_relative_strength_pp)
+                + float(relative_strength_bonus_pp)
+            )
+            if quote.change_rate < min_strength:
+                return False, "neutral_weak_relative_strength"
+
+        reclaim_tick_limit = max_reclaim_ticks
+        if reclaim_tick_limit is None:
+            reclaim_tick_limit = int(self.cfg.neutral_leader_max_reclaim_ticks)
+        if reclaim_speed_ticks > max(1, int(reclaim_tick_limit)):
+            return False, "neutral_slow_reclaim"
+
+        return True, ""
+
+    def _passes_bull_leader_filter(self, quote: Quote) -> tuple[bool, str, str]:
+        active_quotes = self._active_pool_quotes(include_inverse=False)
+        active_quotes_by_symbol = {item.symbol: item for item in active_quotes}
+        active_quotes_by_symbol[quote.symbol] = quote
+        active_quotes = list(active_quotes_by_symbol.values())
+
+        if quote.current_price <= quote.open_price:
+            return False, "bull_non_leader", ""
+        if not active_quotes:
+            return False, "bull_non_leader", ""
+
+        traded_values = sorted(
+            (
+                item.symbol,
+                max(0, int(item.current_price)) * max(0, int(item.volume)),
+            )
+            for item in active_quotes
+        )
+        ranked_turnover = sorted(traded_values, key=lambda item: (item[1], item[0]), reverse=True)
+        turnover_rank = next(
+            (idx for idx, (symbol, _) in enumerate(ranked_turnover, start=1) if symbol == quote.symbol),
+            len(ranked_turnover) + 1,
+        )
+        if turnover_rank > max(1, int(self.cfg.bull_leader_top_n)):
+            return False, "bull_low_turnover_rank", ""
+
+        median_change_rate = float(median(item.change_rate for item in active_quotes))
+        min_strength = median_change_rate + float(self.cfg.bull_leader_relative_strength_pp)
+        if quote.change_rate < min_strength:
+            return False, "bull_weak_relative_strength", ""
+
+        payload = (
+            f"entry_grade=A turnover_rank={turnover_rank} "
+            f"relative_strength_floor={min_strength:.2f}"
+        )
+        return True, "", payload
+
     def _passes_bull_breakout_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
         if not self._is_bullish_regime():
             return False, "", "bull_only"
@@ -752,9 +1085,15 @@ class MomentumScalpStrategy(BaseStrategy):
             return False, "", "bull_score"
         if not self._is_volume_spike(quote, score=score):
             return False, "", "bull_volume"
+        leader_ok, leader_reject, leader_payload = self._passes_bull_leader_filter(quote)
+        if not leader_ok:
+            return False, "", leader_reject
 
         prices = [item.current_price for item in history]
-        prior_high = max(prices[:-1])
+        prior_prices = prices[:-hold_ticks] if len(prices) > hold_ticks else prices[:-1]
+        if not prior_prices:
+            return False, "", "bull_breakout_wait"
+        prior_high = max(prior_prices)
         breakout_level = prior_high * (1 + (self.cfg.bull_breakout_buffer_pct / 100))
         if quote.current_price < breakout_level:
             return False, "", "bull_breakout_wait"
@@ -765,7 +1104,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
         reason = (
             f"setup_name=bull_breakout entry_reason=local_high_breakout "
-            f"prior_high={prior_high} hold_ticks={hold_ticks}"
+            f"prior_high={prior_high} hold_ticks={hold_ticks} {leader_payload}"
         )
         return True, "bull_breakout", reason
 
@@ -795,6 +1134,19 @@ class MomentumScalpStrategy(BaseStrategy):
         reclaim_buffer_pct = self.cfg.neutral_reclaim_buffer_pct
         min_score = self._regime_min_momentum_score()
         min_change_rate = self._regime_min_change_rate()
+        leader_turnover_rank_limit: Optional[int] = None
+        leader_reclaim_tick_limit: Optional[int] = None
+        leader_relative_strength_bonus_pp = 0.0
+
+        if self._is_neutral_first_entry_attempt():
+            min_pullback_drop_pct += float(self.cfg.neutral_first_entry_min_drop_bonus_pct)
+            min_runup_from_open_pct += float(self.cfg.neutral_first_entry_min_runup_bonus_pct)
+            reclaim_buffer_pct += float(self.cfg.neutral_first_entry_reclaim_buffer_bonus_pct)
+            min_score += float(self.cfg.neutral_first_entry_score_bonus)
+            min_change_rate += float(self.cfg.neutral_first_entry_change_rate_bonus)
+            leader_turnover_rank_limit = int(self.cfg.neutral_first_entry_max_turnover_rank)
+            leader_reclaim_tick_limit = int(self.cfg.neutral_first_entry_max_reclaim_ticks)
+            leader_relative_strength_bonus_pp += 0.15
 
         if self._is_neutral_post_loss_retry_available():
             retry_thresholds = self._neutral_retry_thresholds()
@@ -804,6 +1156,22 @@ class MomentumScalpStrategy(BaseStrategy):
             reclaim_buffer_pct = retry_thresholds["reclaim_buffer_pct"]
             min_score = retry_thresholds["min_score"]
             min_change_rate = retry_thresholds["min_change_rate"]
+
+        if self._is_loss_stage_active() and not self._is_neutral_post_loss_retry_available():
+            min_pullback_drop_pct += float(self.cfg.stage1_neutral_min_drop_bonus_pct)
+            min_runup_from_open_pct += float(self.cfg.stage1_neutral_min_runup_bonus_pct)
+            reclaim_buffer_pct += float(self.cfg.stage1_neutral_reclaim_buffer_bonus_pct)
+            min_score += float(self.cfg.stage1_neutral_score_bonus)
+            min_change_rate += float(self.cfg.stage1_neutral_change_rate_bonus)
+            leader_turnover_rank_limit = min(
+                int(leader_turnover_rank_limit or self.cfg.neutral_leader_top_n),
+                int(self.cfg.stage1_neutral_max_turnover_rank),
+            )
+            leader_reclaim_tick_limit = min(
+                int(leader_reclaim_tick_limit or self.cfg.neutral_leader_max_reclaim_ticks),
+                int(self.cfg.stage1_neutral_max_reclaim_ticks),
+            )
+            leader_relative_strength_bonus_pp += 0.10
 
         if runup_from_open < min_runup_from_open_pct:
             return False, "", "pullback_missing"
@@ -825,7 +1193,23 @@ class MomentumScalpStrategy(BaseStrategy):
         if pullback_drop > self.cfg.neutral_pullback_max_drop_pct:
             return False, "", "pullback_broken"
         if self._pct_move(quote.open_price, quote.current_price) <= 0:
-            return False, "", "reclaim_failed"
+            return False, "", "neutral_non_leader"
+
+        pullback_low_idx = local_high_idx + 1 + min(
+            range(len(pullback_window)),
+            key=lambda idx: pullback_window[idx],
+        )
+        reclaim_speed_ticks = max(1, (len(history) - 1) - pullback_low_idx)
+        if self.cfg.enable_neutral_leader_filter:
+            leader_ok, leader_reject = self._passes_neutral_leader_filter(
+                quote,
+                reclaim_speed_ticks=reclaim_speed_ticks,
+                max_turnover_rank=leader_turnover_rank_limit,
+                max_reclaim_ticks=leader_reclaim_tick_limit,
+                relative_strength_bonus_pp=leader_relative_strength_bonus_pp,
+            )
+            if not leader_ok:
+                return False, "", leader_reject
 
         reclaim_level = int(round(local_high * (1 + reclaim_buffer_pct / 100)))
         if quote.current_price < reclaim_level:
@@ -839,53 +1223,56 @@ class MomentumScalpStrategy(BaseStrategy):
 
         reason = (
             f"setup_name=neutral_pullback_reclaim entry_reason=pullback_reclaim "
-            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f}"
+            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f} "
+            f"reclaim_speed_ticks={reclaim_speed_ticks}"
         )
         return True, "neutral_pullback_reclaim", reason
 
     def _passes_soft_bear_inverse_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
         if self._resolve_regime_profile_name() != "soft_bear":
             return False, "", "soft_bear_only"
+        if quote.symbol not in self._inverse_symbols:
+            return False, "", "soft_bear_inverse_only"
         history = self._get_recent_quotes(quote.symbol)
         if len(history) < 4:
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_pullback_missing"
         if quote.current_price <= 0 or quote.open_price <= 0:
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_pullback_missing"
 
         prices = [item.current_price for item in history[:-1]]
         if not prices:
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_pullback_missing"
 
         local_high = max(prices)
         local_high_idx = max(idx for idx, price in enumerate(prices) if price == local_high)
         pullback_window = prices[local_high_idx + 1:]
         if not pullback_window:
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_pullback_missing"
 
         runup_from_open = self._pct_move(quote.open_price, local_high)
-        if runup_from_open < self.cfg.soft_bear_inverse_min_runup_from_open_pct:
-            return False, "", "soft_bear_inverse_fail"
+        if runup_from_open < self.cfg.soft_bear_inverse_min_runup_pct:
+            return False, "", "soft_bear_runup_missing"
 
         pullback_low = min(pullback_window)
         pullback_drop = self._loss_pct(local_high, pullback_low)
-        if pullback_drop < self.cfg.soft_bear_inverse_pullback_min_drop_pct:
-            return False, "", "soft_bear_inverse_fail"
-        if pullback_drop > self.cfg.soft_bear_inverse_pullback_max_drop_pct:
-            return False, "", "soft_bear_inverse_fail"
+        if pullback_drop < self.cfg.soft_bear_inverse_min_drop_pct:
+            return False, "", "soft_bear_pullback_missing"
+        if pullback_drop > self.cfg.soft_bear_inverse_max_drop_pct:
+            return False, "", "soft_bear_pullback_missing"
 
-        reclaim_level = int(round(local_high * (1 - self.cfg.soft_bear_inverse_reclaim_buffer_pct / 100)))
+        reclaim_level = int(round(local_high * (1 + self.cfg.soft_bear_inverse_reclaim_buffer_pct / 100)))
         if quote.current_price < reclaim_level:
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_reclaim_failed"
         if quote.change_rate < self.cfg.soft_bear_inverse_min_change_rate:
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_runup_missing"
         if score < self.cfg.soft_bear_inverse_min_momentum:
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_runup_missing"
         if not self._is_volume_spike(quote, score=score):
-            return False, "", "soft_bear_inverse_fail"
+            return False, "", "soft_bear_volume_failed"
 
         reason = (
             f"setup_name=soft_bear_inverse_breakdown entry_reason=weak_rebound_failure "
-            f"local_high={local_high} drop_pct={pullback_drop:.2f}"
+            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f}"
         )
         return True, "soft_bear_inverse_breakdown", reason
 
@@ -915,6 +1302,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._state_loaded_for_today = False
         self._daily_breaker_pnl_offset = 0
         self._load_daily_state()
+        self._load_strategy_gates()
         if self._halted and self._halt_date == today and self.cfg.allow_hard_stop_bypass_for_day:
             logger.warning(
                 "당일 하드스탑 플래그 복구 무시(임시 모드): 오늘 전일 누적손실이 있어도 재개합니다."
@@ -927,7 +1315,8 @@ class MomentumScalpStrategy(BaseStrategy):
             self._halted = False
             self._halt_date = None
             self._sell_cooldown = {}
-            self._global_loss_cooldown_until = None
+            self._symbol_cooldown_until = {}
+            self._strategy_cooldown_until = {}
             self._startup_rebalance_active = False
             self._startup_rebalance_ticks = 0
             self._last_cumulative_volumes = {}
@@ -1230,6 +1619,8 @@ class MomentumScalpStrategy(BaseStrategy):
                 "regime_label": pos.regime_label,
                 "bear_score": pos.bear_score,
                 "planned_risk_stage": pos.planned_risk_stage,
+                "entry_grade": pos.entry_grade,
+                "partial_exit_done": pos.partial_exit_done,
             }
         return payload
 
@@ -1355,52 +1746,9 @@ class MomentumScalpStrategy(BaseStrategy):
         risk_stage = self._current_risk_stage(total_net)
         self._log_risk_stage_change(risk_stage, total_net)
         if not self._hard_stop_bypass_for_day:
-            total_loss_limit = int(
-                self._get_regime_value(
-                    "daily_total_loss_limit",
-                    self.cfg.daily_total_loss_limit
-                    if self.cfg.daily_total_loss_limit is not None
-                    else self.cfg.daily_loss_limit,
-                )
-            )
-            daily_profit_target = int(self._get_regime_value("daily_profit_target", self.cfg.daily_profit_target))
-
-            if total_net <= total_loss_limit:
-                logger.warning(
-                    "일일 총손익 하드스탑 도달! (순실현: %s원, 미실현추정: %s원, 합계: %s원) → 전량 청산 후 거래 중지",
-                    f"{realized_net:,}",
-                    f"{unrealized_net:,}",
-                    f"{total_net:,}",
-                )
-                self._alerts.send(
-                    event_key="daily_total_loss_limit_hit",
-                    title="일일 총손익 하드스탑",
-                    message=(
-                        f"순실현 {realized_net:,}원, 미실현추정 {unrealized_net:,}원, "
-                        f"합계 {total_net:,}원으로 하드스탑에 도달했습니다."
-                    ),
-                    level="error",
-                    cooldown_seconds=1800,
-                )
-                self._halted = True
-                self._halt_date = self._today()
-                return self._liquidate_all()
-
-            if total_net >= daily_profit_target:
-                logger.info(
-                    "일일 총손익 목표 달성! (총손익: %s원) → 전량 청산 후 거래 중지",
-                    f"{total_net:,}",
-                )
-                self._alerts.send(
-                    event_key="daily_profit_target_hit",
-                    title="일일 목표 달성",
-                    message=f"총손익 {total_net:,}원으로 목표를 달성했습니다. 전량 청산 후 거래를 중지합니다.",
-                    level="info",
-                    cooldown_seconds=1800,
-                )
-                self._halted = True
-                self._halt_date = self._today()
-                return self._liquidate_all()
+            breaker_orders = self._evaluate_daily_breakers(liquidate=True)
+            if breaker_orders is not None:
+                return breaker_orders
         else:
             logger.info("당일 하드스탑 무시 모드: 일일 손익 브레이크는 비활성화됩니다.")
 
@@ -1515,6 +1863,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 existing.buy_price = int(round(total_invested / total_qty))
                 existing.is_restored = False
                 existing.restored_at = None
+                existing.partial_exit_done = False
                 if fill_price > existing.high_since_buy:
                     existing.high_since_buy = fill_price
                 if entry_meta and not existing.entry_setup_name:
@@ -1524,6 +1873,7 @@ class MomentumScalpStrategy(BaseStrategy):
                     existing.regime_label = str(entry_meta.get("regime_label", "") or "")
                     existing.bear_score = int(entry_meta.get("bear_score", 0) or 0)
                     existing.planned_risk_stage = str(entry_meta.get("planned_risk_stage", "") or "")
+                    existing.entry_grade = str(entry_meta.get("entry_grade", "") or "")
                 tag = "[INV] " if result.symbol in self._inverse_symbols else ""
                 logger.info(
                     "%s추가매수 체결: %s +%d주 @ %s원 (평단 %s원, 총 %d주)",
@@ -1533,6 +1883,17 @@ class MomentumScalpStrategy(BaseStrategy):
                     f"{fill_price:,}",
                     f"{existing.buy_price:,}",
                     existing.quantity,
+                )
+                alert_key_suffix = self._now().strftime("%H%M%S%f")
+                self._alerts.send(
+                    event_key=f"buy_fill_add_{result.symbol}_{alert_key_suffix}",
+                    title="추가매수 체결",
+                    message=(
+                        f"{result.symbol} +{result.quantity}주 @ {fill_price:,}원\n"
+                        f"평단 {existing.buy_price:,}원, 총 {existing.quantity}주"
+                    ),
+                    level="info",
+                    cooldown_seconds=0,
                 )
                 self._save_daily_state()
                 return
@@ -1559,11 +1920,12 @@ class MomentumScalpStrategy(BaseStrategy):
                 regime_label=str(entry_meta.get("regime_label", "") or ""),
                 bear_score=int(entry_meta.get("bear_score", 0) or 0),
                 planned_risk_stage=str(entry_meta.get("planned_risk_stage", "") or ""),
+                entry_grade=str(entry_meta.get("entry_grade", "") or ""),
             )
             tag = "[INV] " if result.symbol in self._inverse_symbols else ""
             logger.info(
                 "%s매수 체결: %s %d주 @ %s원 "
-                "(strategy_name=%s, setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s)",
+                "(strategy_name=%s, setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s, entry_grade=%s)",
                 tag,
                 result.symbol,
                 result.quantity,
@@ -1573,6 +1935,20 @@ class MomentumScalpStrategy(BaseStrategy):
                 self.positions[result.symbol].regime_label or "-",
                 self.positions[result.symbol].bear_score,
                 self.positions[result.symbol].planned_risk_stage or "-",
+                self.positions[result.symbol].entry_grade or "-",
+            )
+            alert_key_suffix = self._now().strftime("%H%M%S%f")
+            self._alerts.send(
+                event_key=f"buy_fill_{result.symbol}_{alert_key_suffix}",
+                title="매수 체결",
+                message=(
+                    f"{result.symbol} {result.quantity}주 @ {fill_price:,}원\n"
+                    f"전략 {self.positions[result.symbol].entry_strategy_name or '-'} / "
+                    f"셋업 {self.positions[result.symbol].entry_setup_name or '-'} / "
+                    f"레짐 {self.positions[result.symbol].regime_label or '-'}"
+                ),
+                level="info",
+                cooldown_seconds=0,
             )
             self._save_daily_state()
 
@@ -1589,15 +1965,19 @@ class MomentumScalpStrategy(BaseStrategy):
                 )
                 return
 
-            pos = self.positions.pop(result.symbol, None)
+            pos = self.positions.get(result.symbol)
             if pos:
+                original_qty = int(pos.quantity)
+                filled_qty = max(0, min(int(result.quantity or 0), original_qty))
+                if filled_qty <= 0:
+                    return
                 sell_price = result.price
                 if sell_price <= 0:
                     cached = self._quotes_cache.get(result.symbol)
                     sell_price = cached.current_price if cached else pos.buy_price
 
-                gross_pnl = (sell_price - pos.buy_price) * pos.quantity
-                sell_notional = sell_price * pos.quantity
+                gross_pnl = (sell_price - pos.buy_price) * filled_qty
+                sell_notional = sell_price * filled_qty
                 sell_fee = self._calc_commission_cost(sell_notional)
                 sell_tax_slippage = self._calc_sell_tax_slippage_cost(sell_notional)
                 net_pnl = gross_pnl - sell_fee - sell_tax_slippage
@@ -1618,10 +1998,13 @@ class MomentumScalpStrategy(BaseStrategy):
                 else:
                     self.daily_pnl.breakeven_count += 1
 
+                is_partial_exit = filled_qty < original_qty
+
                 if (
                     net_pnl < 0
                     and pos.regime_label == "neutral"
                     and result.symbol not in self._inverse_symbols
+                    and not is_partial_exit
                 ):
                     self._neutral_loss_count_today += 1
                     self._neutral_last_loss_at = self._now()
@@ -1632,31 +2015,73 @@ class MomentumScalpStrategy(BaseStrategy):
                         result.symbol,
                     )
 
-                if net_pnl < 0:
-                    self._global_loss_cooldown_until = self._now() + timedelta(
-                        seconds=self._regime_loss_cooldown_seconds()
-                    )
+                if net_pnl < 0 and not is_partial_exit:
+                    self._apply_loss_cooldowns(result.symbol, pos.entry_strategy_name)
 
                 self._sell_cooldown[result.symbol] = self._now()
 
+                if is_partial_exit:
+                    remaining_qty = original_qty - filled_qty
+                    pos.quantity = remaining_qty
+                    pos.invested_amount = max(0, pos.buy_price * remaining_qty)
+                    pos.partial_exit_done = True
+                else:
+                    self.positions.pop(result.symbol, None)
+
                 tag = "[INV] " if result.symbol in self._inverse_symbols else ""
-                logger.info(
-                    "%s매도 체결: %s %d주 @ %s원 "
-                    "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, "
-                    "strategy_name=%s, setup_name=%s, regime_label=%s)",
-                    tag,
-                    result.symbol,
-                    result.quantity,
-                    f"{sell_price:,}",
-                    f"{gross_pnl:,}",
-                    f"{net_pnl:,}",
-                    f"{self.daily_pnl.realized_net_pnl:,}",
-                    pos.entry_strategy_name or "-",
-                    pos.entry_setup_name or "-",
-                    pos.regime_label or "-",
+                if is_partial_exit:
+                    logger.info(
+                        "%s부분매도 체결: %s %d주 @ %s원 "
+                        "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, 잔여 %d주, "
+                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s)",
+                        tag,
+                        result.symbol,
+                        filled_qty,
+                        f"{sell_price:,}",
+                        f"{gross_pnl:,}",
+                        f"{net_pnl:,}",
+                        f"{self.daily_pnl.realized_net_pnl:,}",
+                        pos.quantity,
+                        pos.entry_strategy_name or "-",
+                        pos.entry_setup_name or "-",
+                        pos.regime_label or "-",
+                        pos.entry_grade or "-",
+                    )
+                else:
+                    logger.info(
+                        "%s매도 체결: %s %d주 @ %s원 "
+                        "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, "
+                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s)",
+                        tag,
+                        result.symbol,
+                        filled_qty,
+                        f"{sell_price:,}",
+                        f"{gross_pnl:,}",
+                        f"{net_pnl:,}",
+                        f"{self.daily_pnl.realized_net_pnl:,}",
+                        pos.entry_strategy_name or "-",
+                        pos.entry_setup_name or "-",
+                        pos.regime_label or "-",
+                        pos.entry_grade or "-",
+                    )
+                alert_key_suffix = self._now().strftime("%H%M%S%f")
+                self._alerts.send(
+                    event_key=f"{'partial_' if is_partial_exit else ''}sell_fill_{result.symbol}_{alert_key_suffix}",
+                    title="부분매도 체결" if is_partial_exit else "매도 체결",
+                    message=(
+                        f"{result.symbol} {filled_qty}주 @ {sell_price:,}원\n"
+                        f"순손익 {net_pnl:,}원, 누적순손익 {self.daily_pnl.realized_net_pnl:,}원\n"
+                        f"전략 {pos.entry_strategy_name or '-'} / "
+                        f"셋업 {pos.entry_setup_name or '-'} / "
+                        f"레짐 {pos.regime_label or '-'}"
+                    ),
+                    level="info" if net_pnl >= 0 else "warning",
+                    cooldown_seconds=0,
                 )
 
                 self._save_daily_state()
+                if not self._hard_stop_bypass_for_day:
+                    self._evaluate_daily_breakers(liquidate=False)
 
     def should_continue(self) -> bool:
         if self._halted and not self.positions:
@@ -2205,6 +2630,8 @@ class MomentumScalpStrategy(BaseStrategy):
                 regime_label=str(snapshot.get("regime_label", "") or ""),
                 bear_score=int(snapshot.get("bear_score", 0) or 0),
                 planned_risk_stage=str(snapshot.get("planned_risk_stage", "") or ""),
+                entry_grade=str(snapshot.get("entry_grade", "") or ""),
+                partial_exit_done=bool(snapshot.get("partial_exit_done", False)),
             )
 
         self.positions = synced
@@ -2309,7 +2736,31 @@ class MomentumScalpStrategy(BaseStrategy):
 
     def _is_bullish_regime(self) -> bool:
         """약세점수 기반 완화 모드 판정."""
-        return self._bear_score <= 0
+        return self._bear_score <= 0 or self._is_bull_bias_market()
+
+    def _is_bull_bias_market(self) -> bool:
+        if self._resolve_regime_profile_name() != "neutral":
+            return False
+        index_info = self._cached_index_regime_info
+        if index_info:
+            current, ma20, ma5 = index_info
+            if current <= 0 or current <= ma20 or current <= ma5:
+                return False
+        elif self.market_data is not None:
+            return False
+
+        active_quotes = self._active_pool_quotes(include_inverse=False)
+        if len(active_quotes) < 4:
+            return False
+
+        avg_change = sum(item.change_rate for item in active_quotes) / len(active_quotes)
+        declining_ratio = (
+            sum(1 for item in active_quotes if item.change_rate < 0) / len(active_quotes)
+        )
+        return (
+            avg_change >= float(self.cfg.bull_bias_avg_change_rate_threshold)
+            and declining_ratio <= float(self.cfg.bull_bias_max_decliner_ratio)
+        )
 
     def _check_market_regime(self, quotes: Optional[List[Quote]] = None, force: bool = False):
         """KOSPI + 실시간 후보군 추세를 결합해 약세 점수를 계산한다."""
@@ -2698,16 +3149,44 @@ class MomentumScalpStrategy(BaseStrategy):
         if self._is_new_entry_window_blocked(now):
             return False
 
-        if self._global_loss_cooldown_until:
-            if now < self._global_loss_cooldown_until:
-                logger.info("전역 리스크 쿨다운: %s (종료: %s)",
-                            quote.symbol, self._global_loss_cooldown_until)
-                return False
-
         if any(
             o.side == OrderSide.BUY and o.symbol == quote.symbol
             for o in pending_orders or []
         ):
+            return False
+
+        strategy_name = self._current_profile_entry_strategy_name(is_inverse=False)
+        if strategy_name and not self._is_strategy_gate_enabled(strategy_name):
+            self._log_setup_reject(
+                quote,
+                "strategy_gate_disabled",
+                "전략 자동 게이트 비활성화: %s (%s)",
+                quote.symbol,
+                strategy_name,
+            )
+            return False
+
+        symbol_cooldown_until = self._symbol_cooldown_remaining(quote.symbol, now)
+        if symbol_cooldown_until is not None:
+            self._log_setup_reject(
+                quote,
+                "symbol_loss_cooldown",
+                "종목 손실 쿨다운 중입니다: %s (재허용 %s)",
+                quote.symbol,
+                symbol_cooldown_until.strftime("%H:%M:%S"),
+            )
+            return False
+
+        strategy_cooldown_until = self._strategy_cooldown_remaining(strategy_name, now)
+        if strategy_cooldown_until is not None:
+            self._log_setup_reject(
+                quote,
+                "strategy_loss_cooldown",
+                "전략 손실 쿨다운 중입니다: %s (%s, 재허용 %s)",
+                quote.symbol,
+                strategy_name,
+                strategy_cooldown_until.strftime("%H:%M:%S"),
+            )
             return False
 
         if profile_name in {"soft_bear", "bear"}:
@@ -2720,7 +3199,7 @@ class MomentumScalpStrategy(BaseStrategy):
             )
             return False
 
-        if profile_name == "neutral":
+        if profile_name == "neutral" and strategy_name == "neutral_pullback_strategy":
             neutral_loss_limit = self._neutral_loss_limit()
             if self._neutral_loss_count_today > neutral_loss_limit:
                 self._track_shadow_blocked_candidate(quote, "neutral_loss_limit_block")
@@ -2786,15 +3265,32 @@ class MomentumScalpStrategy(BaseStrategy):
                     )
                     return False
 
-        if self._is_loss_stage_active() and profile_name == "neutral":
-            self._log_setup_reject(
-                quote,
-                "risk_stage1_block",
-                "손실 1단계에서는 중립장 신규 롱을 차단합니다: %s (총손익 %s원)",
-                quote.symbol,
-                f"{self._current_total_net_pnl():,}",
-            )
-            return False
+        if self._is_loss_stage_active() and strategy_name == "neutral_pullback_strategy":
+            stage1_score_floor = self._regime_min_momentum_score() + float(self.cfg.stage1_neutral_score_bonus)
+            stage1_change_floor = self._regime_min_change_rate() + float(self.cfg.stage1_neutral_change_rate_bonus)
+            total_net = self._current_total_net_pnl()
+            if score is not None and score < stage1_score_floor:
+                self._log_setup_reject(
+                    quote,
+                    "risk_stage1_quality_block",
+                    "손실 1단계에서는 A급 중립장 롱만 허용합니다: %s (점수 %.2f < %.2f, 총손익 %s원)",
+                    quote.symbol,
+                    score,
+                    stage1_score_floor,
+                    f"{total_net:,}",
+                )
+                return False
+            if quote.change_rate < stage1_change_floor:
+                self._log_setup_reject(
+                    quote,
+                    "risk_stage1_quality_block",
+                    "손실 1단계에서는 A급 중립장 롱만 허용합니다: %s (등락률 %.2f%% < %.2f%%, 총손익 %s원)",
+                    quote.symbol,
+                    quote.change_rate,
+                    stage1_change_floor,
+                    f"{total_net:,}",
+                )
+                return False
 
         if self._bear_market and self.cfg.bear_market_mode == "B":
             logger.info("신규롱 차단: 약세 모드 B")
@@ -3103,29 +3599,51 @@ class MomentumScalpStrategy(BaseStrategy):
                 now=now,
             ):
                 return None
-            decision = self._regime_router.evaluate_long_entry(self, quote, score)
-            if not decision.allowed:
-                self._entry_signals.pop(quote.symbol, None)
-                if decision.reject_reason:
-                    self._log_setup_reject(
-                        quote,
-                        decision.reject_reason,
-                        "%s (%s)",
-                        quote.symbol,
-                        decision.reject_reason,
-                    )
-                return None
-            strategy_name = decision.strategy_name
-            setup_name = decision.setup_name
-            entry_meta = self._build_entry_metadata(
-                quote.symbol,
-                setup_name,
-                decision.payload,
-                strategy_name=strategy_name,
-            )
-            if self._resolve_regime_profile_name() == "neutral" and self._is_neutral_post_loss_retry_available(now):
-                entry_meta["neutral_post_loss_retry"] = True
-            entry_reason = self._append_entry_context(decision.payload, entry_meta)
+            if self.market_data is None and self.cfg.enable_backtest_score_entry_fallback:
+                fallback_min_score = self._regime_min_momentum_score()
+                if self._is_bullish_regime():
+                    fallback_min_score = self._regime_bullish_min_momentum_score()
+                if score < fallback_min_score:
+                    return None
+                if not self._is_volume_spike(quote, score=score):
+                    return None
+                strategy_name = "backtest_score_fallback_strategy"
+                setup_name = "backtest_score_entry"
+                fallback_payload = (
+                    "setup_name=backtest_score_entry "
+                    "entry_reason=score_fallback"
+                )
+                entry_meta = self._build_entry_metadata(
+                    quote.symbol,
+                    setup_name,
+                    fallback_payload,
+                    strategy_name=strategy_name,
+                )
+                entry_reason = self._append_entry_context(fallback_payload, entry_meta)
+            else:
+                decision = self._regime_router.evaluate_long_entry(self, quote, score)
+                if not decision.allowed:
+                    self._entry_signals.pop(quote.symbol, None)
+                    if decision.reject_reason:
+                        self._log_setup_reject(
+                            quote,
+                            decision.reject_reason,
+                            "%s (%s)",
+                            quote.symbol,
+                            decision.reject_reason,
+                        )
+                    return None
+                strategy_name = decision.strategy_name
+                setup_name = decision.setup_name
+                entry_meta = self._build_entry_metadata(
+                    quote.symbol,
+                    setup_name,
+                    decision.payload,
+                    strategy_name=strategy_name,
+                )
+                if self._resolve_regime_profile_name() == "neutral" and self._is_neutral_post_loss_retry_available(now):
+                    entry_meta["neutral_post_loss_retry"] = True
+                entry_reason = self._append_entry_context(decision.payload, entry_meta)
 
         if quote.change_rate >= self.cfg.overheated_jump_change_pct:
             retrace_anchor = quote.open_price * (
@@ -3217,17 +3735,46 @@ class MomentumScalpStrategy(BaseStrategy):
         if self._bear_score < required_bear_score:
             return None
 
-        if self._global_loss_cooldown_until and now < self._global_loss_cooldown_until:
-            logger.info("[INV] 전역 리스크 쿨다운: %s (종료: %s)",
-                        quote.symbol, self._global_loss_cooldown_until)
-            return None
-
         # 쿨다운 체크
         last_sold = self._sell_cooldown.get(quote.symbol)
         if last_sold:
             elapsed = (now - last_sold).total_seconds()
             if elapsed < self._regime_cooldown_seconds():
                 return None
+
+        strategy_name = self._current_profile_entry_strategy_name(is_inverse=True)
+        if strategy_name and not self._is_strategy_gate_enabled(strategy_name):
+            self._log_setup_reject(
+                quote,
+                "strategy_gate_disabled",
+                "%s (%s)",
+                quote.symbol,
+                strategy_name,
+            )
+            return None
+
+        symbol_cooldown_until = self._symbol_cooldown_remaining(quote.symbol, now)
+        if symbol_cooldown_until is not None:
+            self._log_setup_reject(
+                quote,
+                "symbol_loss_cooldown",
+                "%s (재허용 %s)",
+                quote.symbol,
+                symbol_cooldown_until.strftime("%H:%M:%S"),
+            )
+            return None
+
+        strategy_cooldown_until = self._strategy_cooldown_remaining(strategy_name, now)
+        if strategy_cooldown_until is not None:
+            self._log_setup_reject(
+                quote,
+                "strategy_loss_cooldown",
+                "%s (%s, 재허용 %s)",
+                quote.symbol,
+                strategy_name,
+                strategy_cooldown_until.strftime("%H:%M:%S"),
+            )
+            return None
 
         score = self._calc_momentum_score(quote)
         decision = self._regime_router.evaluate_inverse_entry(self, quote, score)
@@ -3391,15 +3938,40 @@ class MomentumScalpStrategy(BaseStrategy):
 
         # 익절
         if pnl_pct >= self._regime_take_profit_pct():
-            if self._should_defer_profit_exit(
+            if (
+                pos.entry_strategy_name == "bull_breakout_strategy"
+                and pos.entry_grade == "A"
+                and not pos.partial_exit_done
+                and pos.quantity >= 2
+            ):
+                partial_ratio = min(0.9, max(0.1, float(self.cfg.bull_partial_exit_ratio)))
+                partial_qty = max(1, int(pos.quantity * partial_ratio))
+                if partial_qty >= pos.quantity:
+                    partial_qty = pos.quantity - 1
+                if partial_qty > 0:
+                    logger.info(
+                        "bull A급 부분익절: %s %.2f%% (%s원) %d/%d주",
+                        quote.symbol,
+                        pnl_pct,
+                        f"{pnl_amount:,}",
+                        partial_qty,
+                        pos.quantity,
+                    )
+                    return self._make_sell_order(pos, quantity=partial_qty)
+            elif (
+                pos.entry_strategy_name == "bull_breakout_strategy"
+                and pos.entry_grade == "A"
+                and pos.partial_exit_done
+            ):
+                pass
+            elif not self._should_defer_profit_exit(
                 pos=pos,
                 exit_price=quote.current_price,
                 reason="익절",
             ):
-                return None
-            logger.info("익절: %s %.2f%% (%s원)",
-                        quote.symbol, pnl_pct, f"{pnl_amount:,}")
-            return self._make_sell_order(pos)
+                logger.info("익절: %s %.2f%% (%s원)",
+                            quote.symbol, pnl_pct, f"{pnl_amount:,}")
+                return self._make_sell_order(pos)
 
         # 개별 포지션 손절 (포지션 노출 연동 금액 기준)
         if pnl_amount <= stop_amount:
@@ -3528,8 +4100,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
         # 3. 고가 근접도 (0~1.0)
         price_range = quote.high_price - quote.low_price
-        profile_name = self._resolve_regime_profile_name()
-        if price_range > 0 and profile_name == "bull":
+        if price_range > 0 and self._is_bullish_regime():
             proximity = (quote.current_price - quote.low_price) / price_range
             if proximity >= 0.9:
                 score += 1.0
@@ -3549,12 +4120,12 @@ class MomentumScalpStrategy(BaseStrategy):
 
         return score
 
-    def _make_sell_order(self, pos: PositionState) -> Order:
+    def _make_sell_order(self, pos: PositionState, quantity: Optional[int] = None) -> Order:
         return Order(
             symbol=pos.symbol,
             side=OrderSide.SELL,
             order_type=OrderType.MARKET,
-            quantity=pos.quantity,
+            quantity=max(1, int(quantity if quantity is not None else pos.quantity)),
             price=0,
         )
 

@@ -12,11 +12,15 @@ DEFAULT_LOG_ROOT = Path("logs")
 DAILY_REPORT_PREFIX = "daily-scorecard."
 READINESS_REPORT_JSON = "real-trade-readiness.json"
 READINESS_REPORT_MD = "real-trade-readiness.md"
+STRATEGY_GATE_REPORT_JSON = "strategy-gates.json"
+STRATEGY_GATE_REPORT_MD = "strategy-gates.md"
 PAPER_GATE_WINDOW_DAYS = 5
 PAPER_GATE_MIN_POSITIVE_DAYS = 3
 PAPER_GATE_MIN_TOTAL_NET_PNL = 10_000
 PAPER_GATE_DAILY_LOSS_LIMIT = -5_000
 PAPER_GATE_DAILY_TARGET = 10_000
+DEFAULT_STRATEGY_GATE_WINDOW_DAYS = 5
+DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES = 4
 REAL_MONEY_STAGE_RULES = {
     1: {
         "label": "stage1",
@@ -55,6 +59,14 @@ _SELL_SYMBOL_RE = re.compile(r"(?:\[INV\]\s*)?매도 체결:\s*([0-9A-Z]+)\s")
 _SELL_NET_PNL_RE = re.compile(r"순손익:\s*([-\d,]+)원")
 _SELL_PNL_RE = re.compile(r"손익:\s*([-\d,]+)원")
 _RISK_STAGE_RE = re.compile(r"리스크 단계 전환:\s*([a-zA-Z0-9_]+)")
+_SHADOW_OUTCOME_RE = re.compile(r"outcome=([a-zA-Z0-9_]+)")
+
+
+def _parse_line_timestamp(raw_line: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(raw_line[:19], "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -297,6 +309,16 @@ def analyze_trading_log(
     regime_pnl: Dict[str, int] = defaultdict(int)
     symbol_pnl: Dict[str, int] = defaultdict(int)
     risk_stage_transitions: Dict[str, int] = defaultdict(int)
+    strategy_hourly: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
+    )
+    shadow_blocked: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "total": 0,
+            "outcomes": defaultdict(int),
+            "by_reason": defaultdict(int),
+        }
+    )
     active_entries: Dict[str, Dict[str, str]] = {}
     daily_hard_stop_triggered = False
     daily_profit_target_triggered = False
@@ -305,6 +327,7 @@ def analyze_trading_log(
         message = _extract_log_message(raw_line)
         if not message:
             continue
+        line_ts = _parse_line_timestamp(raw_line)
 
         risk_stage_match = _RISK_STAGE_RE.search(message)
         if risk_stage_match:
@@ -366,6 +389,21 @@ def analyze_trading_log(
             elif net_pnl < 0:
                 metrics["losses"] += 1
                 strategy_metrics["losses"] += 1
+            if line_ts is not None:
+                hour_key = f"{line_ts.hour:02d}"
+                bucket = strategy_hourly[strategy_name][hour_key]
+                bucket["closed_trades"] += 1
+                bucket["net_pnl"] += net_pnl
+
+        if "그림자 후보 종료:" in message:
+            strategy_name = _extract_context_token(message, "strategy_name", "unknown_strategy")
+            shadow_reason = _extract_context_token(message, "shadow_reason", "unknown")
+            outcome_match = _SHADOW_OUTCOME_RE.search(message)
+            outcome = outcome_match.group(1) if outcome_match else "unknown"
+            shadow_metrics = shadow_blocked[strategy_name]
+            shadow_metrics["total"] += 1
+            shadow_metrics["outcomes"][outcome] += 1
+            shadow_metrics["by_reason"][shadow_reason] += 1
 
     sorted_symbols = sorted(symbol_pnl.items(), key=lambda item: (item[1], item[0]), reverse=True)
     top_winners = [
@@ -394,11 +432,33 @@ def analyze_trading_log(
             strategy: metrics
             for strategy, metrics in sorted(strategy_pnl.items())
         },
+        "strategy_hourly_pnl": {
+            strategy: {
+                hour: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(
+                        metrics["net_pnl"] / metrics["closed_trades"],
+                        2,
+                    ) if metrics["closed_trades"] else 0.0,
+                }
+                for hour, metrics in sorted(hours.items())
+            }
+            for strategy, hours in sorted(strategy_hourly.items())
+        },
         "setup_pnl": {
             setup: metrics
             for setup, metrics in sorted(setup_pnl.items())
         },
         "regime_pnl": dict(sorted(regime_pnl.items())),
+        "shadow_blocked": {
+            strategy: {
+                "total": int(metrics["total"]),
+                "outcomes": dict(sorted(metrics["outcomes"].items())),
+                "by_reason": dict(sorted(metrics["by_reason"].items())),
+            }
+            for strategy, metrics in sorted(shadow_blocked.items())
+        },
         "symbols": {
             "net_pnl": dict(sorted(symbol_pnl.items())),
             "top_winners": top_winners,
@@ -453,6 +513,8 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
     strategy_pnl = log_analysis.get("strategy_pnl", {})
     setup_pnl = log_analysis.get("setup_pnl", {})
     regime_pnl = log_analysis.get("regime_pnl", {})
+    strategy_hourly_pnl = log_analysis.get("strategy_hourly_pnl", {})
+    shadow_blocked = log_analysis.get("shadow_blocked", {})
     symbols = log_analysis.get("symbols", {})
     risk_events = log_analysis.get("risk_events", {})
     if entries or rejections or setup_pnl:
@@ -480,6 +542,22 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
             f"{key} {_format_currency(value)}"
             for key, value in regime_pnl.items()
         ) or "-"
+        hourly_expectancy_summary = ", ".join(
+            f"{strategy} "
+            + "/".join(
+                f"{hour}시 {metrics.get('expectancy', 0.0):,.1f}원"
+                for hour, metrics in hourly.items()
+            )
+            for strategy, hourly in strategy_hourly_pnl.items()
+        ) or "-"
+        shadow_summary = ", ".join(
+            f"{strategy} {data.get('total', 0)}건 "
+            + "/".join(
+                f"{outcome} {count}건"
+                for outcome, count in data.get("outcomes", {}).items()
+            )
+            for strategy, data in shadow_blocked.items()
+        ) or "-"
         top_winners_summary = ", ".join(
             f"{item.get('symbol')} {_format_currency(item.get('net_pnl'))}"
             for item in symbols.get("top_winners", [])
@@ -498,8 +576,10 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
                 f"- 차단 사유 수: {_safe_int(rejections.get('total'))}건",
                 f"- 차단 사유별: {rejection_summary}",
                 f"- 전략별 순손익: {strategy_pnl_summary}",
+                f"- 전략별 시간대 기대값: {hourly_expectancy_summary}",
                 f"- 셋업별 순손익: {setup_pnl_summary}",
                 f"- 레짐별 순손익: {regime_pnl_summary}",
+                f"- 그림자 차단 후보 결과: {shadow_summary}",
                 f"- 종목별 상위: {top_winners_summary}",
                 f"- 종목별 하위: {top_losers_summary}",
                 f"- 손실 1단계 진입 차단: {_safe_int(risk_events.get('risk_stage1_block_count'))}건",
@@ -523,6 +603,122 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def evaluate_strategy_gates(
+    scorecards: List[Dict[str, Any]],
+    *,
+    window_days: int = DEFAULT_STRATEGY_GATE_WINDOW_DAYS,
+    min_closed_trades: int = DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES,
+) -> Dict[str, Any]:
+    window_cards = scorecards[-window_days:] if window_days > 0 else list(scorecards)
+    strategy_rollup: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "closed_trades": 0,
+            "net_pnl": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "hourly": defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0}),
+            "shadow_outcomes": defaultdict(int),
+            "shadow_reasons": defaultdict(int),
+        }
+    )
+
+    for card in window_cards:
+        log_analysis = card.get("log_analysis", {})
+        for strategy_name, metrics in (log_analysis.get("strategy_pnl") or {}).items():
+            rollup = strategy_rollup[strategy_name]
+            rollup["closed_trades"] += _safe_int(metrics.get("closed_trades"))
+            rollup["net_pnl"] += _safe_float(metrics.get("net_pnl"))
+            rollup["wins"] += _safe_int(metrics.get("wins"))
+            rollup["losses"] += _safe_int(metrics.get("losses"))
+        for strategy_name, hours in (log_analysis.get("strategy_hourly_pnl") or {}).items():
+            rollup = strategy_rollup[strategy_name]
+            for hour, metrics in hours.items():
+                bucket = rollup["hourly"][hour]
+                bucket["closed_trades"] += _safe_int(metrics.get("closed_trades"))
+                bucket["net_pnl"] += _safe_float(metrics.get("net_pnl"))
+        for strategy_name, shadow in (log_analysis.get("shadow_blocked") or {}).items():
+            rollup = strategy_rollup[strategy_name]
+            for outcome, count in (shadow.get("outcomes") or {}).items():
+                rollup["shadow_outcomes"][outcome] += _safe_int(count)
+            for reason, count in (shadow.get("by_reason") or {}).items():
+                rollup["shadow_reasons"][reason] += _safe_int(count)
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    strategies: Dict[str, Any] = {}
+    for strategy_name, metrics in sorted(strategy_rollup.items()):
+        closed_trades = _safe_int(metrics.get("closed_trades"))
+        net_pnl = _safe_float(metrics.get("net_pnl"))
+        expectancy = round(net_pnl / closed_trades, 2) if closed_trades > 0 else 0.0
+        win_rate = round(_safe_int(metrics.get("wins")) / closed_trades, 4) if closed_trades > 0 else 0.0
+        enabled = not (closed_trades >= min_closed_trades and expectancy < 0)
+        reason = "negative_expectancy" if not enabled else "pass"
+        strategies[strategy_name] = {
+            "enabled": enabled,
+            "reason": reason,
+            "closed_trades": closed_trades,
+            "expectancy": expectancy,
+            "avg_net_pnl": expectancy,
+            "win_rate": win_rate,
+            "hour_bucket_expectancy": {
+                hour: round(bucket["net_pnl"] / bucket["closed_trades"], 2)
+                if bucket["closed_trades"]
+                else 0.0
+                for hour, bucket in sorted(metrics["hourly"].items())
+            },
+            "shadow_blocked_summary": {
+                "outcomes": dict(sorted(metrics["shadow_outcomes"].items())),
+                "by_reason": dict(sorted(metrics["shadow_reasons"].items())),
+            },
+            "updated_at": now_iso,
+        }
+
+    return {
+        "generated_at": now_iso,
+        "window_days": window_days,
+        "min_closed_trades": min_closed_trades,
+        "strategies": strategies,
+    }
+
+
+def render_strategy_gates_markdown(payload: Dict[str, Any]) -> str:
+    lines = [
+        "# 전략 자동 게이트",
+        "",
+        f"- 생성 시각: {payload.get('generated_at', '')}",
+        f"- 최근 창: {_safe_int(payload.get('window_days'))}거래일",
+        f"- 최소 청산 체결: {_safe_int(payload.get('min_closed_trades'))}건",
+        "",
+    ]
+    strategies = payload.get("strategies", {})
+    if not strategies:
+        lines.append("- 집계된 전략이 없습니다.")
+        lines.append("")
+        return "\n".join(lines)
+
+    for strategy_name, metrics in strategies.items():
+        hourly = metrics.get("hour_bucket_expectancy", {})
+        shadow = metrics.get("shadow_blocked_summary", {})
+        lines.extend(
+            [
+                f"## {strategy_name}",
+                f"- 활성화: {'예' if metrics.get('enabled') else '아니오'}",
+                f"- 사유: {metrics.get('reason', '-')}",
+                f"- 청산 체결: {_safe_int(metrics.get('closed_trades'))}건",
+                f"- 기대값: {_safe_float(metrics.get('expectancy')):,.2f}원",
+                f"- 승률: {_format_ratio(metrics.get('win_rate'))}",
+                f"- 시간대 기대값: "
+                + (", ".join(f"{hour}시 {value:,.1f}원" for hour, value in hourly.items()) or "-"),
+                f"- 그림자 결과: "
+                + (
+                    ", ".join(f"{key} {value}건" for key, value in (shadow.get('outcomes') or {}).items())
+                    or "-"
+                ),
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def write_daily_scorecard(scorecard: Dict[str, Any], report_root: Path = DEFAULT_REPORT_ROOT) -> Dict[str, Path]:
     paths = _scorecard_paths(report_root, scorecard["date"])
     for path in paths.values():
@@ -534,6 +730,23 @@ def write_daily_scorecard(scorecard: Dict[str, Any], report_root: Path = DEFAULT
     )
     paths["md"].write_text(
         render_daily_scorecard_markdown(scorecard),
+        encoding="utf-8",
+    )
+    return paths
+
+
+def write_strategy_gates_report(payload: Dict[str, Any], report_root: Path = DEFAULT_REPORT_ROOT) -> Dict[str, Path]:
+    report_root.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "json": report_root / STRATEGY_GATE_REPORT_JSON,
+        "md": report_root / STRATEGY_GATE_REPORT_MD,
+    }
+    paths["json"].write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    paths["md"].write_text(
+        render_strategy_gates_markdown(payload),
         encoding="utf-8",
     )
     return paths
@@ -940,10 +1153,24 @@ def update_performance_reports(
     merged_scorecards = _merge_scorecards(existing_scorecards, scorecard)
     scorecard["paper_gate"] = evaluate_paper_trading_gate(merged_scorecards)
     scorecard_paths = write_daily_scorecard(scorecard, report_root=report_root)
+    strategy_cfg = getattr(strategy, "cfg", None)
+    strategy_gates = evaluate_strategy_gates(
+        merged_scorecards,
+        window_days=_safe_int(
+            getattr(strategy_cfg, "strategy_gate_window_days", DEFAULT_STRATEGY_GATE_WINDOW_DAYS),
+            DEFAULT_STRATEGY_GATE_WINDOW_DAYS,
+        ),
+        min_closed_trades=_safe_int(
+            getattr(strategy_cfg, "strategy_gate_min_closed_trades", DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES),
+            DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES,
+        ),
+    )
+    strategy_gate_paths = write_strategy_gates_report(strategy_gates, report_root=report_root)
     readiness = evaluate_real_trading_readiness(merged_scorecards)
     readiness_paths = write_readiness_report(readiness, report_root=report_root)
     return {
         "scorecard": scorecard_paths,
+        "strategy_gates": strategy_gate_paths,
         "readiness": readiness_paths,
     }
 

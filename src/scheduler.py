@@ -1,7 +1,9 @@
 import logging
 import math
 import time
+import json
 from datetime import datetime, time as clock_time, timedelta
+from pathlib import Path
 
 import requests
 
@@ -13,6 +15,7 @@ from src.executor import OrderExecutor, RiskManager
 from src.logger_setup import setup_logger
 from src.market_data import MarketDataAPI
 from src.performance_reporting import update_performance_reports
+from src.notifications import AlertManager
 from src.strategy import BaseStrategy
 from src.trading import TradingAPI
 
@@ -39,9 +42,11 @@ class TradingScheduler:
         self.trading = TradingAPI(self.client)
         self.account = AccountAPI(self.client)
         self.executor = OrderExecutor(self.trading, RiskManager())
+        self._alerts = AlertManager()
 
         self._balance_retry_attempts = 3
         self._balance_retry_delay_seconds = 2
+        self._last_session_end_reason = "session_end"
 
     def stop(self):
         self._shutdown = True
@@ -67,7 +72,12 @@ class TradingScheduler:
                     if self._is_trading_time(now):
                         halted_for_day = self._run_trading_session(tick_interval)
                         if halted_for_day and not self._shutdown:
-                            logger.info("당일 하드스탑 감지: 다음 장 준비 시각까지 대기합니다.")
+                            if self._last_session_end_reason == "daily_hard_stop":
+                                logger.info("당일 하드스탑 감지: 다음 장 준비 시각까지 대기합니다.")
+                            elif self._last_session_end_reason == "daily_profit_target":
+                                logger.info("당일 목표 달성 종료: 다음 장 준비 시각까지 대기합니다.")
+                            else:
+                                logger.info("당일 세션 종료 감지: 다음 장 준비 시각까지 대기합니다.")
                             self._sleep_until_preopen()
                     else:
                         wait = self._seconds_until_preopen(now)
@@ -197,6 +207,16 @@ class TradingScheduler:
         strategy_pnl_baseline = self._extract_strategy_realized_pnl()
         watchlist = self.strategy.get_watchlist()
         logger.info("감시 종목: %d개", len(watchlist))
+        self._alerts.send(
+            event_key=f"trading_session_started_{datetime.now().date().isoformat()}",
+            title="트레이딩 세션 시작",
+            message=(
+                f"{self.config.trading_mode.upper()} 모드로 장중 세션을 시작했습니다.\n"
+                f"감시 종목 {len(watchlist)}개"
+            ),
+            level="info",
+            cooldown_seconds=0,
+        )
 
         # 잔고 확인
         balance = self._fetch_balance_with_retry("세션 시작 잔고 조회")
@@ -215,6 +235,7 @@ class TradingScheduler:
             return False
 
         halted_for_day = False
+        self._last_session_end_reason = "session_end"
 
         # 틱 루프
         while not self._shutdown and self._is_trading_time(datetime.now()):
@@ -296,8 +317,23 @@ class TradingScheduler:
                 paths["scorecard"]["json"],
                 paths["readiness"]["json"],
             )
+            self._last_session_end_reason = self._resolve_session_end_reason(paths["scorecard"]["json"])
         except Exception:
             logger.exception("성과 리포트 생성 실패")
+            self._last_session_end_reason = "session_end"
+
+    def _resolve_session_end_reason(self, scorecard_path) -> str:
+        try:
+            payload = json.loads(Path(scorecard_path).read_text(encoding="utf-8"))
+        except Exception:
+            return "session_end"
+
+        risk_events = payload.get("log_analysis", {}).get("risk_events", {})
+        if bool(risk_events.get("daily_hard_stop_triggered")):
+            return "daily_hard_stop"
+        if bool(risk_events.get("daily_profit_target_triggered")):
+            return "daily_profit_target"
+        return "session_end"
 
     def _resolve_session_profit_loss(self, balance, strategy_pnl_baseline=None) -> int:
         """세션 종료 손익 값을 결정한다.
