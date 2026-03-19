@@ -14,6 +14,8 @@ READINESS_REPORT_JSON = "real-trade-readiness.json"
 READINESS_REPORT_MD = "real-trade-readiness.md"
 STRATEGY_GATE_REPORT_JSON = "strategy-gates.json"
 STRATEGY_GATE_REPORT_MD = "strategy-gates.md"
+MATH_SHADOW_REPORT_JSON = "math-shadow-report.json"
+MATH_SHADOW_REPORT_MD = "math-shadow-report.md"
 PAPER_GATE_WINDOW_DAYS = 5
 PAPER_GATE_MIN_POSITIVE_DAYS = 3
 PAPER_GATE_MIN_TOTAL_NET_PNL = 10_000
@@ -312,6 +314,7 @@ def analyze_trading_log(
     strategy_hourly: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
         lambda: defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
     )
+    trade_records: List[Dict[str, Any]] = []
     shadow_blocked: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
             "total": 0,
@@ -319,6 +322,16 @@ def analyze_trading_log(
             "by_reason": defaultdict(int),
         }
     )
+    math_grade_entries: Dict[str, int] = defaultdict(int)
+    math_grade_pnl: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    math_ev_buckets: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    math_shadow_gate_counts: Dict[str, int] = defaultdict(int)
+    math_shadow_reason_counts: Dict[str, int] = defaultdict(int)
+    regime_shadow_disagreements: Dict[str, int] = defaultdict(int)
     active_entries: Dict[str, Dict[str, str]] = {}
     daily_hard_stop_triggered = False
     daily_profit_target_triggered = False
@@ -341,6 +354,16 @@ def analyze_trading_log(
         reject_match = _REJECT_REASON_RE.search(message)
         if reject_match:
             reject_by_reason[reject_match.group(1)] += 1
+        math_shadow_gate = _extract_context_token(message, "math_shadow_gate", "")
+        math_shadow_reason = _extract_context_token(message, "math_shadow_reason", "")
+        if math_shadow_gate:
+            math_shadow_gate_counts[math_shadow_gate] += 1
+        if math_shadow_reason:
+            math_shadow_reason_counts[math_shadow_reason] += 1
+        if _extract_context_token(message, "math_regime_shadow_disagreement", "") == "1":
+            discrete_regime = _extract_context_token(message, "discrete_regime", "unknown")
+            shadow_regime = _extract_context_token(message, "shadow_regime", "unknown")
+            regime_shadow_disagreements[f"{discrete_regime}->{shadow_regime}"] += 1
 
         setup_match = _SETUP_NAME_RE.search(message)
         entry_reason_match = _ENTRY_REASON_RE.search(message)
@@ -354,12 +377,23 @@ def analyze_trading_log(
                 entry_by_reason[entry_reason_match.group(1)] += 1
             regime_label = regime_match.group(1) if regime_match else "unknown"
             entry_by_regime[regime_label] += 1
+            entry_grade_math = _extract_context_token(message, "entry_grade_math", "unknown")
+            math_grade_entries[entry_grade_math] += 1
             symbol = _extract_signal_symbol(message)
             if symbol:
                 active_entries[symbol] = {
                     "strategy_name": strategy_name,
                     "setup_name": setup_name,
                     "regime_label": regime_label,
+                    "entry_grade_math": entry_grade_math,
+                    "leader_score": _extract_context_token(message, "leader_score", "0"),
+                    "leader_pct": _extract_context_token(message, "leader_pct", "0"),
+                    "entry_ev": _extract_context_token(message, "entry_ev", "0"),
+                    "entry_ev_conf": _extract_context_token(message, "entry_ev_conf", "none"),
+                    "bull_prob": _extract_context_token(message, "bull_prob", "0"),
+                    "neutral_prob": _extract_context_token(message, "neutral_prob", "0"),
+                    "soft_bear_prob": _extract_context_token(message, "soft_bear_prob", "0"),
+                    "bear_prob": _extract_context_token(message, "bear_prob", "0"),
                 }
 
         if "매도 체결:" in message:
@@ -374,6 +408,11 @@ def analyze_trading_log(
             )
             setup_name = entry_meta.get("setup_name") or _extract_context_token(message, "setup_name", "unknown")
             regime_label = entry_meta.get("regime_label") or _extract_context_token(message, "regime_label", "unknown")
+            entry_grade_math = entry_meta.get("entry_grade_math") or _extract_context_token(
+                message,
+                "entry_grade_math",
+                "unknown",
+            )
             net_pnl = _extract_sell_net_pnl(message)
             metrics = setup_pnl[setup_name]
             metrics["closed_trades"] += 1
@@ -394,6 +433,33 @@ def analyze_trading_log(
                 bucket = strategy_hourly[strategy_name][hour_key]
                 bucket["closed_trades"] += 1
                 bucket["net_pnl"] += net_pnl
+            math_grade_metrics = math_grade_pnl[entry_grade_math]
+            math_grade_metrics["closed_trades"] += 1
+            math_grade_metrics["net_pnl"] += net_pnl
+            entry_ev = _safe_float(entry_meta.get("entry_ev"))
+            ev_bucket = "positive" if entry_ev > 0 else "negative" if entry_ev < 0 else "zero"
+            math_ev_metrics = math_ev_buckets[ev_bucket]
+            math_ev_metrics["closed_trades"] += 1
+            math_ev_metrics["net_pnl"] += net_pnl
+            trade_records.append(
+                {
+                    "symbol": symbol,
+                    "strategy_name": strategy_name,
+                    "setup_name": setup_name,
+                    "regime_label": regime_label,
+                    "hour_bucket": f"{line_ts.hour:02d}" if line_ts is not None else "unknown",
+                    "entry_grade_math": entry_grade_math,
+                    "net_pnl": net_pnl,
+                    "leader_score": _safe_float(entry_meta.get("leader_score")),
+                    "leader_pct": _safe_float(entry_meta.get("leader_pct")),
+                    "entry_ev": entry_ev,
+                    "entry_ev_conf": entry_meta.get("entry_ev_conf") or "none",
+                    "bull_prob": _safe_float(entry_meta.get("bull_prob")),
+                    "neutral_prob": _safe_float(entry_meta.get("neutral_prob")),
+                    "soft_bear_prob": _safe_float(entry_meta.get("soft_bear_prob")),
+                    "bear_prob": _safe_float(entry_meta.get("bear_prob")),
+                }
+            )
 
         if "그림자 후보 종료:" in message:
             strategy_name = _extract_context_token(message, "strategy_name", "unknown_strategy")
@@ -459,6 +525,35 @@ def analyze_trading_log(
             }
             for strategy, metrics in sorted(shadow_blocked.items())
         },
+        "trade_records": trade_records,
+        "math_shadow": {
+            "entries_by_grade": dict(sorted(math_grade_entries.items())),
+            "grade_pnl": {
+                grade: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(
+                        metrics["net_pnl"] / metrics["closed_trades"],
+                        2,
+                    ) if metrics["closed_trades"] else 0.0,
+                }
+                for grade, metrics in sorted(math_grade_pnl.items())
+            },
+            "ev_buckets": {
+                bucket: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(
+                        metrics["net_pnl"] / metrics["closed_trades"],
+                        2,
+                    ) if metrics["closed_trades"] else 0.0,
+                }
+                for bucket, metrics in sorted(math_ev_buckets.items())
+            },
+            "shadow_gate_counts": dict(sorted(math_shadow_gate_counts.items())),
+            "shadow_reason_counts": dict(sorted(math_shadow_reason_counts.items())),
+            "regime_shadow_disagreements": dict(sorted(regime_shadow_disagreements.items())),
+        },
         "symbols": {
             "net_pnl": dict(sorted(symbol_pnl.items())),
             "top_winners": top_winners,
@@ -515,6 +610,7 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
     regime_pnl = log_analysis.get("regime_pnl", {})
     strategy_hourly_pnl = log_analysis.get("strategy_hourly_pnl", {})
     shadow_blocked = log_analysis.get("shadow_blocked", {})
+    math_shadow = log_analysis.get("math_shadow", {})
     symbols = log_analysis.get("symbols", {})
     risk_events = log_analysis.get("risk_events", {})
     if entries or rejections or setup_pnl:
@@ -566,6 +662,18 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
             f"{item.get('symbol')} {_format_currency(item.get('net_pnl'))}"
             for item in symbols.get("top_losers", [])
         ) or "-"
+        math_grade_summary = ", ".join(
+            f"{grade} {_safe_int(value)}건"
+            for grade, value in (math_shadow.get("entries_by_grade") or {}).items()
+        ) or "-"
+        math_ev_summary = ", ".join(
+            f"{bucket} {_format_currency(value.get('net_pnl'))} / {_safe_int(value.get('closed_trades'))}건"
+            for bucket, value in (math_shadow.get("ev_buckets") or {}).items()
+        ) or "-"
+        math_regime_summary = ", ".join(
+            f"{key} {value}건"
+            for key, value in (math_shadow.get("regime_shadow_disagreements") or {}).items()
+        ) or "-"
         lines.extend(
             [
                 "## 로그 분석",
@@ -580,6 +688,9 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
                 f"- 셋업별 순손익: {setup_pnl_summary}",
                 f"- 레짐별 순손익: {regime_pnl_summary}",
                 f"- 그림자 차단 후보 결과: {shadow_summary}",
+                f"- Math shadow 등급 분포: {math_grade_summary}",
+                f"- Math shadow EV 버킷: {math_ev_summary}",
+                f"- Math shadow 레짐 불일치: {math_regime_summary}",
                 f"- 종목별 상위: {top_winners_summary}",
                 f"- 종목별 하위: {top_losers_summary}",
                 f"- 손실 1단계 진입 차단: {_safe_int(risk_events.get('risk_stage1_block_count'))}건",
@@ -719,6 +830,159 @@ def render_strategy_gates_markdown(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def evaluate_math_shadow_report(
+    scorecards: List[Dict[str, Any]],
+    *,
+    window_days: int = 5,
+    min_closed_trades: int = 4,
+) -> Dict[str, Any]:
+    window_cards = scorecards[-window_days:] if window_days > 0 else list(scorecards)
+    grade_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"entries": 0, "closed_trades": 0, "net_pnl": 0.0}
+    )
+    ev_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    shadow_gate_counts: Dict[str, int] = defaultdict(int)
+    regime_disagreements: Dict[str, int] = defaultdict(int)
+    leader_hits: List[Dict[str, Any]] = []
+
+    for card in window_cards:
+        log_analysis = card.get("log_analysis", {})
+        math_shadow = log_analysis.get("math_shadow", {})
+        for grade, count in (math_shadow.get("entries_by_grade") or {}).items():
+            grade_rollup[grade]["entries"] += _safe_int(count)
+        for grade, metrics in (math_shadow.get("grade_pnl") or {}).items():
+            grade_rollup[grade]["closed_trades"] += _safe_int(metrics.get("closed_trades"))
+            grade_rollup[grade]["net_pnl"] += _safe_float(metrics.get("net_pnl"))
+        for bucket, metrics in (math_shadow.get("ev_buckets") or {}).items():
+            ev_rollup[bucket]["closed_trades"] += _safe_int(metrics.get("closed_trades"))
+            ev_rollup[bucket]["net_pnl"] += _safe_float(metrics.get("net_pnl"))
+        for key, value in (math_shadow.get("shadow_gate_counts") or {}).items():
+            shadow_gate_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("regime_shadow_disagreements") or {}).items():
+            regime_disagreements[key] += _safe_int(value)
+        for record in (log_analysis.get("trade_records") or []):
+            if _safe_float(record.get("leader_pct")) >= 0.95:
+                leader_hits.append(
+                    {
+                        "date": card.get("date"),
+                        "symbol": record.get("symbol"),
+                        "strategy_name": record.get("strategy_name"),
+                        "entry_grade_math": record.get("entry_grade_math"),
+                        "leader_pct": round(_safe_float(record.get("leader_pct")), 4),
+                        "entry_ev": round(_safe_float(record.get("entry_ev")), 2),
+                        "net_pnl": _safe_int(record.get("net_pnl")),
+                    }
+                )
+
+    grade_summary = {
+        grade: {
+            "entries": int(metrics["entries"]),
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for grade, metrics in sorted(grade_rollup.items())
+    }
+    ev_summary = {
+        bucket: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for bucket, metrics in sorted(ev_rollup.items())
+    }
+    promotion_ready = any(
+        metrics["closed_trades"] >= min_closed_trades and metrics["expectancy"] > 0
+        for metrics in grade_summary.values()
+    ) or any(
+        metrics["closed_trades"] >= min_closed_trades and metrics["expectancy"] > 0
+        for metrics in ev_summary.values()
+    )
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "window_days": window_days,
+        "min_closed_trades": min_closed_trades,
+        "grades": grade_summary,
+        "ev_buckets": ev_summary,
+        "shadow_gate_counts": dict(sorted(shadow_gate_counts.items())),
+        "regime_shadow_disagreements": dict(sorted(regime_disagreements.items())),
+        "top_leader_trades": sorted(
+            leader_hits,
+            key=lambda item: (item.get("leader_pct", 0.0), item.get("net_pnl", 0)),
+            reverse=True,
+        )[:10],
+        "shadow_ready_for_promotion": promotion_ready,
+    }
+
+
+def render_math_shadow_markdown(payload: Dict[str, Any]) -> str:
+    lines = [
+        "# Math Shadow Report",
+        "",
+        f"- 생성 시각: {payload.get('generated_at', '')}",
+        f"- 최근 창: {_safe_int(payload.get('window_days'))}거래일",
+        f"- 최소 청산 체결: {_safe_int(payload.get('min_closed_trades'))}건",
+        f"- 승격 후보 여부: {'예' if payload.get('shadow_ready_for_promotion') else '아니오'}",
+        "",
+        "## Leader Grade",
+    ]
+    grades = payload.get("grades", {})
+    if grades:
+        for grade, metrics in grades.items():
+            lines.append(
+                f"- {grade}: 진입 {_safe_int(metrics.get('entries'))}건 / 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## EV Buckets"])
+    ev_buckets = payload.get("ev_buckets", {})
+    if ev_buckets:
+        for bucket, metrics in ev_buckets.items():
+            lines.append(
+                f"- {bucket}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Shadow Gates"])
+    shadow_gates = payload.get("shadow_gate_counts", {})
+    if shadow_gates:
+        for key, value in shadow_gates.items():
+            lines.append(f"- {key}: {_safe_int(value)}건")
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Regime Disagreements"])
+    disagreements = payload.get("regime_shadow_disagreements", {})
+    if disagreements:
+        for key, value in disagreements.items():
+            lines.append(f"- {key}: {_safe_int(value)}건")
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Top Leader Trades"])
+    top_trades = payload.get("top_leader_trades", {})
+    if top_trades:
+        for item in top_trades:
+            lines.append(
+                f"- {item.get('date')} {item.get('symbol')} "
+                f"{item.get('strategy_name')} grade={item.get('entry_grade_math')} "
+                f"leader_pct={_safe_float(item.get('leader_pct')):.4f} "
+                f"entry_ev={_safe_float(item.get('entry_ev')):,.2f} "
+                f"net={_format_currency(item.get('net_pnl'))}"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def write_daily_scorecard(scorecard: Dict[str, Any], report_root: Path = DEFAULT_REPORT_ROOT) -> Dict[str, Path]:
     paths = _scorecard_paths(report_root, scorecard["date"])
     for path in paths.values():
@@ -747,6 +1011,23 @@ def write_strategy_gates_report(payload: Dict[str, Any], report_root: Path = DEF
     )
     paths["md"].write_text(
         render_strategy_gates_markdown(payload),
+        encoding="utf-8",
+    )
+    return paths
+
+
+def write_math_shadow_report(payload: Dict[str, Any], report_root: Path = DEFAULT_REPORT_ROOT) -> Dict[str, Path]:
+    report_root.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "json": report_root / MATH_SHADOW_REPORT_JSON,
+        "md": report_root / MATH_SHADOW_REPORT_MD,
+    }
+    paths["json"].write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    paths["md"].write_text(
+        render_math_shadow_markdown(payload),
         encoding="utf-8",
     )
     return paths
@@ -1166,11 +1447,24 @@ def update_performance_reports(
         ),
     )
     strategy_gate_paths = write_strategy_gates_report(strategy_gates, report_root=report_root)
+    math_shadow = evaluate_math_shadow_report(
+        merged_scorecards,
+        window_days=_safe_int(
+            getattr(strategy_cfg, "ev_window_days", DEFAULT_STRATEGY_GATE_WINDOW_DAYS),
+            DEFAULT_STRATEGY_GATE_WINDOW_DAYS,
+        ),
+        min_closed_trades=_safe_int(
+            getattr(strategy_cfg, "ev_min_samples", DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES),
+            DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES,
+        ),
+    )
+    math_shadow_paths = write_math_shadow_report(math_shadow, report_root=report_root)
     readiness = evaluate_real_trading_readiness(merged_scorecards)
     readiness_paths = write_readiness_report(readiness, report_root=report_root)
     return {
         "scorecard": scorecard_paths,
         "strategy_gates": strategy_gate_paths,
+        "math_shadow": math_shadow_paths,
         "readiness": readiness_paths,
     }
 

@@ -197,6 +197,12 @@ def main(argv: list[str] | None = None):
         soft_bear_strong_leader_min_trade_amount=1_500_000_000,
         strategy_gate_window_days=5,
         strategy_gate_min_closed_trades=4,
+        enable_math_shadow_layer=True,
+        enable_math_live_layer=True,
+        quote_tape_enabled=False,
+        quote_tape_root=os.path.join(PROJECT_ROOT, "data", "intraday_tape"),
+        ev_window_days=5,
+        ev_min_samples=4,
         enable_backtest_score_entry_fallback=True,
         static_watchlist=list(data.keys()),
         # 인버스 ETF 활성화

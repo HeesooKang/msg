@@ -264,6 +264,12 @@ def get_strategy():
         strategy_gate_window_days=5,
         strategy_gate_min_closed_trades=4,
         strategy_gate_path=os.path.join(PROJECT_ROOT, "reports", "strategy-gates.json"),
+        enable_math_shadow_layer=True,
+        enable_math_live_layer=True,
+        quote_tape_enabled=True,
+        quote_tape_root=os.path.join(PROJECT_ROOT, "data", "intraday_tape"),
+        ev_window_days=5,
+        ev_min_samples=4,
         bear_market_mode='A',             # 점수 2는 제한적 대응, 점수 3부터는 예외 통과형
         min_bear_score_for_new_long=2,
         bear_market_entry_score=4.0,      # 강한 약세장 예외 진입은 더 강한 모멘텀만 허용

@@ -17,10 +17,21 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from statistics import median
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from src.analytics.math_signals import (
+    ExpectedValueEstimate,
+    LeaderSignal,
+    RegimeProbabilities,
+    build_entry_ev_table,
+    build_leader_signals,
+    compute_regime_probabilities,
+    estimate_entry_ev,
+    load_recent_scorecards,
+)
+from src.analytics.quote_tape import QuoteTapeRecorder
 from src.market_data import MarketDataAPI
 from src.models import Order, OrderResult, OrderSide, OrderType, Position, Quote
 from src.notifications import AlertManager
@@ -281,6 +292,23 @@ class MomentumScalpConfig:
     strategy_gate_window_days: int = 5
     strategy_gate_min_closed_trades: int = 4
     strategy_gate_path: str = "reports/strategy-gates.json"
+    enable_math_shadow_layer: bool = True
+    quote_tape_enabled: bool = True
+    quote_tape_root: str = "data/intraday_tape"
+    quote_tape_flush_seconds: int = 0
+    ev_window_days: int = 5
+    ev_min_samples: int = 4
+    enable_math_live_layer: bool = True
+    math_live_pool_top_n: int = 3
+    math_live_pool_percentile_floor: float = 0.75
+    math_live_bull_leader_percentile: float = 0.80
+    math_live_neutral_leader_percentile: float = 0.72
+    math_live_bull_prob_threshold: float = 0.55
+    math_live_soft_bear_bull_prob_threshold: float = 0.42
+    math_live_regime_margin: float = 0.08
+    math_live_negative_ev_gate: bool = True
+    math_live_ev_min_trades: int = 4
+    math_live_negative_ev_threshold: float = 0.0
     enable_backtest_score_entry_fallback: bool = False
     stage1_loss_threshold: int = -3_000
     profit_protect_threshold: int = 8_000
@@ -369,6 +397,15 @@ class PositionState:
     bear_score: int = 0
     planned_risk_stage: str = ""
     entry_grade: str = ""
+    leader_score: float = 0.0
+    leader_percentile: float = 0.0
+    entry_grade_math: str = ""
+    entry_ev: float = 0.0
+    entry_ev_confidence: str = ""
+    bull_prob: float = 0.0
+    neutral_prob: float = 0.0
+    soft_bear_prob: float = 0.0
+    bear_prob: float = 0.0
     partial_exit_done: bool = False
 
     def __post_init__(self):
@@ -513,6 +550,18 @@ class MomentumScalpStrategy(BaseStrategy):
         self._latest_direct_dynamic_symbols: set[str] = set()
         self._latest_strong_leader_symbols: set[str] = set()
         self._latest_strong_leader_snapshot: Dict[str, dict] = {}
+        self._latest_math_leader_signals: Dict[str, LeaderSignal] = {}
+        self._latest_regime_probabilities = RegimeProbabilities(
+            bull_prob=0.25,
+            neutral_prob=0.25,
+            soft_bear_prob=0.25,
+            bear_prob=0.25,
+        )
+        self._entry_ev_table: Dict[Tuple[str, str, str, str], ExpectedValueEstimate] = {}
+        self._quote_tape = QuoteTapeRecorder(
+            self.cfg.quote_tape_root,
+            enabled=bool(self.cfg.quote_tape_enabled and self.market_data is not None),
+        )
         self._regime_router = RegimeStrategyRouter()
         self._strategy_gate_state: Dict[str, dict] = {}
 
@@ -533,6 +582,249 @@ class MomentumScalpStrategy(BaseStrategy):
 
     def _get_recent_quotes(self, symbol: str) -> List[Quote]:
         return list(self._recent_quotes.get(symbol, ()))
+
+    def _math_report_root(self) -> Path:
+        gate_path_raw = str(getattr(self.cfg, "strategy_gate_path", "") or "").strip()
+        if gate_path_raw:
+            return Path(gate_path_raw).parent
+        return Path("reports")
+
+    def _load_math_shadow_inputs(self) -> None:
+        if not self.cfg.enable_math_shadow_layer:
+            self._entry_ev_table = {}
+            return
+        try:
+            scorecards = load_recent_scorecards(
+                self._math_report_root(),
+                window_days=max(1, int(self.cfg.ev_window_days)),
+            )
+            self._entry_ev_table = build_entry_ev_table(
+                scorecards,
+                window_days=max(1, int(self.cfg.ev_window_days)),
+                min_samples=max(1, int(self.cfg.ev_min_samples)),
+            )
+        except Exception as exc:
+            logger.warning("math shadow 입력 로드 실패(무시): %s", exc)
+            self._entry_ev_table = {}
+
+    def _refresh_math_leader_signals(self, quotes: Optional[List[Quote]] = None) -> None:
+        if not self.cfg.enable_math_shadow_layer:
+            self._latest_math_leader_signals = {}
+            return
+        source_quotes = [
+            q for q in (quotes or self._active_pool_quotes(include_inverse=False))
+            if q.symbol not in self._inverse_symbols and q.current_price > 0
+        ]
+        if not source_quotes:
+            self._latest_math_leader_signals = {}
+            return
+        self._latest_math_leader_signals = build_leader_signals(
+            source_quotes,
+            avg_volumes=self._avg_volumes,
+            recent_quotes_by_symbol=self._recent_quotes,
+        )
+
+    def _leader_signal_for_quote(self, quote: Quote) -> LeaderSignal:
+        signal = self._latest_math_leader_signals.get(quote.symbol)
+        if signal is not None:
+            return signal
+        signals = build_leader_signals(
+            [quote],
+            avg_volumes=self._avg_volumes,
+            recent_quotes_by_symbol={quote.symbol: self._get_recent_quotes(quote.symbol)},
+        )
+        return signals.get(
+            quote.symbol,
+            LeaderSignal(
+                symbol=quote.symbol,
+                leader_score=0.0,
+                leader_percentile=0.0,
+                entry_grade="C",
+                change_rate=float(quote.change_rate or 0.0),
+                trade_amount=self._quote_trade_amount(quote),
+                vs_open_pct=self._pct_move(quote.open_price, quote.current_price),
+                high_proximity=0.0,
+                volume_vs_avg=1.0,
+                reclaim_speed_ticks=99,
+            ),
+        )
+
+    def _entry_ev_for_context(
+        self,
+        *,
+        strategy_name: str,
+        regime_label: str,
+        entry_grade_math: str,
+    ) -> ExpectedValueEstimate:
+        return estimate_entry_ev(
+            self._entry_ev_table,
+            strategy_name=strategy_name or "unknown_strategy",
+            regime_label=regime_label or "unknown",
+            hour_bucket=self._now().strftime("%H"),
+            entry_grade=entry_grade_math or "unknown",
+        )
+
+    def _math_live_layer_enabled(self) -> bool:
+        return bool(self.cfg.enable_math_shadow_layer and self.cfg.enable_math_live_layer)
+
+    def _math_top_leader_symbols(self, limit: Optional[int] = None) -> set[str]:
+        if not self._math_live_layer_enabled() or not self._latest_math_leader_signals:
+            return set()
+        percentile_floor = float(self.cfg.math_live_pool_percentile_floor)
+        ranked = sorted(
+            self._latest_math_leader_signals.values(),
+            key=lambda signal: (
+                signal.leader_score,
+                signal.leader_percentile,
+                signal.trade_amount,
+                signal.symbol,
+            ),
+            reverse=True,
+        )
+        selected = [
+            signal.symbol
+            for signal in ranked
+            if signal.leader_percentile >= percentile_floor
+        ]
+        top_n = max(0, int(limit if limit is not None else self.cfg.math_live_pool_top_n))
+        if top_n > 0:
+            selected = selected[:top_n]
+        return set(selected)
+
+    def _build_math_shadow_metadata(
+        self,
+        quote: Quote,
+        *,
+        strategy_name: str,
+        regime_label: str,
+        reject_reason: str = "",
+    ) -> dict:
+        if not self.cfg.enable_math_shadow_layer:
+            return {}
+        leader_signal = self._leader_signal_for_quote(quote)
+        ev_estimate = self._entry_ev_for_context(
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+            entry_grade_math=leader_signal.entry_grade,
+        )
+        math_shadow_gate = ""
+        math_shadow_reason = ""
+        if ev_estimate.closed_trades >= max(1, int(self.cfg.ev_min_samples)) and ev_estimate.entry_ev < 0:
+            math_shadow_gate = "ev_negative"
+            math_shadow_reason = "negative_entry_ev"
+        elif reject_reason and leader_signal.leader_percentile >= 0.95:
+            math_shadow_gate = "top_leader_rejected"
+            math_shadow_reason = reject_reason
+        return {
+            "leader_score": round(leader_signal.leader_score, 6),
+            "leader_percentile": round(leader_signal.leader_percentile, 6),
+            "entry_grade_math": leader_signal.entry_grade,
+            "entry_ev": round(ev_estimate.entry_ev, 2),
+            "entry_ev_confidence": ev_estimate.confidence,
+            "entry_ev_closed_trades": int(ev_estimate.closed_trades),
+            "bull_prob": round(self._latest_regime_probabilities.bull_prob, 6),
+            "neutral_prob": round(self._latest_regime_probabilities.neutral_prob, 6),
+            "soft_bear_prob": round(self._latest_regime_probabilities.soft_bear_prob, 6),
+            "bear_prob": round(self._latest_regime_probabilities.bear_prob, 6),
+            "math_shadow_gate": math_shadow_gate,
+            "math_shadow_reason": math_shadow_reason,
+        }
+
+    def _passes_math_live_entry_gate(
+        self,
+        quote: Quote,
+        *,
+        strategy_name: str,
+        entry_meta: dict,
+        is_inverse: bool,
+    ) -> tuple[bool, str]:
+        if not self._math_live_layer_enabled():
+            return True, ""
+
+        leader_percentile = float(entry_meta.get("leader_percentile", 0.0) or 0.0)
+        entry_ev = float(entry_meta.get("entry_ev", 0.0) or 0.0)
+        entry_ev_trades = int(entry_meta.get("entry_ev_closed_trades", 0) or 0)
+        bull_prob = float(entry_meta.get("bull_prob", 0.0) or 0.0)
+        neutral_prob = float(entry_meta.get("neutral_prob", 0.0) or 0.0)
+        soft_bear_prob = float(entry_meta.get("soft_bear_prob", 0.0) or 0.0)
+        bear_prob = float(entry_meta.get("bear_prob", 0.0) or 0.0)
+
+        if not is_inverse:
+            if strategy_name == "bull_breakout_strategy":
+                if leader_percentile < float(self.cfg.math_live_bull_leader_percentile):
+                    return False, "math_bull_leader_floor"
+                if bull_prob + float(self.cfg.math_live_regime_margin) < max(neutral_prob, soft_bear_prob, bear_prob):
+                    return False, "math_bull_regime_mismatch"
+            elif strategy_name == "neutral_pullback_strategy":
+                if leader_percentile < float(self.cfg.math_live_neutral_leader_percentile):
+                    return False, "math_neutral_leader_floor"
+                if neutral_prob + float(self.cfg.math_live_regime_margin) < max(bull_prob, soft_bear_prob, bear_prob):
+                    return False, "math_neutral_regime_mismatch"
+        else:
+            if soft_bear_prob + bear_prob < 0.50:
+                return False, "math_inverse_regime_mismatch"
+
+        if (
+            self.cfg.math_live_negative_ev_gate
+            and entry_ev_trades >= max(1, int(self.cfg.math_live_ev_min_trades))
+            and entry_ev < float(self.cfg.math_live_negative_ev_threshold)
+        ):
+            return False, "math_negative_ev"
+
+        return True, ""
+
+    def _append_math_shadow_context(self, payload: str, metadata: dict) -> str:
+        base = str(payload or "").strip()
+        if not metadata:
+            return base
+        extras = []
+        if "leader_score" in metadata:
+            extras.append(f"leader_score={float(metadata.get('leader_score', 0.0)):.4f}")
+        if "leader_percentile" in metadata:
+            extras.append(f"leader_pct={float(metadata.get('leader_percentile', 0.0)):.4f}")
+        if metadata.get("entry_grade_math"):
+            extras.append(f"entry_grade_math={metadata.get('entry_grade_math')}")
+        if "bull_prob" in metadata:
+            extras.append(f"bull_prob={float(metadata.get('bull_prob', 0.0)):.4f}")
+            extras.append(f"neutral_prob={float(metadata.get('neutral_prob', 0.0)):.4f}")
+            extras.append(f"soft_bear_prob={float(metadata.get('soft_bear_prob', 0.0)):.4f}")
+            extras.append(f"bear_prob={float(metadata.get('bear_prob', 0.0)):.4f}")
+        if "entry_ev" in metadata:
+            extras.append(f"entry_ev={float(metadata.get('entry_ev', 0.0)):.2f}")
+        if metadata.get("entry_ev_confidence"):
+            extras.append(f"entry_ev_conf={metadata.get('entry_ev_confidence')}")
+        if "entry_ev_closed_trades" in metadata:
+            extras.append(f"entry_ev_trades={int(metadata.get('entry_ev_closed_trades', 0))}")
+        if metadata.get("math_shadow_gate"):
+            extras.append(f"math_shadow_gate={metadata.get('math_shadow_gate')}")
+        if metadata.get("math_shadow_reason"):
+            extras.append(f"math_shadow_reason={metadata.get('math_shadow_reason')}")
+        extra = " ".join(extras).strip()
+        if not extra:
+            return base
+        return f"{base} {extra}".strip()
+
+    def _record_quote_tape(self, quotes: List[Quote], *, market_data_ready: bool) -> None:
+        if not self.cfg.enable_math_shadow_layer or not self.cfg.quote_tape_enabled:
+            return
+        try:
+            self._quote_tape.record_quotes(
+                self._now(),
+                quotes,
+                regime_label=self._resolve_regime_profile_name(),
+                bear_score=int(self._bear_score),
+                market_data_ready=market_data_ready,
+            )
+        except Exception as exc:
+            logger.warning("quote tape 기록 실패(무시): %s", exc)
+
+    def _record_leader_tape(self, event: str, rows: List[dict]) -> None:
+        if not self.cfg.enable_math_shadow_layer or not self.cfg.quote_tape_enabled or not rows:
+            return
+        try:
+            self._quote_tape.record_leaders(self._now(), event=event, rows=rows)
+        except Exception as exc:
+            logger.warning("leader tape 기록 실패(무시): %s", exc)
 
     def _current_total_net_pnl(self) -> int:
         realized_net = self._effective_realized_net_for_breaker()
@@ -655,13 +947,32 @@ class MomentumScalpStrategy(BaseStrategy):
             return self._trigger_daily_profit_target(total_net, liquidate=liquidate)
         return None
 
-    def _log_setup_reject(self, quote: Quote, reject_reason: str, message: str, *args):
+    def _log_setup_reject(
+        self,
+        quote: Quote,
+        reject_reason: str,
+        message: str,
+        *args,
+        strategy_name: str = "",
+    ):
         if not self.cfg.enable_setup_logging:
             return
+        is_inverse = quote.symbol in self._inverse_symbols
+        resolved_strategy_name = strategy_name or self._current_profile_entry_strategy_name(is_inverse=is_inverse)
+        math_meta = self._build_math_shadow_metadata(
+            quote,
+            strategy_name=resolved_strategy_name or "unknown_strategy",
+            regime_label=self._resolve_regime_profile_name(),
+            reject_reason=reject_reason,
+        )
+        formatted = self._append_math_shadow_context(
+            f"진입 거부[{reject_reason}] reject_reason={reject_reason}: " + message,
+            math_meta,
+        )
         self._log_entry_filter_once_per_minute(
             quote.symbol,
             reject_reason,
-            f"진입 거부[{reject_reason}] reject_reason={reject_reason}: " + message,
+            formatted,
             *args,
         )
 
@@ -825,9 +1136,10 @@ class MomentumScalpStrategy(BaseStrategy):
         setup_name: str,
         payload: str,
         strategy_name: str = "",
+        quote: Optional[Quote] = None,
     ) -> dict:
         current_stage = self._current_risk_stage()
-        return {
+        metadata = {
             "strategy_name": strategy_name or self._extract_context_token(payload, "strategy_name", "unknown"),
             "setup_name": setup_name or self._extract_context_token(payload, "setup_name", "unknown"),
             "entry_reason": self._extract_context_token(payload, "entry_reason", setup_name or "unknown"),
@@ -838,6 +1150,15 @@ class MomentumScalpStrategy(BaseStrategy):
             "entry_grade": self._extract_context_token(payload, "entry_grade", ""),
             "turnover_rank": self._extract_context_int(payload, "turnover_rank", 0),
         }
+        if quote is not None:
+            metadata.update(
+                self._build_math_shadow_metadata(
+                    quote,
+                    strategy_name=metadata["strategy_name"],
+                    regime_label=metadata["regime_label"],
+                )
+            )
+        return metadata
 
     def _append_entry_context(self, payload: str, metadata: dict) -> str:
         base = str(payload or "").strip()
@@ -851,7 +1172,7 @@ class MomentumScalpStrategy(BaseStrategy):
             extra += f" entry_grade={metadata.get('entry_grade', '')}"
         if metadata.get("turnover_rank"):
             extra += f" turnover_rank={int(metadata.get('turnover_rank', 0))}"
-        return f"{base} {extra}".strip()
+        return self._append_math_shadow_context(f"{base} {extra}".strip(), metadata)
 
     def _current_profile_entry_strategy_name(self, is_inverse: bool) -> str:
         profile_name = self._resolve_regime_profile_name()
@@ -1176,7 +1497,13 @@ class MomentumScalpStrategy(BaseStrategy):
         turnover_rank_limit = max_turnover_rank
         if turnover_rank_limit is None:
             turnover_rank_limit = int(self.cfg.neutral_leader_top_n)
-        if turnover_rank > max(1, int(turnover_rank_limit)):
+        leader_signal = self._leader_signal_for_quote(quote)
+        math_override = (
+            self._math_live_layer_enabled()
+            and leader_signal.leader_percentile >= float(self.cfg.math_live_neutral_leader_percentile)
+            and self._quote_trade_amount(quote) >= int(self.cfg.strong_leader_min_trade_amount)
+        )
+        if turnover_rank > max(1, int(turnover_rank_limit)) and not math_override:
             return False, "neutral_low_turnover_rank"
 
         if len(active_quotes) > 1:
@@ -1186,13 +1513,13 @@ class MomentumScalpStrategy(BaseStrategy):
                 + float(self.cfg.neutral_leader_relative_strength_pp)
                 + float(relative_strength_bonus_pp)
             )
-            if quote.change_rate < min_strength:
+            if quote.change_rate < min_strength and not math_override:
                 return False, "neutral_weak_relative_strength"
 
         reclaim_tick_limit = max_reclaim_ticks
         if reclaim_tick_limit is None:
             reclaim_tick_limit = int(self.cfg.neutral_leader_max_reclaim_ticks)
-        if reclaim_speed_ticks > max(1, int(reclaim_tick_limit)):
+        if reclaim_speed_ticks > max(1, int(reclaim_tick_limit)) and not math_override:
             return False, "neutral_slow_reclaim"
 
         return True, ""
@@ -1220,17 +1547,24 @@ class MomentumScalpStrategy(BaseStrategy):
             (idx for idx, (symbol, _) in enumerate(ranked_turnover, start=1) if symbol == quote.symbol),
             len(ranked_turnover) + 1,
         )
-        if turnover_rank > max(1, int(self.cfg.bull_leader_top_n)):
+        leader_signal = self._leader_signal_for_quote(quote)
+        math_override = (
+            self._math_live_layer_enabled()
+            and leader_signal.leader_percentile >= float(self.cfg.math_live_bull_leader_percentile)
+            and self._quote_trade_amount(quote) >= int(self.cfg.strong_leader_min_trade_amount)
+        )
+        if turnover_rank > max(1, int(self.cfg.bull_leader_top_n)) and not math_override:
             return False, "bull_low_turnover_rank", ""
 
         median_change_rate = float(median(item.change_rate for item in active_quotes))
         min_strength = median_change_rate + float(self.cfg.bull_leader_relative_strength_pp)
-        if quote.change_rate < min_strength:
+        if quote.change_rate < min_strength and not math_override:
             return False, "bull_weak_relative_strength", ""
 
         payload = (
             f"entry_grade=A turnover_rank={turnover_rank} "
-            f"relative_strength_floor={min_strength:.2f}"
+            f"relative_strength_floor={min_strength:.2f} "
+            f"math_leader_pct={leader_signal.leader_percentile:.4f}"
         )
         return True, "", payload
 
@@ -1497,6 +1831,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._daily_breaker_pnl_offset = 0
         self._load_daily_state()
         self._load_strategy_gates()
+        self._load_math_shadow_inputs()
         if self._halted and self._halt_date == today and self.cfg.allow_hard_stop_bypass_for_day:
             logger.warning(
                 "당일 하드스탑 플래그 복구 무시(임시 모드): 오늘 전일 누적손실이 있어도 재개합니다."
@@ -1534,6 +1869,13 @@ class MomentumScalpStrategy(BaseStrategy):
             self._latest_direct_dynamic_symbols = set()
             self._latest_strong_leader_symbols = set()
             self._latest_strong_leader_snapshot = {}
+            self._latest_math_leader_signals = {}
+            self._latest_regime_probabilities = RegimeProbabilities(
+                bull_prob=0.25,
+                neutral_prob=0.25,
+                soft_bear_prob=0.25,
+                bear_prob=0.25,
+            )
         elif self._state_loaded_for_today and not self.cfg.use_restored_pnl_for_daily_breaker:
             restored_pnl = int(self.daily_pnl.realized_net_pnl)
             if restored_pnl != 0 or self.daily_pnl.trade_count > 0:
@@ -1551,6 +1893,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._current_day = today
         self._session_start_at = None
         self._build_pool()
+        self._refresh_math_leader_signals()
         self._check_market_regime()
         regime_profile = self._build_regime_profile()
         self._log_regime_profiles()
@@ -1836,6 +2179,15 @@ class MomentumScalpStrategy(BaseStrategy):
                 "bear_score": pos.bear_score,
                 "planned_risk_stage": pos.planned_risk_stage,
                 "entry_grade": pos.entry_grade,
+                "leader_score": pos.leader_score,
+                "leader_percentile": pos.leader_percentile,
+                "entry_grade_math": pos.entry_grade_math,
+                "entry_ev": pos.entry_ev,
+                "entry_ev_confidence": pos.entry_ev_confidence,
+                "bull_prob": pos.bull_prob,
+                "neutral_prob": pos.neutral_prob,
+                "soft_bear_prob": pos.soft_bear_prob,
+                "bear_prob": pos.bear_prob,
                 "partial_exit_done": pos.partial_exit_done,
             }
         return payload
@@ -1921,11 +2273,13 @@ class MomentumScalpStrategy(BaseStrategy):
             self._update_tick_volume_state(q)
             self._refresh_entry_signal_if_stale(q.symbol, now)
 
+        self._refresh_math_leader_signals(quotes)
         self._clear_restored_positions_after_grace(now)
         self._cleanup_stale_entry_signals(now)
         self._check_market_regime(quotes=quotes)
         self._update_shadow_blocked_candidates(quotes, now=now)
         market_data_ready = self._update_market_data_readiness(quotes=quotes, now=now)
+        self._record_quote_tape(quotes, market_data_ready=market_data_ready)
         effective_max_position_count = self._effective_max_position_count()
 
         # 거래 중지 상태면 주문 없음
@@ -2169,15 +2523,29 @@ class MomentumScalpStrategy(BaseStrategy):
                     existing.bear_score = int(entry_meta.get("bear_score", 0) or 0)
                     existing.planned_risk_stage = str(entry_meta.get("planned_risk_stage", "") or "")
                     existing.entry_grade = str(entry_meta.get("entry_grade", "") or "")
+                    existing.leader_score = float(entry_meta.get("leader_score", 0.0) or 0.0)
+                    existing.leader_percentile = float(entry_meta.get("leader_percentile", 0.0) or 0.0)
+                    existing.entry_grade_math = str(entry_meta.get("entry_grade_math", "") or "")
+                    existing.entry_ev = float(entry_meta.get("entry_ev", 0.0) or 0.0)
+                    existing.entry_ev_confidence = str(entry_meta.get("entry_ev_confidence", "") or "")
+                    existing.bull_prob = float(entry_meta.get("bull_prob", 0.0) or 0.0)
+                    existing.neutral_prob = float(entry_meta.get("neutral_prob", 0.0) or 0.0)
+                    existing.soft_bear_prob = float(entry_meta.get("soft_bear_prob", 0.0) or 0.0)
+                    existing.bear_prob = float(entry_meta.get("bear_prob", 0.0) or 0.0)
                 tag = "[INV] " if result.symbol in self._inverse_symbols else ""
                 logger.info(
-                    "%s추가매수 체결: %s +%d주 @ %s원 (평단 %s원, 총 %d주)",
+                    "%s추가매수 체결: %s +%d주 @ %s원 (평단 %s원, 총 %d주, entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s)",
                     tag,
                     result.symbol,
                     result.quantity,
                     f"{fill_price:,}",
                     f"{existing.buy_price:,}",
                     existing.quantity,
+                    existing.entry_grade_math or "-",
+                    existing.leader_score,
+                    existing.leader_percentile,
+                    existing.entry_ev,
+                    existing.entry_ev_confidence or "-",
                 )
                 alert_key_suffix = self._now().strftime("%H%M%S%f")
                 self._alerts.send(
@@ -2216,11 +2584,22 @@ class MomentumScalpStrategy(BaseStrategy):
                 bear_score=int(entry_meta.get("bear_score", 0) or 0),
                 planned_risk_stage=str(entry_meta.get("planned_risk_stage", "") or ""),
                 entry_grade=str(entry_meta.get("entry_grade", "") or ""),
+                leader_score=float(entry_meta.get("leader_score", 0.0) or 0.0),
+                leader_percentile=float(entry_meta.get("leader_percentile", 0.0) or 0.0),
+                entry_grade_math=str(entry_meta.get("entry_grade_math", "") or ""),
+                entry_ev=float(entry_meta.get("entry_ev", 0.0) or 0.0),
+                entry_ev_confidence=str(entry_meta.get("entry_ev_confidence", "") or ""),
+                bull_prob=float(entry_meta.get("bull_prob", 0.0) or 0.0),
+                neutral_prob=float(entry_meta.get("neutral_prob", 0.0) or 0.0),
+                soft_bear_prob=float(entry_meta.get("soft_bear_prob", 0.0) or 0.0),
+                bear_prob=float(entry_meta.get("bear_prob", 0.0) or 0.0),
             )
             tag = "[INV] " if result.symbol in self._inverse_symbols else ""
             logger.info(
                 "%s매수 체결: %s %d주 @ %s원 "
-                "(strategy_name=%s, setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s, entry_grade=%s)",
+                "(strategy_name=%s, setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s, entry_grade=%s, "
+                "entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s, "
+                "bull_prob=%.4f, neutral_prob=%.4f, soft_bear_prob=%.4f, bear_prob=%.4f)",
                 tag,
                 result.symbol,
                 result.quantity,
@@ -2231,6 +2610,15 @@ class MomentumScalpStrategy(BaseStrategy):
                 self.positions[result.symbol].bear_score,
                 self.positions[result.symbol].planned_risk_stage or "-",
                 self.positions[result.symbol].entry_grade or "-",
+                self.positions[result.symbol].entry_grade_math or "-",
+                self.positions[result.symbol].leader_score,
+                self.positions[result.symbol].leader_percentile,
+                self.positions[result.symbol].entry_ev,
+                self.positions[result.symbol].entry_ev_confidence or "-",
+                self.positions[result.symbol].bull_prob,
+                self.positions[result.symbol].neutral_prob,
+                self.positions[result.symbol].soft_bear_prob,
+                self.positions[result.symbol].bear_prob,
             )
             alert_key_suffix = self._now().strftime("%H%M%S%f")
             self._alerts.send(
@@ -2336,7 +2724,8 @@ class MomentumScalpStrategy(BaseStrategy):
                     logger.info(
                         "%s부분매도 체결: %s %d주 @ %s원 "
                         "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, 잔여 %d주, "
-                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s)",
+                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s, "
+                        "entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s)",
                         tag,
                         result.symbol,
                         filled_qty,
@@ -2349,12 +2738,18 @@ class MomentumScalpStrategy(BaseStrategy):
                         pos.entry_setup_name or "-",
                         pos.regime_label or "-",
                         pos.entry_grade or "-",
+                        pos.entry_grade_math or "-",
+                        pos.leader_score,
+                        pos.leader_percentile,
+                        pos.entry_ev,
+                        pos.entry_ev_confidence or "-",
                     )
                 else:
                     logger.info(
                         "%s매도 체결: %s %d주 @ %s원 "
                         "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, "
-                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s)",
+                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s, "
+                        "entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s)",
                         tag,
                         result.symbol,
                         filled_qty,
@@ -2366,6 +2761,11 @@ class MomentumScalpStrategy(BaseStrategy):
                         pos.entry_setup_name or "-",
                         pos.regime_label or "-",
                         pos.entry_grade or "-",
+                        pos.entry_grade_math or "-",
+                        pos.leader_score,
+                        pos.leader_percentile,
+                        pos.entry_ev,
+                        pos.entry_ev_confidence or "-",
                     )
                 alert_key_suffix = self._now().strftime("%H%M%S%f")
                 self._alerts.send(
@@ -2462,6 +2862,21 @@ class MomentumScalpStrategy(BaseStrategy):
         score = self._bear_score if bear_score is None else bear_score
         if score <= 0:
             return "bull"
+        if self._math_live_layer_enabled():
+            bull_prob = float(self._latest_regime_probabilities.bull_prob)
+            neutral_prob = float(self._latest_regime_probabilities.neutral_prob)
+            soft_bear_prob = float(self._latest_regime_probabilities.soft_bear_prob)
+            bear_prob = float(self._latest_regime_probabilities.bear_prob)
+            margin = float(self.cfg.math_live_regime_margin)
+            if score == 1 and bull_prob >= float(self.cfg.math_live_bull_prob_threshold):
+                if bull_prob >= max(neutral_prob, soft_bear_prob, bear_prob) + margin:
+                    return "bull"
+            if score == 2:
+                if bull_prob >= float(self.cfg.math_live_soft_bear_bull_prob_threshold):
+                    if bull_prob >= max(soft_bear_prob, bear_prob) + margin:
+                        return "neutral"
+                if neutral_prob >= max(soft_bear_prob, bear_prob) + margin:
+                    return "neutral"
         if score == 1 and (self._strong_bull_override_active or self._index_support_bull_bias_active):
             return "bull"
         if score == 1:
@@ -2938,6 +3353,15 @@ class MomentumScalpStrategy(BaseStrategy):
                 bear_score=int(snapshot.get("bear_score", 0) or 0),
                 planned_risk_stage=str(snapshot.get("planned_risk_stage", "") or ""),
                 entry_grade=str(snapshot.get("entry_grade", "") or ""),
+                leader_score=float(snapshot.get("leader_score", 0.0) or 0.0),
+                leader_percentile=float(snapshot.get("leader_percentile", 0.0) or 0.0),
+                entry_grade_math=str(snapshot.get("entry_grade_math", "") or ""),
+                entry_ev=float(snapshot.get("entry_ev", 0.0) or 0.0),
+                entry_ev_confidence=str(snapshot.get("entry_ev_confidence", "") or ""),
+                bull_prob=float(snapshot.get("bull_prob", 0.0) or 0.0),
+                neutral_prob=float(snapshot.get("neutral_prob", 0.0) or 0.0),
+                soft_bear_prob=float(snapshot.get("soft_bear_prob", 0.0) or 0.0),
+                bear_prob=float(snapshot.get("bear_prob", 0.0) or 0.0),
                 partial_exit_done=bool(snapshot.get("partial_exit_done", False)),
             )
 
@@ -3060,6 +3484,41 @@ class MomentumScalpStrategy(BaseStrategy):
                         "rank": int(existing.get("rank", 999)),
                     }
                     direct_dynamic.add(quote.symbol)
+                math_direct_dynamic: set[str] = set()
+                if self._math_live_layer_enabled() and cache_leaders:
+                    cache_signals = build_leader_signals(
+                        cache_leaders,
+                        avg_volumes=self._avg_volumes,
+                        recent_quotes_by_symbol=self._recent_quotes,
+                    )
+                    ranked_math_leaders = sorted(
+                        cache_signals.values(),
+                        key=lambda signal: (
+                            signal.leader_score,
+                            signal.leader_percentile,
+                            signal.trade_amount,
+                            signal.symbol,
+                        ),
+                        reverse=True,
+                    )
+                    percentile_floor = float(self.cfg.math_live_pool_percentile_floor)
+                    for signal in ranked_math_leaders:
+                        if signal.leader_percentile < percentile_floor:
+                            continue
+                        math_direct_dynamic.add(signal.symbol)
+                        if len(math_direct_dynamic) >= max(0, int(self.cfg.math_live_pool_top_n)):
+                            break
+                    for symbol in math_direct_dynamic:
+                        appeared.add(symbol)
+                        direct_dynamic.add(symbol)
+                        quote = self._quotes_cache.get(symbol)
+                        if quote is not None:
+                            existing = strong_leader_snapshot.get(symbol, {})
+                            strong_leader_snapshot[symbol] = {
+                                "change_rate": max(float(existing.get("change_rate", 0.0)), float(quote.change_rate)),
+                                "trade_amount": max(int(existing.get("trade_amount", 0)), int(self._quote_trade_amount(quote))),
+                                "rank": int(existing.get("rank", 999)),
+                            }
                 logger.info(
                     "동적 풀 갱신: 등락률 %d개 + 거래대금 %d개 + 실시간 리더 %d개 (총 %d종목)",
                     len(by_rank),
@@ -3067,6 +3526,12 @@ class MomentumScalpStrategy(BaseStrategy):
                     len(cache_leaders),
                     len(pool),
                 )
+                if math_direct_dynamic:
+                    logger.info(
+                        "수학 상위 리더 즉시 편입: %d개 [%s]",
+                        len(math_direct_dynamic),
+                        self._format_symbol_sample(math_direct_dynamic),
+                    )
             except Exception as e:
                 logger.warning("등락률 순위 조회 실패, 정적 풀만 사용: %s", e)
 
@@ -3106,6 +3571,27 @@ class MomentumScalpStrategy(BaseStrategy):
             )
         self._pool = list(pool)[:55]  # 인버스 포함하여 여유 확보
         self._last_pool_refresh = self._now()
+        self._refresh_math_leader_signals()
+        leader_rows = []
+        for symbol in sorted(direct_dynamic | set(strong_leader_snapshot.keys())):
+            quote = self._quotes_cache.get(symbol)
+            signal = self._latest_math_leader_signals.get(symbol)
+            leader_rows.append(
+                {
+                    "symbol": symbol,
+                    "name": quote.name if quote else "",
+                    "change_rate": float(quote.change_rate if quote else strong_leader_snapshot.get(symbol, {}).get("change_rate", 0.0)),
+                    "trade_amount": int(
+                        self._quote_trade_amount(quote) if quote else strong_leader_snapshot.get(symbol, {}).get("trade_amount", 0)
+                    ),
+                    "leader_score": round(signal.leader_score, 6) if signal else 0.0,
+                    "leader_percentile": round(signal.leader_percentile, 6) if signal else 0.0,
+                    "entry_grade_math": signal.entry_grade if signal else "C",
+                    "direct_dynamic": symbol in direct_dynamic,
+                    "strong_leader_candidate": symbol in strong_leader_snapshot,
+                }
+            )
+        self._record_leader_tape("pool_refresh", leader_rows)
 
     def _record_pool_appearances(self, symbols: set[str]):
         if not self.cfg.enable_pool_persistence_gate:
@@ -3483,6 +3969,61 @@ class MomentumScalpStrategy(BaseStrategy):
             final_score = 1
 
         final_score = max(0, min(final_score, 3))
+        strong_leader_signals = [
+            signal
+            for signal in self._latest_math_leader_signals.values()
+            if signal.entry_grade == "A"
+        ]
+        strong_leader_count = len(strong_leader_signals)
+        strong_leader_avg_score = (
+            sum(signal.leader_score for signal in strong_leader_signals) / max(1, strong_leader_count)
+            if strong_leader_signals
+            else 0.0
+        )
+        index_gap_ma20_pct = (
+            ((index_info[0] - index_info[1]) / index_info[1]) * 100
+            if index_info is not None and index_info[1] > 0
+            else 0.0
+        )
+        index_gap_ma5_pct = (
+            ((index_info[0] - index_info[2]) / index_info[2]) * 100
+            if index_info is not None and index_info[2] > 0
+            else 0.0
+        )
+        self._latest_regime_probabilities = compute_regime_probabilities(
+            index_gap_ma20_pct=index_gap_ma20_pct,
+            index_gap_ma5_pct=index_gap_ma5_pct,
+            avg_change=quote_avg_change,
+            decliner_ratio=quote_decline_ratio,
+            strong_leader_count=strong_leader_count,
+            strong_leader_avg_score=strong_leader_avg_score,
+        )
+        discrete_regime = self._resolve_regime_profile_name(final_score)
+        shadow_regime = self._latest_regime_probabilities.dominant_profile()
+        if (
+            self.cfg.enable_math_shadow_layer
+            and shadow_regime != discrete_regime
+            and max(
+                self._latest_regime_probabilities.bull_prob,
+                self._latest_regime_probabilities.neutral_prob,
+                self._latest_regime_probabilities.soft_bear_prob,
+                self._latest_regime_probabilities.bear_prob,
+            ) >= 0.40
+        ):
+            logger.info(
+                "수학 레짐 그림자 불일치: math_regime_shadow_disagreement=1 "
+                "discrete_regime=%s shadow_regime=%s "
+                "bull_prob=%.4f neutral_prob=%.4f soft_bear_prob=%.4f bear_prob=%.4f "
+                "strong_leader_count=%d strong_leader_avg_score=%.4f",
+                discrete_regime,
+                shadow_regime,
+                self._latest_regime_probabilities.bull_prob,
+                self._latest_regime_probabilities.neutral_prob,
+                self._latest_regime_probabilities.soft_bear_prob,
+                self._latest_regime_probabilities.bear_prob,
+                strong_leader_count,
+                strong_leader_avg_score,
+            )
         self._bear_score = final_score
         self._bear_market = final_score >= 2
         self._leader_support_bull_bias_active = leader_support_bull_bias
@@ -4216,7 +4757,23 @@ class MomentumScalpStrategy(BaseStrategy):
                     setup_name,
                     fallback_payload,
                     strategy_name=strategy_name,
+                    quote=quote,
                 )
+                gate_ok, gate_reason = self._passes_math_live_entry_gate(
+                    quote,
+                    strategy_name=strategy_name,
+                    entry_meta=entry_meta,
+                    is_inverse=False,
+                )
+                if not gate_ok:
+                    self._log_setup_reject(
+                        quote,
+                        gate_reason,
+                        "%s (%s)",
+                        quote.symbol,
+                        gate_reason,
+                    )
+                    return None
                 entry_reason = self._append_entry_context(fallback_payload, entry_meta)
             else:
                 decision = self._regime_router.evaluate_long_entry(self, quote, score)
@@ -4238,7 +4795,24 @@ class MomentumScalpStrategy(BaseStrategy):
                     setup_name,
                     decision.payload,
                     strategy_name=strategy_name,
+                    quote=quote,
                 )
+                gate_ok, gate_reason = self._passes_math_live_entry_gate(
+                    quote,
+                    strategy_name=strategy_name,
+                    entry_meta=entry_meta,
+                    is_inverse=False,
+                )
+                if not gate_ok:
+                    self._entry_signals.pop(quote.symbol, None)
+                    self._log_setup_reject(
+                        quote,
+                        gate_reason,
+                        "%s (%s)",
+                        quote.symbol,
+                        gate_reason,
+                    )
+                    return None
                 if self._resolve_regime_profile_name() == "neutral" and self._is_neutral_post_loss_retry_available(now):
                     entry_meta["neutral_post_loss_retry"] = True
                 entry_reason = self._append_entry_context(decision.payload, entry_meta)
@@ -4329,6 +4903,30 @@ class MomentumScalpStrategy(BaseStrategy):
             entry_price=quote.current_price,
         ):
             return None
+
+        self._record_leader_tape(
+            "entry_eval",
+            [
+                {
+                    "symbol": quote.symbol,
+                    "name": quote.name,
+                    "strategy_name": strategy_name,
+                    "setup_name": setup_name,
+                    "score": round(score, 4),
+                    "entry_grade": entry_grade,
+                    "leader_score": float(entry_meta.get("leader_score", 0.0)),
+                    "leader_percentile": float(entry_meta.get("leader_percentile", 0.0)),
+                    "entry_grade_math": entry_meta.get("entry_grade_math", ""),
+                    "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
+                    "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
+                    "bull_prob": float(entry_meta.get("bull_prob", 0.0)),
+                    "neutral_prob": float(entry_meta.get("neutral_prob", 0.0)),
+                    "soft_bear_prob": float(entry_meta.get("soft_bear_prob", 0.0)),
+                    "bear_prob": float(entry_meta.get("bear_prob", 0.0)),
+                    "allowed": True,
+                }
+            ],
+        )
 
         if is_scale_in:
             logger.info(
@@ -4438,7 +5036,23 @@ class MomentumScalpStrategy(BaseStrategy):
             decision.setup_name,
             decision.payload,
             strategy_name=decision.strategy_name,
+            quote=quote,
         )
+        gate_ok, gate_reason = self._passes_math_live_entry_gate(
+            quote,
+            strategy_name=decision.strategy_name,
+            entry_meta=entry_meta,
+            is_inverse=True,
+        )
+        if not gate_ok:
+            self._log_setup_reject(
+                quote,
+                gate_reason,
+                "%s (%s)",
+                quote.symbol,
+                gate_reason,
+            )
+            return None
         entry_reason = self._append_entry_context(decision.payload, entry_meta)
 
         alloc = self._compute_buy_allocation(
@@ -4455,6 +5069,27 @@ class MomentumScalpStrategy(BaseStrategy):
             entry_price=quote.current_price,
         ):
             return None
+
+        self._record_leader_tape(
+            "entry_eval",
+            [
+                {
+                    "symbol": quote.symbol,
+                    "name": quote.name,
+                    "strategy_name": decision.strategy_name,
+                    "setup_name": decision.setup_name,
+                    "score": round(score, 4),
+                    "entry_grade_math": entry_meta.get("entry_grade_math", ""),
+                    "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
+                    "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
+                    "bull_prob": float(entry_meta.get("bull_prob", 0.0)),
+                    "neutral_prob": float(entry_meta.get("neutral_prob", 0.0)),
+                    "soft_bear_prob": float(entry_meta.get("soft_bear_prob", 0.0)),
+                    "bear_prob": float(entry_meta.get("bear_prob", 0.0)),
+                    "allowed": True,
+                }
+            ],
+        )
 
         self._pending_entry_meta[quote.symbol] = dict(entry_meta)
         logger.info(

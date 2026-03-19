@@ -166,6 +166,8 @@ class PerformanceReportingTests(unittest.TestCase):
             self.assertTrue(paths["scorecard"]["md"].exists())
             self.assertTrue(paths["strategy_gates"]["json"].exists())
             self.assertTrue(paths["strategy_gates"]["md"].exists())
+            self.assertTrue(paths["math_shadow"]["json"].exists())
+            self.assertTrue(paths["math_shadow"]["md"].exists())
             self.assertTrue(paths["readiness"]["json"].exists())
             self.assertTrue(paths["readiness"]["md"].exists())
 
