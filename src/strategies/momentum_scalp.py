@@ -117,6 +117,9 @@ class MomentumScalpConfig:
 
     # 재시작 복구: 보유 종목이 한도에 걸린 상태에서의 초기 재진입 억제를 위한 설정
     startup_full_position_recheck_ticks: int = 2
+    startup_market_data_ready_ticks: int = 2
+    startup_market_data_min_valid_quote_count: int = 8
+    startup_market_data_wait_log_interval_seconds: int = 60
 
     # 시장 레짐 필터 (KOSPI + 실시간 후보군 조합)
     bear_market_mode: str = 'A'          # 'A'=약세 필터 보완 적용, 'B'=완전 차단
@@ -142,9 +145,17 @@ class MomentumScalpConfig:
     dynamic_pool_ranking_fetch_count: int = 30
     dynamic_pool_turnover_slots: int = 6
     dynamic_pool_quote_trade_amount_slots: int = 4
+    dynamic_pool_direct_rank_slots: int = 4
     dynamic_pool_direct_turnover_slots: int = 3
     dynamic_pool_direct_quote_leader_slots: int = 2
     dynamic_pool_quote_min_change_rate: float = 0.8
+    opening_market_relief_minutes: int = 45
+    opening_dynamic_pool_min_change_rate: float = 0.2
+    opening_dynamic_pool_min_volume: int = 30_000
+    opening_dynamic_pool_direct_rank_slots: int = 5
+    opening_dynamic_pool_direct_turnover_slots: int = 5
+    opening_dynamic_pool_direct_quote_leader_slots: int = 4
+    dynamic_pool_log_symbol_count: int = 6
     pool_refresh_interval: int = 300     # 초
 
     # 필터
@@ -165,10 +176,24 @@ class MomentumScalpConfig:
     bullish_volume_spike_abs_min_ratio: float = 0.6
     bull_bias_avg_change_rate_threshold: float = 0.8
     bull_bias_max_decliner_ratio: float = 0.45
+    index_support_bull_bias_index_gap_pct: float = 1.0
+    index_support_bull_bias_avg_change_rate_threshold: float = 1.0
+    index_support_bull_bias_max_decliner_ratio: float = 0.55
+    index_support_bull_bias_min_quote_count: int = 8
     strong_bull_override_index_gap_pct: float = 1.5
     strong_bull_override_avg_change_rate_threshold: float = 2.0
     strong_bull_override_max_decliner_ratio: float = 0.25
     strong_bull_override_min_quote_count: int = 8
+    strong_leader_min_change_rate: float = 2.5
+    strong_leader_min_trade_amount: int = 1_000_000_000
+    strong_leader_top_rank: int = 6
+    leader_support_bull_bias_min_count: int = 1
+    leader_support_bull_bias_min_change_rate: float = 4.0
+    leader_support_bull_bias_min_trade_amount: int = 2_000_000_000
+    leader_support_bull_bias_max_decliner_ratio: float = 0.7
+    opening_leader_bull_bias_min_count: int = 2
+    opening_leader_bull_bias_change_rate: float = 2.5
+    opening_leader_bull_bias_min_trade_amount: int = 1_000_000_000
     bull_leader_top_n: int = 5
     bull_leader_relative_strength_pp: float = 0.4
     bull_partial_exit_ratio: float = 0.5
@@ -241,6 +266,11 @@ class MomentumScalpConfig:
     soft_bear_inverse_min_drop_pct: float = 0.15
     soft_bear_inverse_max_drop_pct: float = 0.8
     soft_bear_strategy_cooldown_minutes: int = 8
+    enable_soft_bear_strong_leader_longs: bool = True
+    soft_bear_strong_leader_max_positions: int = 1
+    soft_bear_strong_leader_min_change_rate: float = 3.2
+    soft_bear_strong_leader_min_momentum: float = 2.5
+    soft_bear_strong_leader_min_trade_amount: int = 1_500_000_000
     stage1_neutral_score_bonus: float = 0.55
     stage1_neutral_change_rate_bonus: float = 0.20
     stage1_neutral_min_drop_bonus_pct: float = 0.10
@@ -440,6 +470,10 @@ class MomentumScalpStrategy(BaseStrategy):
         self._bull_last_loss_at: Optional[datetime] = None
         self._startup_rebalance_ticks: int = 0
         self._startup_rebalance_active: bool = False
+        self._market_data_ready_for_entries: bool = market_data is None
+        self._market_data_ready_streak: int = 0
+        self._market_data_readiness_reason: str = ""
+        self._last_market_data_wait_log_at: Optional[datetime] = None
         self._bear_score: int = 0
         self._bear_market = False
         self._inverse_symbols: set = set(self.cfg.inverse_etfs)
@@ -451,6 +485,9 @@ class MomentumScalpStrategy(BaseStrategy):
         self._cached_index_regime_score: int = 0
         self._cached_index_regime_info: Optional[tuple[float, float, float]] = None
         self._cached_index_regime_error: Optional[Exception] = None
+        self._opening_leader_bull_bias_active: bool = False
+        self._leader_support_bull_bias_active: bool = False
+        self._index_support_bull_bias_active: bool = False
         self._strong_bull_override_active: bool = False
         self._regime_profile_name: str = "neutral"
         self._session_start_at: Optional[datetime] = None
@@ -473,6 +510,9 @@ class MomentumScalpStrategy(BaseStrategy):
         self._neutral_last_loss_at: Optional[datetime] = None
         self._neutral_post_loss_reentries_today: int = 0
         self._shadow_blocked_candidates: Dict[str, ShadowBlockedCandidate] = {}
+        self._latest_direct_dynamic_symbols: set[str] = set()
+        self._latest_strong_leader_symbols: set[str] = set()
+        self._latest_strong_leader_snapshot: Dict[str, dict] = {}
         self._regime_router = RegimeStrategyRouter()
         self._strategy_gate_state: Dict[str, dict] = {}
 
@@ -817,6 +857,8 @@ class MomentumScalpStrategy(BaseStrategy):
         profile_name = self._resolve_regime_profile_name()
         if not is_inverse and profile_name == "neutral" and self._is_bull_bias_market():
             return "bull_breakout_strategy"
+        if not is_inverse and profile_name == "soft_bear" and self._soft_bear_strong_leader_lane_active():
+            return "bull_breakout_strategy"
         strategy_name = self._regime_router.strategy_for_profile(profile_name).name
         if is_inverse:
             return strategy_name
@@ -1025,6 +1067,80 @@ class MomentumScalpStrategy(BaseStrategy):
             candidates.append(quote)
         return candidates
 
+    @staticmethod
+    def _ranking_trade_amount(item) -> int:
+        return max(0, int(item.current_price)) * max(0, int(item.volume))
+
+    @staticmethod
+    def _quote_trade_amount(quote: Quote) -> int:
+        raw = int(getattr(quote, "trade_amount", 0) or 0)
+        if raw > 0:
+            return raw
+        return max(0, int(quote.current_price)) * max(0, int(quote.volume))
+
+    def _format_symbol_sample(self, symbols) -> str:
+        sample = sorted(str(symbol) for symbol in symbols if symbol)
+        if not sample:
+            return "-"
+        limit = max(1, int(self.cfg.dynamic_pool_log_symbol_count))
+        clipped = sample[:limit]
+        if len(sample) > limit:
+            clipped.append("...")
+        return ", ".join(clipped)
+
+    def _is_dynamic_strong_leader_candidate(
+        self,
+        *,
+        symbol: str,
+        current_price: int,
+        change_rate: float,
+        trade_amount: int,
+        rank: Optional[int],
+    ) -> bool:
+        if not symbol or symbol in self._inverse_symbols:
+            return False
+        if current_price < self.cfg.min_price:
+            return False
+        if change_rate < float(self.cfg.strong_leader_min_change_rate):
+            return False
+        has_top_rank = rank is not None and int(rank) <= max(1, int(self.cfg.strong_leader_top_rank))
+        has_turnover = trade_amount >= int(self.cfg.strong_leader_min_trade_amount)
+        return has_top_rank or has_turnover
+
+    def _soft_bear_strong_leader_lane_active(self) -> bool:
+        return (
+            self.cfg.enable_soft_bear_strong_leader_longs
+            and self._resolve_regime_profile_name() == "soft_bear"
+            and bool(self._latest_strong_leader_symbols)
+        )
+
+    def _is_soft_bear_strong_leader_long_candidate(
+        self,
+        quote: Quote,
+        *,
+        score: Optional[float] = None,
+    ) -> bool:
+        if not self.cfg.enable_soft_bear_strong_leader_longs:
+            return False
+        if self._resolve_regime_profile_name() != "soft_bear":
+            return False
+        if quote.symbol in self._inverse_symbols:
+            return False
+        if quote.current_price <= 0 or quote.open_price <= 0:
+            return False
+        if quote.current_price <= quote.open_price:
+            return False
+        if quote.symbol not in self._latest_strong_leader_symbols:
+            return False
+        if quote.change_rate < float(self.cfg.soft_bear_strong_leader_min_change_rate):
+            return False
+        if self._quote_trade_amount(quote) < int(self.cfg.soft_bear_strong_leader_min_trade_amount):
+            return False
+        if score is not None and score < float(self.cfg.soft_bear_strong_leader_min_momentum):
+            return False
+        leader_ok, _, _ = self._passes_bull_leader_filter(quote)
+        return leader_ok
+
     def _passes_neutral_leader_filter(
         self,
         quote: Quote,
@@ -1119,15 +1235,21 @@ class MomentumScalpStrategy(BaseStrategy):
         return True, "", payload
 
     def _passes_bull_breakout_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
-        if not self._is_bullish_regime():
+        soft_bear_leader_lane = self._is_soft_bear_strong_leader_long_candidate(quote, score=score)
+        if not self._is_bullish_regime() and not soft_bear_leader_lane:
             return False, "", "bull_only"
         history = self._get_recent_quotes(quote.symbol)
         hold_ticks = max(2, int(self.cfg.bull_breakout_hold_ticks))
         if len(history) < hold_ticks + 1:
             return False, "", "bull_breakout_wait"
-        if quote.change_rate < self._regime_bullish_min_change_rate():
+        required_change_rate = self._regime_bullish_min_change_rate()
+        required_score = self._regime_bullish_min_momentum_score()
+        if soft_bear_leader_lane:
+            required_change_rate = float(self.cfg.soft_bear_strong_leader_min_change_rate)
+            required_score = float(self.cfg.soft_bear_strong_leader_min_momentum)
+        if quote.change_rate < required_change_rate:
             return False, "", "bull_change_rate"
-        if score < self._regime_bullish_min_momentum_score():
+        if score < required_score:
             return False, "", "bull_score"
         if not self._is_volume_spike(quote, score=score):
             return False, "", "bull_volume"
@@ -1175,7 +1297,8 @@ class MomentumScalpStrategy(BaseStrategy):
 
         reason = (
             f"setup_name=bull_breakout entry_reason=local_high_breakout "
-            f"prior_high={prior_high} hold_ticks={hold_ticks} {leader_payload}"
+            f"prior_high={prior_high} hold_ticks={hold_ticks} "
+            f"leader_lane={'soft_bear' if soft_bear_leader_lane else 'bull'} {leader_payload}"
         )
         return True, "bull_breakout", reason
 
@@ -1390,6 +1513,11 @@ class MomentumScalpStrategy(BaseStrategy):
             self._strategy_cooldown_until = {}
             self._startup_rebalance_active = False
             self._startup_rebalance_ticks = 0
+            self._market_data_ready_for_entries = self.market_data is None
+            self._market_data_ready_streak = 0
+            self._market_data_readiness_reason = ""
+            self._last_market_data_wait_log_at = None
+            self._leader_support_bull_bias_active = False
             self._last_cumulative_volumes = {}
             self._entry_filter_log_cache = {}
             self._daily_breaker_pnl_offset = 0
@@ -1403,6 +1531,9 @@ class MomentumScalpStrategy(BaseStrategy):
             self._bull_loss_count_today = 0
             self._bull_last_loss_at = None
             self._shadow_blocked_candidates = {}
+            self._latest_direct_dynamic_symbols = set()
+            self._latest_strong_leader_symbols = set()
+            self._latest_strong_leader_snapshot = {}
         elif self._state_loaded_for_today and not self.cfg.use_restored_pnl_for_daily_breaker:
             restored_pnl = int(self.daily_pnl.realized_net_pnl)
             if restored_pnl != 0 or self.daily_pnl.trade_count > 0:
@@ -1440,6 +1571,12 @@ class MomentumScalpStrategy(BaseStrategy):
                 logger.info("당일 하드스탑 우회 모드가 적용되어 거래를 계속 진행합니다.")
 
         logger.info("전략 초기화: 모멘텀 스캘핑")
+        if self.market_data is not None:
+            logger.info(
+                "  시작 워밍업: 시장 데이터 준비 후 신규 진입 허용 (%d틱 연속, 유효 시세 최소 %d개)",
+                max(1, int(self.cfg.startup_market_data_ready_ticks)),
+                max(1, int(self.cfg.startup_market_data_min_valid_quote_count)),
+            )
         logger.info("  시드: %s원, 기준자본: %s원, 기본 종목당: %s원",
                      f"{self.cfg.seed_money:,}", f"{capital_base:,}", f"{self.cfg.per_stock_amount:,}")
         logger.info("  최대 동시 보유 수: %d종목", self._effective_max_position_count())
@@ -1775,7 +1912,6 @@ class MomentumScalpStrategy(BaseStrategy):
 
     def on_batch_tick(self, quotes: List[Quote]) -> List[Order]:
         """배치 시세를 받아 전체적으로 판단한다."""
-        effective_max_position_count = self._effective_max_position_count()
         now = self._now()
         if self._session_start_at is None:
             self._session_start_at = now
@@ -1789,6 +1925,8 @@ class MomentumScalpStrategy(BaseStrategy):
         self._cleanup_stale_entry_signals(now)
         self._check_market_regime(quotes=quotes)
         self._update_shadow_blocked_candidates(quotes, now=now)
+        market_data_ready = self._update_market_data_readiness(quotes=quotes, now=now)
+        effective_max_position_count = self._effective_max_position_count()
 
         # 거래 중지 상태면 주문 없음
         if self._halted:
@@ -1864,6 +2002,9 @@ class MomentumScalpStrategy(BaseStrategy):
                 logger.info("재시작 복구 모드 종료: 보유 포지션의 보유시간 규칙 정상 적용")
             return orders
 
+        if not market_data_ready:
+            return orders
+
         # 2) 일반 매수 후보를 모멘텀 점수 기준으로 정렬 후 진입 시도
         ranked_candidates = self._rank_long_entry_candidates(quotes)
         for score, q in ranked_candidates:
@@ -1910,6 +2051,81 @@ class MomentumScalpStrategy(BaseStrategy):
                         orders.append(order)
 
         return orders
+
+    def _has_valid_index_regime_info(self) -> bool:
+        index_info = self._cached_index_regime_info
+        return bool(index_info) and all(float(value) > 0 for value in index_info)
+
+    def _update_market_data_readiness(self, quotes: List[Quote], now: datetime) -> bool:
+        if self.market_data is None:
+            self._market_data_ready_for_entries = True
+            self._market_data_ready_streak = 0
+            self._market_data_readiness_reason = ""
+            return True
+
+        regular_quotes = [q for q in quotes if q.symbol not in self._inverse_symbols]
+        valid_quotes = [
+            q for q in regular_quotes
+            if q.current_price > 0 and q.open_price > 0
+        ]
+        valid_index = self._has_valid_index_regime_info()
+        required_valid_quotes = min(
+            max(1, int(self.cfg.startup_market_data_min_valid_quote_count)),
+            max(1, len(regular_quotes)),
+        ) if regular_quotes else max(1, int(self.cfg.startup_market_data_min_valid_quote_count))
+        valid_quote_count = len(valid_quotes)
+        market_data_valid = (
+            valid_index
+            and bool(regular_quotes)
+            and valid_quote_count >= required_valid_quotes
+        )
+
+        if market_data_valid:
+            self._market_data_ready_streak += 1
+            required_ticks = max(1, int(self.cfg.startup_market_data_ready_ticks))
+            if not self._market_data_ready_for_entries and self._market_data_ready_streak >= required_ticks:
+                self._market_data_ready_for_entries = True
+                self._market_data_readiness_reason = ""
+                logger.info(
+                    "시장 데이터 준비 완료: 신규 진입 재개 (지수 유효, 유효 시세 %d/%d, 연속 %d틱)",
+                    valid_quote_count,
+                    len(regular_quotes),
+                    self._market_data_ready_streak,
+                )
+            return self._market_data_ready_for_entries
+
+        previous_ready = self._market_data_ready_for_entries
+        self._market_data_ready_for_entries = False
+        self._market_data_ready_streak = 0
+
+        reason_parts: List[str] = []
+        if not valid_index:
+            reason_parts.append("지수 일봉 미준비")
+        if not regular_quotes:
+            reason_parts.append("일반 종목 시세 없음")
+        elif valid_quote_count < required_valid_quotes:
+            reason_parts.append(
+                f"유효 시세 부족 {valid_quote_count}/{required_valid_quotes}"
+            )
+        self._market_data_readiness_reason = ", ".join(reason_parts) if reason_parts else "시장 데이터 미준비"
+
+        log_interval = max(1, int(self.cfg.startup_market_data_wait_log_interval_seconds))
+        should_log = previous_ready
+        if not should_log:
+            if self._last_market_data_wait_log_at is None:
+                should_log = True
+            else:
+                should_log = (now - self._last_market_data_wait_log_at).total_seconds() >= log_interval
+        if should_log:
+            logger.warning(
+                "시장 데이터 준비 대기: 신규 진입 보류 (%s, 유효 시세 %d/%d, 지수캐시=%s)",
+                self._market_data_readiness_reason,
+                valid_quote_count,
+                len(regular_quotes),
+                "OK" if valid_index else "NONE",
+            )
+            self._last_market_data_wait_log_at = now
+        return False
 
     def on_order_filled(self, result: OrderResult):
         if result.side == OrderSide.BUY:
@@ -2200,6 +2416,8 @@ class MomentumScalpStrategy(BaseStrategy):
         elif profile_name == "neutral":
             override = self.cfg.neutral_max_position_count
 
+        if profile_name == "soft_bear" and self._soft_bear_strong_leader_lane_active():
+            return max(0, int(self.cfg.soft_bear_strong_leader_max_positions))
         if override is None:
             return base_count
         return max(0, int(override))
@@ -2244,7 +2462,7 @@ class MomentumScalpStrategy(BaseStrategy):
         score = self._bear_score if bear_score is None else bear_score
         if score <= 0:
             return "bull"
-        if score == 1 and self._strong_bull_override_active:
+        if score == 1 and (self._strong_bull_override_active or self._index_support_bull_bias_active):
             return "bull"
         if score == 1:
             return "neutral"
@@ -2753,6 +2971,7 @@ class MomentumScalpStrategy(BaseStrategy):
         pool = set(self.cfg.static_watchlist)
         appeared: set[str] = set()
         direct_dynamic: set[str] = set()
+        strong_leader_snapshot: Dict[str, dict] = {}
 
         # 인버스 ETF 추가
         if self.cfg.inverse_enabled:
@@ -2772,7 +2991,7 @@ class MomentumScalpStrategy(BaseStrategy):
                 by_turnover = sorted(
                     rising,
                     key=lambda item: (
-                        max(0, int(item.current_price)) * max(0, int(item.volume)),
+                        self._ranking_trade_amount(item),
                         float(item.change_rate),
                         -int(item.rank or 0),
                     ),
@@ -2802,9 +3021,44 @@ class MomentumScalpStrategy(BaseStrategy):
                     appeared.add(item.symbol)
                 for quote in cache_leaders:
                     appeared.add(quote.symbol)
+                for item in by_rank[: max(0, int(self.cfg.dynamic_pool_direct_rank_slots))]:
+                    direct_dynamic.add(item.symbol)
                 for item in by_turnover[: max(0, int(self.cfg.dynamic_pool_direct_turnover_slots))]:
                     direct_dynamic.add(item.symbol)
                 for quote in cache_leaders[: max(0, int(self.cfg.dynamic_pool_direct_quote_leader_slots))]:
+                    direct_dynamic.add(quote.symbol)
+                for item in rising:
+                    trade_amount = self._ranking_trade_amount(item)
+                    if not self._is_dynamic_strong_leader_candidate(
+                        symbol=item.symbol,
+                        current_price=int(item.current_price),
+                        change_rate=float(item.change_rate),
+                        trade_amount=trade_amount,
+                        rank=int(item.rank or 0),
+                    ):
+                        continue
+                    strong_leader_snapshot[item.symbol] = {
+                        "change_rate": float(item.change_rate),
+                        "trade_amount": int(trade_amount),
+                        "rank": int(item.rank or 0),
+                    }
+                    direct_dynamic.add(item.symbol)
+                for quote in cache_leaders:
+                    trade_amount = self._quote_trade_amount(quote)
+                    if not self._is_dynamic_strong_leader_candidate(
+                        symbol=quote.symbol,
+                        current_price=int(quote.current_price),
+                        change_rate=float(quote.change_rate),
+                        trade_amount=trade_amount,
+                        rank=None,
+                    ):
+                        continue
+                    existing = strong_leader_snapshot.get(quote.symbol, {})
+                    strong_leader_snapshot[quote.symbol] = {
+                        "change_rate": max(float(existing.get("change_rate", 0.0)), float(quote.change_rate)),
+                        "trade_amount": max(int(existing.get("trade_amount", 0)), int(trade_amount)),
+                        "rank": int(existing.get("rank", 999)),
+                    }
                     direct_dynamic.add(quote.symbol)
                 logger.info(
                     "동적 풀 갱신: 등락률 %d개 + 거래대금 %d개 + 실시간 리더 %d개 (총 %d종목)",
@@ -2833,10 +3087,23 @@ class MomentumScalpStrategy(BaseStrategy):
                 logger.info("풀 지속성 반영: %d개 동적 후보 중 %d개 채택",
                             len(appeared), len(persistent))
             if direct_dynamic:
-                logger.info("강한 리더 즉시 편입: %d개", len(direct_dynamic))
+                logger.info(
+                    "강한 리더 즉시 편입: %d개 [%s]",
+                    len(direct_dynamic),
+                    self._format_symbol_sample(direct_dynamic),
+                )
         else:
             pool.update(appeared)
 
+        self._latest_direct_dynamic_symbols = set(direct_dynamic)
+        self._latest_strong_leader_symbols = set(strong_leader_snapshot.keys())
+        self._latest_strong_leader_snapshot = strong_leader_snapshot
+        if strong_leader_snapshot:
+            logger.info(
+                "장중 강한 리더 후보: %d개 [%s]",
+                len(strong_leader_snapshot),
+                self._format_symbol_sample(strong_leader_snapshot.keys()),
+            )
         self._pool = list(pool)[:55]  # 인버스 포함하여 여유 확보
         self._last_pool_refresh = self._now()
 
@@ -2873,6 +3140,33 @@ class MomentumScalpStrategy(BaseStrategy):
         """약세점수 기반 완화 모드 판정."""
         return self._bear_score <= 0 or self._is_bull_bias_market()
 
+    def _meets_leader_support_bull_bias_override(
+        self,
+        *,
+        index_info: Optional[tuple[float, float, float]],
+        quote_decline_ratio: Optional[float],
+    ) -> bool:
+        leaders = list(self._latest_strong_leader_snapshot.values())
+        if len(leaders) < max(1, int(self.cfg.leader_support_bull_bias_min_count)):
+            return False
+        avg_change = sum(float(item.get("change_rate", 0.0)) for item in leaders) / len(leaders)
+        avg_trade_amount = sum(int(item.get("trade_amount", 0)) for item in leaders) / len(leaders)
+        if avg_change < float(self.cfg.leader_support_bull_bias_min_change_rate):
+            return False
+        if avg_trade_amount < float(self.cfg.leader_support_bull_bias_min_trade_amount):
+            return False
+        if (
+            quote_decline_ratio is not None
+            and quote_decline_ratio > float(self.cfg.leader_support_bull_bias_max_decliner_ratio)
+        ):
+            return False
+        if index_info is None:
+            return True
+        current, ma20, ma5 = index_info
+        if current <= 0 or ma20 <= 0 or ma5 <= 0:
+            return False
+        return current >= ma20 or current >= ma5
+
     def _meets_strong_bull_override(
         self,
         *,
@@ -2899,7 +3193,37 @@ class MomentumScalpStrategy(BaseStrategy):
             return False
         return True
 
+    def _meets_index_support_bull_bias_override(
+        self,
+        *,
+        index_info: Optional[tuple[float, float, float]],
+        quote_avg_change: Optional[float],
+        quote_decline_ratio: Optional[float],
+        quote_count: int,
+    ) -> bool:
+        if index_info is None:
+            return False
+        current, ma20, ma5 = index_info
+        if current <= 0 or ma20 <= 0 or ma5 <= 0:
+            return False
+        if current <= ma20 or current <= ma5:
+            return False
+        gap_pct = ((current - ma20) / ma20) * 100 if ma20 > 0 else 0.0
+        if gap_pct < float(self.cfg.index_support_bull_bias_index_gap_pct):
+            return False
+        if quote_count < max(1, int(self.cfg.index_support_bull_bias_min_quote_count)):
+            return False
+        if quote_avg_change is None or quote_avg_change < float(self.cfg.index_support_bull_bias_avg_change_rate_threshold):
+            return False
+        if quote_decline_ratio is None or quote_decline_ratio > float(self.cfg.index_support_bull_bias_max_decliner_ratio):
+            return False
+        return True
+
     def _is_bull_bias_market(self) -> bool:
+        if self._leader_support_bull_bias_active:
+            return True
+        if self._index_support_bull_bias_active:
+            return True
         if self._strong_bull_override_active:
             return True
         if self._bear_score != 1:
@@ -2947,6 +3271,7 @@ class MomentumScalpStrategy(BaseStrategy):
             return
 
         if not self.market_data:
+            self._index_support_bull_bias_active = False
             self._strong_bull_override_active = False
             fallback_score = 0 if quote_score is None else max(0, min(int(quote_score), 3))
             self._bear_score = fallback_score
@@ -2972,6 +3297,8 @@ class MomentumScalpStrategy(BaseStrategy):
         )
 
         if should_refresh_index:
+            previous_index_score = self._cached_index_regime_score
+            previous_index_info = self._cached_index_regime_info
             index_score = 0
             index_info = None
             index_error = None
@@ -3004,6 +3331,8 @@ class MomentumScalpStrategy(BaseStrategy):
                     else:
                         closes = close_series.dropna()
 
+                    closes = closes[closes > 0]
+
                     if len(closes) < 20:
                         index_info = None
                     else:
@@ -3032,8 +3361,18 @@ class MomentumScalpStrategy(BaseStrategy):
                             if all(c < p for c, p in zip(last3, prev3)):
                                 score += 1
 
+                        if current <= 0 or ma20 <= 0 or ma5 <= 0:
+                            raise ValueError("비정상 인덱스 응답(0 이하 값)")
+
                         index_score = score
                         index_info = (float(current), float(ma20), float(ma5))
+                if (
+                    index_info is None
+                    and previous_index_info is not None
+                    and all(float(value) > 0 for value in previous_index_info)
+                ):
+                    raise ValueError("비정상 인덱스 응답(유효 일봉 부족)")
+
                 self._cached_index_regime_score = index_score
                 self._cached_index_regime_info = index_info
                 self._cached_index_regime_error = None
@@ -3041,13 +3380,22 @@ class MomentumScalpStrategy(BaseStrategy):
             except Exception as e:
                 index_error = e
                 self._cached_index_regime_error = e
-                self._cached_index_regime_info = None
+                if (
+                    previous_index_info is not None
+                    and all(float(value) > 0 for value in previous_index_info)
+                ):
+                    index_score = previous_index_score or 0
+                    index_info = previous_index_info
+                    self._cached_index_regime_score = index_score
+                    self._cached_index_regime_info = index_info
+                    logger.warning("인덱스 일봉 비정상 응답 감지, 직전 캐시 유지: %s", e)
+                else:
+                    self._cached_index_regime_score = 0
+                    self._cached_index_regime_info = None
                 self._last_index_regime_check_at = now
 
         if index_score is None:
             index_score = 0
-        if index_info is None:
-            index_info = (0.0, 0.0, 0.0)
 
         index_weight = 0.7
         quote_weight = 0.3
@@ -3079,6 +3427,16 @@ class MomentumScalpStrategy(BaseStrategy):
         final_score = round((raw_final_score * 0.75) + (prev_score * 0.25))
         final_score = max(0, min(4, int(final_score)))
 
+        index_support_bull_bias = self._meets_index_support_bull_bias_override(
+            index_info=index_info,
+            quote_avg_change=quote_avg_change,
+            quote_decline_ratio=quote_decline_ratio,
+            quote_count=quote_count,
+        )
+        leader_support_bull_bias = self._meets_leader_support_bull_bias_override(
+            index_info=index_info,
+            quote_decline_ratio=quote_decline_ratio,
+        )
         strong_bull_override = self._meets_strong_bull_override(
             index_info=index_info,
             quote_avg_change=quote_avg_change,
@@ -3095,10 +3453,40 @@ class MomentumScalpStrategy(BaseStrategy):
                 quote_count,
             )
             final_score = 1
+        elif index_support_bull_bias and final_score >= 2:
+            logger.info(
+                "지수 지지 bull-bias 적용: score %d -> 1 (KOSPI-MA20 %.2f%%, 평균등락 %.2f%%, 하락비율 %.1f%%, 표본 %d개)",
+                final_score,
+                ((index_info[0] - index_info[1]) / index_info[1]) * 100 if index_info[1] > 0 else 0.0,
+                quote_avg_change,
+                quote_decline_ratio * 100,
+                quote_count,
+            )
+            final_score = 1
+        elif leader_support_bull_bias and final_score >= 2:
+            leader_count = len(self._latest_strong_leader_snapshot)
+            avg_leader_change = (
+                sum(float(item.get("change_rate", 0.0)) for item in self._latest_strong_leader_snapshot.values())
+                / max(1, leader_count)
+            )
+            avg_leader_trade_amount = int(
+                sum(int(item.get("trade_amount", 0)) for item in self._latest_strong_leader_snapshot.values())
+                / max(1, leader_count)
+            )
+            logger.info(
+                "강한 리더 bull-bias 적용: score %d -> 1 (리더 %d개, 평균등락 %.2f%%, 평균거래대금 %s원)",
+                final_score,
+                leader_count,
+                avg_leader_change,
+                f"{avg_leader_trade_amount:,}",
+            )
+            final_score = 1
 
         final_score = max(0, min(final_score, 3))
         self._bear_score = final_score
         self._bear_market = final_score >= 2
+        self._leader_support_bull_bias_active = leader_support_bull_bias
+        self._index_support_bull_bias_active = index_support_bull_bias
         self._strong_bull_override_active = strong_bull_override
         self._last_regime_check_at = now
 
@@ -3168,7 +3556,10 @@ class MomentumScalpStrategy(BaseStrategy):
     ) -> List[tuple[float, Quote]]:
         candidates: List[tuple[float, Quote]] = []
         profile_name = self._resolve_regime_profile_name()
-        if profile_name in {"soft_bear", "bear"}:
+        soft_bear_leader_lane = profile_name == "soft_bear" and self._soft_bear_strong_leader_lane_active()
+        if profile_name == "bear":
+            return candidates
+        if profile_name == "soft_bear" and not soft_bear_leader_lane:
             return candidates
         is_opening_guard = self._is_early_session_guard_active()
         for q in quotes:
@@ -3181,6 +3572,8 @@ class MomentumScalpStrategy(BaseStrategy):
             min_change_rate = self._regime_min_change_rate()
             if self._is_bullish_regime():
                 min_change_rate = self._regime_bullish_min_change_rate()
+            if soft_bear_leader_lane:
+                min_change_rate = float(self.cfg.soft_bear_strong_leader_min_change_rate)
             if is_opening_guard and self._is_bullish_regime():
                 min_change_rate += self.cfg.early_session_min_change_rate_boost
             if q.change_rate < min_change_rate:
@@ -3189,6 +3582,8 @@ class MomentumScalpStrategy(BaseStrategy):
             min_score = self._regime_min_momentum_score()
             if self._is_bullish_regime():
                 min_score = self._regime_bullish_min_momentum_score()
+            if soft_bear_leader_lane:
+                min_score = float(self.cfg.soft_bear_strong_leader_min_momentum)
             if is_opening_guard and self._is_bullish_regime():
                 min_score += self.cfg.early_session_min_score_boost
             if score < min_score:
@@ -3198,6 +3593,8 @@ class MomentumScalpStrategy(BaseStrategy):
                     score,
                     min_score,
                 )
+                continue
+            if soft_bear_leader_lane and not self._is_soft_bear_strong_leader_long_candidate(q, score=score):
                 continue
             candidates.append((score, q))
 
@@ -3376,11 +3773,24 @@ class MomentumScalpStrategy(BaseStrategy):
             )
             return False
 
-        if profile_name in {"soft_bear", "bear"}:
+        soft_bear_leader_lane = profile_name == "soft_bear" and self._is_soft_bear_strong_leader_long_candidate(
+            quote,
+            score=score,
+        )
+        if profile_name == "bear":
             self._log_setup_reject(
                 quote,
                 "long_disabled",
                 "%s 레짐에서는 신규 롱을 열지 않습니다: %s",
+                profile_name,
+                quote.symbol,
+            )
+            return False
+        if profile_name == "soft_bear" and not soft_bear_leader_lane:
+            self._log_setup_reject(
+                quote,
+                "long_disabled",
+                "%s 레짐에서는 강한 리더만 예외적으로 신규 롱을 평가합니다: %s",
                 profile_name,
                 quote.symbol,
             )
@@ -3501,6 +3911,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
         if (
             self.cfg.enable_pool_persistence_gate
+            and quote.symbol not in self._latest_direct_dynamic_symbols
             and not self._is_pool_persistent(quote.symbol)
         ):
             logger.debug("신규롱 차단: 동적 풀 지속성 미충족 (%s)", quote.symbol)
