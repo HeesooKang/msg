@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from statistics import median
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -309,6 +309,16 @@ class MomentumScalpConfig:
     math_live_negative_ev_gate: bool = True
     math_live_ev_min_trades: int = 4
     math_live_negative_ev_threshold: float = 0.0
+    math_queue_top_n: int = 12
+    math_queue_percentile_floor: float = 0.80
+    math_queue_backfill_slots: int = 6
+    math_gate_regime_margin: float = 0.08
+    math_gate_min_leader_percentile: float = 0.80
+    math_gate_positive_ev_required: bool = True
+    math_size_min_multiplier: float = 0.70
+    math_size_max_multiplier: float = 1.50
+    math_size_bull_a_max_multiplier: float = 1.65
+    math_ev_scale_krw: float = 2500.0
     enable_backtest_score_entry_fallback: bool = False
     stage1_loss_threshold: int = -3_000
     profit_protect_threshold: int = 8_000
@@ -551,6 +561,10 @@ class MomentumScalpStrategy(BaseStrategy):
         self._latest_strong_leader_symbols: set[str] = set()
         self._latest_strong_leader_snapshot: Dict[str, dict] = {}
         self._latest_math_leader_signals: Dict[str, LeaderSignal] = {}
+        self._latest_math_queue_symbols: List[str] = []
+        self._latest_math_backfill_symbols: List[str] = []
+        self._latest_legacy_backfill_symbols: List[str] = []
+        self._latest_math_queue_source: Dict[str, str] = {}
         self._latest_regime_probabilities = RegimeProbabilities(
             bull_prob=0.25,
             neutral_prob=0.25,
@@ -691,6 +705,154 @@ class MomentumScalpStrategy(BaseStrategy):
             selected = selected[:top_n]
         return set(selected)
 
+    def _math_queue_ranked_signals(
+        self,
+        quotes: Optional[Sequence[Quote]] = None,
+    ) -> List[LeaderSignal]:
+        if not self.cfg.enable_math_shadow_layer:
+            return []
+        source_quotes = [
+            quote
+            for quote in (quotes or self._active_pool_quotes(include_inverse=False))
+            if quote.symbol not in self._inverse_symbols and int(quote.current_price or 0) > 0
+        ]
+        if not source_quotes:
+            return []
+        signals = build_leader_signals(
+            source_quotes,
+            avg_volumes=self._avg_volumes,
+            recent_quotes_by_symbol=self._recent_quotes,
+        )
+        ranked = sorted(
+            signals.values(),
+            key=lambda item: (
+                item.leader_score,
+                item.leader_percentile,
+                item.trade_amount,
+                item.symbol,
+            ),
+            reverse=True,
+        )
+        return ranked
+
+    def _math_queue_source_for_symbol(self, symbol: str) -> str:
+        return self._latest_math_queue_source.get(symbol, "")
+
+    def _is_math_queue_symbol(self, symbol: str) -> bool:
+        return symbol in self._latest_math_queue_source
+
+    def _math_regime_ranked(self) -> List[tuple[str, float]]:
+        ranked = [
+            ("bull", float(self._latest_regime_probabilities.bull_prob)),
+            ("neutral", float(self._latest_regime_probabilities.neutral_prob)),
+            ("soft_bear", float(self._latest_regime_probabilities.soft_bear_prob)),
+            ("bear", float(self._latest_regime_probabilities.bear_prob)),
+        ]
+        ranked.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        return ranked
+
+    def _math_regime_choice(self) -> tuple[str, float, float]:
+        ranked = self._math_regime_ranked()
+        if not ranked:
+            return "neutral", 0.0, 0.0
+        top_name, top_prob = ranked[0]
+        runner_prob = ranked[1][1] if len(ranked) > 1 else 0.0
+        return top_name, float(top_prob), float(runner_prob)
+
+    def _math_regime_supports_strategy(self, strategy_name: str, entry_meta: dict, *, is_inverse: bool) -> bool:
+        if not self._math_live_layer_enabled():
+            return True
+        dominant_profile, dominant_prob, runner_prob = self._math_regime_choice()
+        margin = float(self.cfg.math_gate_regime_margin)
+        if dominant_prob < runner_prob + margin:
+            return False
+        if is_inverse:
+            return dominant_profile in {"soft_bear", "bear"}
+        if strategy_name == "bull_breakout_strategy":
+            return dominant_profile == "bull"
+        if strategy_name == "neutral_pullback_strategy":
+            return dominant_profile in {"neutral", "bull"}
+        return dominant_profile in {"bull", "neutral"}
+
+    def _math_candidate_admission(
+        self,
+        quote: Quote,
+        *,
+        strategy_name: str,
+        regime_label: str,
+        is_inverse: bool,
+    ) -> tuple[bool, dict, str]:
+        entry_meta = self._build_math_shadow_metadata(
+            quote,
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+        )
+        gate_ok, gate_reason = self._passes_math_live_entry_gate(
+            quote,
+            strategy_name=strategy_name,
+            entry_meta=entry_meta,
+            is_inverse=is_inverse,
+        )
+        return gate_ok, entry_meta, gate_reason
+
+    def _math_soft_override_allowed(
+        self,
+        quote: Quote,
+        *,
+        strategy_name: str,
+        regime_label: str,
+        reject_reason: str,
+        is_inverse: bool = False,
+    ) -> tuple[bool, dict]:
+        if not self._math_live_layer_enabled():
+            return False, {}
+        allowed, entry_meta, gate_reason = self._math_candidate_admission(
+            quote,
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+            is_inverse=is_inverse,
+        )
+        if not allowed:
+            return False, entry_meta
+        entry_meta = dict(entry_meta)
+        entry_meta["math_soft_override_reason"] = reject_reason
+        entry_meta["math_shadow_gate"] = "soft_override"
+        entry_meta["math_shadow_reason"] = reject_reason if not gate_reason else gate_reason
+        return True, entry_meta
+
+    def _math_size_multiplier(
+        self,
+        *,
+        strategy_name: str,
+        entry_meta: dict,
+        is_inverse: bool,
+    ) -> float:
+        if not self._math_live_layer_enabled():
+            return 1.0
+        leader_percentile = float(entry_meta.get("leader_percentile", 0.0) or 0.0)
+        entry_ev = float(entry_meta.get("entry_ev", 0.0) or 0.0)
+        closed_trades = int(entry_meta.get("entry_ev_closed_trades", 0) or 0)
+
+        leader_component = max(0.0, min(1.0, (leader_percentile - 0.50) / 0.50))
+        ev_scale = max(1.0, float(self.cfg.math_ev_scale_krw))
+        ev_component = max(-1.0, min(1.0, entry_ev / ev_scale))
+        if closed_trades >= 8:
+            confidence_component = 1.0
+        elif closed_trades >= 4:
+            confidence_component = 0.6
+        else:
+            confidence_component = 0.3
+
+        raw_multiplier = 0.70 + 0.45 * leader_component + 0.35 * ev_component * confidence_component
+        min_multiplier = float(self.cfg.math_size_min_multiplier)
+        if strategy_name == "bull_breakout_strategy" and str(entry_meta.get("entry_grade", "")).upper() == "A":
+            max_multiplier = float(self.cfg.math_size_bull_a_max_multiplier)
+        elif is_inverse or strategy_name == "neutral_pullback_strategy":
+            max_multiplier = min(1.10, float(self.cfg.math_size_max_multiplier))
+        else:
+            max_multiplier = float(self.cfg.math_size_max_multiplier)
+        return max(min_multiplier, min(max_multiplier, raw_multiplier))
+
     def _build_math_shadow_metadata(
         self,
         quote: Quote,
@@ -715,6 +877,7 @@ class MomentumScalpStrategy(BaseStrategy):
         elif reject_reason and leader_signal.leader_percentile >= 0.95:
             math_shadow_gate = "top_leader_rejected"
             math_shadow_reason = reject_reason
+        dominant_profile, dominant_prob, runner_prob = self._math_regime_choice()
         return {
             "leader_score": round(leader_signal.leader_score, 6),
             "leader_percentile": round(leader_signal.leader_percentile, 6),
@@ -726,6 +889,10 @@ class MomentumScalpStrategy(BaseStrategy):
             "neutral_prob": round(self._latest_regime_probabilities.neutral_prob, 6),
             "soft_bear_prob": round(self._latest_regime_probabilities.soft_bear_prob, 6),
             "bear_prob": round(self._latest_regime_probabilities.bear_prob, 6),
+            "math_queue_source": self._math_queue_source_for_symbol(quote.symbol),
+            "math_dominant_profile": dominant_profile,
+            "math_dominant_prob": round(dominant_prob, 6),
+            "math_regime_margin": round(max(0.0, dominant_prob - runner_prob), 6),
             "math_shadow_gate": math_shadow_gate,
             "math_shadow_reason": math_shadow_reason,
         }
@@ -744,34 +911,48 @@ class MomentumScalpStrategy(BaseStrategy):
         leader_percentile = float(entry_meta.get("leader_percentile", 0.0) or 0.0)
         entry_ev = float(entry_meta.get("entry_ev", 0.0) or 0.0)
         entry_ev_trades = int(entry_meta.get("entry_ev_closed_trades", 0) or 0)
-        bull_prob = float(entry_meta.get("bull_prob", 0.0) or 0.0)
-        neutral_prob = float(entry_meta.get("neutral_prob", 0.0) or 0.0)
-        soft_bear_prob = float(entry_meta.get("soft_bear_prob", 0.0) or 0.0)
-        bear_prob = float(entry_meta.get("bear_prob", 0.0) or 0.0)
-
-        if not is_inverse:
-            if strategy_name == "bull_breakout_strategy":
-                if leader_percentile < float(self.cfg.math_live_bull_leader_percentile):
-                    return False, "math_bull_leader_floor"
-                if bull_prob + float(self.cfg.math_live_regime_margin) < max(neutral_prob, soft_bear_prob, bear_prob):
-                    return False, "math_bull_regime_mismatch"
-            elif strategy_name == "neutral_pullback_strategy":
-                if leader_percentile < float(self.cfg.math_live_neutral_leader_percentile):
-                    return False, "math_neutral_leader_floor"
-                if neutral_prob + float(self.cfg.math_live_regime_margin) < max(bull_prob, soft_bear_prob, bear_prob):
-                    return False, "math_neutral_regime_mismatch"
-        else:
-            if soft_bear_prob + bear_prob < 0.50:
-                return False, "math_inverse_regime_mismatch"
+        if leader_percentile < float(self.cfg.math_gate_min_leader_percentile):
+            return False, "math_leader_percentile"
 
         if (
-            self.cfg.math_live_negative_ev_gate
+            bool(self.cfg.math_gate_positive_ev_required)
+            and self.cfg.math_live_negative_ev_gate
             and entry_ev_trades >= max(1, int(self.cfg.math_live_ev_min_trades))
-            and entry_ev < float(self.cfg.math_live_negative_ev_threshold)
+            and entry_ev < max(0.0, float(self.cfg.math_live_negative_ev_threshold))
         ):
             return False, "math_negative_ev"
 
+        if not self._math_regime_supports_strategy(strategy_name, entry_meta, is_inverse=is_inverse):
+            return False, "math_regime_mismatch"
+
         return True, ""
+
+    def _can_math_live_override_strategy_gate(
+        self,
+        quote: Quote,
+        *,
+        strategy_name: str,
+        regime_label: str,
+        is_inverse: bool,
+    ) -> tuple[bool, dict]:
+        if not self._math_live_layer_enabled():
+            return False, {}
+
+        entry_meta = self._build_math_shadow_metadata(
+            quote,
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+        )
+        gate_ok, _ = self._passes_math_live_entry_gate(
+            quote,
+            strategy_name=strategy_name,
+            entry_meta=entry_meta,
+            is_inverse=is_inverse,
+        )
+        if not gate_ok:
+            return False, entry_meta
+
+        return True, entry_meta
 
     def _append_math_shadow_context(self, payload: str, metadata: dict) -> str:
         base = str(payload or "").strip()
@@ -799,6 +980,14 @@ class MomentumScalpStrategy(BaseStrategy):
             extras.append(f"math_shadow_gate={metadata.get('math_shadow_gate')}")
         if metadata.get("math_shadow_reason"):
             extras.append(f"math_shadow_reason={metadata.get('math_shadow_reason')}")
+        if metadata.get("math_queue_source"):
+            extras.append(f"math_queue_source={metadata.get('math_queue_source')}")
+        if metadata.get("math_dominant_profile"):
+            extras.append(f"math_dominant_profile={metadata.get('math_dominant_profile')}")
+        if "math_regime_margin" in metadata:
+            extras.append(f"math_regime_margin={float(metadata.get('math_regime_margin', 0.0)):.4f}")
+        if "size_multiplier" in metadata:
+            extras.append(f"size_multiplier={float(metadata.get('size_multiplier', 1.0)):.4f}")
         extra = " ".join(extras).strip()
         if not extra:
             return base
@@ -1375,7 +1564,14 @@ class MomentumScalpStrategy(BaseStrategy):
     def _active_pool_quotes(self, include_inverse: bool = False) -> List[Quote]:
         candidates: List[Quote] = []
         seen: set[str] = set()
-        pool_symbols = list(self._pool) if self._pool else list(self._quotes_cache.keys())
+        if self._pool:
+            pool_symbols: List[str] = []
+            pool_symbols.extend(self._latest_math_queue_symbols)
+            pool_symbols.extend(self._latest_math_backfill_symbols)
+            pool_symbols.extend(self._latest_legacy_backfill_symbols)
+            pool_symbols.extend(list(self._pool))
+        else:
+            pool_symbols = list(self._quotes_cache.keys())
         for symbol in pool_symbols:
             quote = self._quotes_cache.get(symbol)
             if quote is None or quote.current_price <= 0:
@@ -1500,8 +1696,10 @@ class MomentumScalpStrategy(BaseStrategy):
         leader_signal = self._leader_signal_for_quote(quote)
         math_override = (
             self._math_live_layer_enabled()
-            and leader_signal.leader_percentile >= float(self.cfg.math_live_neutral_leader_percentile)
-            and self._quote_trade_amount(quote) >= int(self.cfg.strong_leader_min_trade_amount)
+            and (
+                self._is_math_queue_symbol(quote.symbol)
+                or leader_signal.leader_percentile >= float(self.cfg.math_gate_min_leader_percentile)
+            )
         )
         if turnover_rank > max(1, int(turnover_rank_limit)) and not math_override:
             return False, "neutral_low_turnover_rank"
@@ -1550,8 +1748,10 @@ class MomentumScalpStrategy(BaseStrategy):
         leader_signal = self._leader_signal_for_quote(quote)
         math_override = (
             self._math_live_layer_enabled()
-            and leader_signal.leader_percentile >= float(self.cfg.math_live_bull_leader_percentile)
-            and self._quote_trade_amount(quote) >= int(self.cfg.strong_leader_min_trade_amount)
+            and (
+                self._is_math_queue_symbol(quote.symbol)
+                or leader_signal.leader_percentile >= float(self.cfg.math_gate_min_leader_percentile)
+            )
         )
         if turnover_rank > max(1, int(self.cfg.bull_leader_top_n)) and not math_override:
             return False, "bull_low_turnover_rank", ""
@@ -1586,7 +1786,17 @@ class MomentumScalpStrategy(BaseStrategy):
         if score < required_score:
             return False, "", "bull_score"
         if not self._is_volume_spike(quote, score=score):
-            return False, "", "bull_volume"
+            soft_override, soft_meta = self._math_soft_override_allowed(
+                quote,
+                strategy_name="bull_breakout_strategy",
+                regime_label=self._resolve_regime_profile_name(),
+                reject_reason="bull_volume",
+            )
+            if not soft_override:
+                return False, "", "bull_volume"
+            soft_override_payload = f" math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'bull_volume')}"
+        else:
+            soft_override_payload = ""
         leader_ok, leader_reject, leader_payload = self._passes_bull_leader_filter(quote)
         if not leader_ok:
             return False, "", leader_reject
@@ -1632,7 +1842,7 @@ class MomentumScalpStrategy(BaseStrategy):
         reason = (
             f"setup_name=bull_breakout entry_reason=local_high_breakout "
             f"prior_high={prior_high} hold_ticks={hold_ticks} "
-            f"leader_lane={'soft_bear' if soft_bear_leader_lane else 'bull'} {leader_payload}"
+            f"leader_lane={'soft_bear' if soft_bear_leader_lane else 'bull'} {leader_payload}{soft_override_payload}"
         )
         return True, "bull_breakout", reason
 
@@ -1721,7 +1931,17 @@ class MomentumScalpStrategy(BaseStrategy):
         if pullback_drop > self.cfg.neutral_pullback_max_drop_pct:
             return False, "", "pullback_broken"
         if self._pct_move(quote.open_price, quote.current_price) <= 0:
-            return False, "", "neutral_non_leader"
+            soft_override, soft_meta = self._math_soft_override_allowed(
+                quote,
+                strategy_name="neutral_pullback_strategy",
+                regime_label="neutral",
+                reject_reason="neutral_non_leader",
+            )
+            if not soft_override:
+                return False, "", "neutral_non_leader"
+            soft_override_payload = f" math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'neutral_non_leader')}"
+        else:
+            soft_override_payload = ""
 
         pullback_low_idx = local_high_idx + 1 + min(
             range(len(pullback_window)),
@@ -1747,12 +1967,20 @@ class MomentumScalpStrategy(BaseStrategy):
         if quote.change_rate < min_change_rate:
             return False, "", "neutral_change_rate"
         if not self._is_volume_spike(quote, score=score):
-            return False, "", "neutral_volume"
+            soft_override, soft_meta = self._math_soft_override_allowed(
+                quote,
+                strategy_name="neutral_pullback_strategy",
+                regime_label="neutral",
+                reject_reason="neutral_volume",
+            )
+            if not soft_override:
+                return False, "", "neutral_volume"
+            soft_override_payload = f"{soft_override_payload} math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'neutral_volume')}".strip()
 
         reason = (
             f"setup_name=neutral_pullback_reclaim entry_reason=pullback_reclaim "
             f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f} "
-            f"reclaim_speed_ticks={reclaim_speed_ticks}"
+            f"reclaim_speed_ticks={reclaim_speed_ticks}{(' ' + soft_override_payload.strip()) if soft_override_payload.strip() else ''}"
         )
         return True, "neutral_pullback_reclaim", reason
 
@@ -1796,11 +2024,22 @@ class MomentumScalpStrategy(BaseStrategy):
         if score < self.cfg.soft_bear_inverse_min_momentum:
             return False, "", "soft_bear_runup_missing"
         if not self._is_volume_spike(quote, score=score):
-            return False, "", "soft_bear_volume_failed"
+            soft_override, soft_meta = self._math_soft_override_allowed(
+                quote,
+                strategy_name="soft_bear_inverse_strategy",
+                regime_label="soft_bear",
+                reject_reason="soft_bear_volume_failed",
+                is_inverse=True,
+            )
+            if not soft_override:
+                return False, "", "soft_bear_volume_failed"
+            soft_override_payload = f" math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'soft_bear_volume_failed')}"
+        else:
+            soft_override_payload = ""
 
         reason = (
             f"setup_name=soft_bear_inverse_breakdown entry_reason=weak_rebound_failure "
-            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f}"
+            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f}{soft_override_payload}"
         )
         return True, "soft_bear_inverse_breakdown", reason
 
@@ -1870,6 +2109,10 @@ class MomentumScalpStrategy(BaseStrategy):
             self._latest_strong_leader_symbols = set()
             self._latest_strong_leader_snapshot = {}
             self._latest_math_leader_signals = {}
+            self._latest_math_queue_symbols = []
+            self._latest_math_backfill_symbols = []
+            self._latest_legacy_backfill_symbols = []
+            self._latest_math_queue_source = {}
             self._latest_regime_probabilities = RegimeProbabilities(
                 bull_prob=0.25,
                 neutral_prob=0.25,
@@ -2863,20 +3106,9 @@ class MomentumScalpStrategy(BaseStrategy):
         if score <= 0:
             return "bull"
         if self._math_live_layer_enabled():
-            bull_prob = float(self._latest_regime_probabilities.bull_prob)
-            neutral_prob = float(self._latest_regime_probabilities.neutral_prob)
-            soft_bear_prob = float(self._latest_regime_probabilities.soft_bear_prob)
-            bear_prob = float(self._latest_regime_probabilities.bear_prob)
-            margin = float(self.cfg.math_live_regime_margin)
-            if score == 1 and bull_prob >= float(self.cfg.math_live_bull_prob_threshold):
-                if bull_prob >= max(neutral_prob, soft_bear_prob, bear_prob) + margin:
-                    return "bull"
-            if score == 2:
-                if bull_prob >= float(self.cfg.math_live_soft_bear_bull_prob_threshold):
-                    if bull_prob >= max(soft_bear_prob, bear_prob) + margin:
-                        return "neutral"
-                if neutral_prob >= max(soft_bear_prob, bear_prob) + margin:
-                    return "neutral"
+            dominant_profile, dominant_prob, runner_prob = self._math_regime_choice()
+            if dominant_prob >= runner_prob + float(self.cfg.math_gate_regime_margin):
+                return dominant_profile
         if score == 1 and (self._strong_bull_override_active or self._index_support_bull_bias_active):
             return "bull"
         if score == 1:
@@ -3396,6 +3628,10 @@ class MomentumScalpStrategy(BaseStrategy):
         appeared: set[str] = set()
         direct_dynamic: set[str] = set()
         strong_leader_snapshot: Dict[str, dict] = {}
+        math_queue_symbols: List[str] = []
+        math_backfill_symbols: List[str] = []
+        legacy_backfill_symbols: List[str] = []
+        math_queue_source: Dict[str, str] = {}
 
         # 인버스 ETF 추가
         if self.cfg.inverse_enabled:
@@ -3439,18 +3675,23 @@ class MomentumScalpStrategy(BaseStrategy):
                     ),
                     reverse=True,
                 )[: max(0, int(self.cfg.dynamic_pool_quote_trade_amount_slots))]
+
+                source_quotes: Dict[str, Quote] = {}
+                for quote in list(self._quotes_cache.values()) + list(cache_leaders) + list(rising):
+                    if quote.symbol in self._inverse_symbols:
+                        continue
+                    if int(getattr(quote, "current_price", 0) or 0) <= 0:
+                        continue
+                    if not all(hasattr(quote, attr) for attr in ("open_price", "high_price", "low_price")):
+                        continue
+                    source_quotes[quote.symbol] = quote
+
                 for item in by_rank:
                     appeared.add(item.symbol)
                 for item in by_turnover:
                     appeared.add(item.symbol)
                 for quote in cache_leaders:
                     appeared.add(quote.symbol)
-                for item in by_rank[: max(0, int(self.cfg.dynamic_pool_direct_rank_slots))]:
-                    direct_dynamic.add(item.symbol)
-                for item in by_turnover[: max(0, int(self.cfg.dynamic_pool_direct_turnover_slots))]:
-                    direct_dynamic.add(item.symbol)
-                for quote in cache_leaders[: max(0, int(self.cfg.dynamic_pool_direct_quote_leader_slots))]:
-                    direct_dynamic.add(quote.symbol)
                 for item in rising:
                     trade_amount = self._ranking_trade_amount(item)
                     if not self._is_dynamic_strong_leader_candidate(
@@ -3484,41 +3725,59 @@ class MomentumScalpStrategy(BaseStrategy):
                         "rank": int(existing.get("rank", 999)),
                     }
                     direct_dynamic.add(quote.symbol)
-                math_direct_dynamic: set[str] = set()
-                if self._math_live_layer_enabled() and cache_leaders:
-                    cache_signals = build_leader_signals(
-                        cache_leaders,
-                        avg_volumes=self._avg_volumes,
-                        recent_quotes_by_symbol=self._recent_quotes,
-                    )
-                    ranked_math_leaders = sorted(
-                        cache_signals.values(),
-                        key=lambda signal: (
-                            signal.leader_score,
-                            signal.leader_percentile,
-                            signal.trade_amount,
-                            signal.symbol,
-                        ),
-                        reverse=True,
-                    )
-                    percentile_floor = float(self.cfg.math_live_pool_percentile_floor)
-                    for signal in ranked_math_leaders:
-                        if signal.leader_percentile < percentile_floor:
-                            continue
-                        math_direct_dynamic.add(signal.symbol)
-                        if len(math_direct_dynamic) >= max(0, int(self.cfg.math_live_pool_top_n)):
-                            break
-                    for symbol in math_direct_dynamic:
-                        appeared.add(symbol)
-                        direct_dynamic.add(symbol)
-                        quote = self._quotes_cache.get(symbol)
-                        if quote is not None:
-                            existing = strong_leader_snapshot.get(symbol, {})
-                            strong_leader_snapshot[symbol] = {
-                                "change_rate": max(float(existing.get("change_rate", 0.0)), float(quote.change_rate)),
-                                "trade_amount": max(int(existing.get("trade_amount", 0)), int(self._quote_trade_amount(quote))),
-                                "rank": int(existing.get("rank", 999)),
-                            }
+
+                ranked_math_leaders = self._math_queue_ranked_signals(list(source_quotes.values()))
+                percentile_floor = float(self.cfg.math_queue_percentile_floor)
+                math_queue_limit = max(0, int(self.cfg.math_queue_top_n))
+                for signal in ranked_math_leaders:
+                    if signal.leader_percentile < percentile_floor:
+                        continue
+                    math_queue_symbols.append(signal.symbol)
+                    math_queue_source[signal.symbol] = "math_queue"
+                    if len(math_queue_symbols) >= math_queue_limit:
+                        break
+
+                remaining_backfill = max(0, int(self.cfg.math_queue_backfill_slots))
+                for signal in ranked_math_leaders:
+                    if remaining_backfill <= 0:
+                        break
+                    if signal.symbol in math_queue_source:
+                        continue
+                    math_backfill_symbols.append(signal.symbol)
+                    math_queue_source[signal.symbol] = "math_backfill"
+                    remaining_backfill -= 1
+
+                legacy_candidates: List[str] = []
+                for item in by_turnover:
+                    legacy_candidates.append(item.symbol)
+                for item in by_rank:
+                    legacy_candidates.append(item.symbol)
+                for quote in cache_leaders:
+                    legacy_candidates.append(quote.symbol)
+                for symbol in legacy_candidates:
+                    if remaining_backfill <= 0:
+                        break
+                    if symbol in math_queue_source:
+                        continue
+                    if symbol in legacy_backfill_symbols:
+                        continue
+                    legacy_backfill_symbols.append(symbol)
+                    math_queue_source[symbol] = "legacy_backfill"
+                    remaining_backfill -= 1
+
+                for symbol in math_queue_symbols:
+                    appeared.add(symbol)
+                    direct_dynamic.add(symbol)
+                    quote = source_quotes.get(symbol) or self._quotes_cache.get(symbol)
+                    if quote is not None:
+                        existing = strong_leader_snapshot.get(symbol, {})
+                        strong_leader_snapshot[symbol] = {
+                            "change_rate": max(float(existing.get("change_rate", 0.0)), float(quote.change_rate)),
+                            "trade_amount": max(int(existing.get("trade_amount", 0)), int(self._quote_trade_amount(quote))),
+                            "rank": int(existing.get("rank", 999)),
+                        }
+                for symbol in math_backfill_symbols + legacy_backfill_symbols:
+                    appeared.add(symbol)
                 logger.info(
                     "동적 풀 갱신: 등락률 %d개 + 거래대금 %d개 + 실시간 리더 %d개 (총 %d종목)",
                     len(by_rank),
@@ -3526,11 +3785,23 @@ class MomentumScalpStrategy(BaseStrategy):
                     len(cache_leaders),
                     len(pool),
                 )
-                if math_direct_dynamic:
+                if math_queue_symbols:
                     logger.info(
-                        "수학 상위 리더 즉시 편입: %d개 [%s]",
-                        len(math_direct_dynamic),
-                        self._format_symbol_sample(math_direct_dynamic),
+                        "math leader queue: %d개 [%s]",
+                        len(math_queue_symbols),
+                        self._format_symbol_sample(math_queue_symbols),
+                    )
+                if math_backfill_symbols:
+                    logger.info(
+                        "math backfill: %d개 [%s]",
+                        len(math_backfill_symbols),
+                        self._format_symbol_sample(math_backfill_symbols),
+                    )
+                if legacy_backfill_symbols:
+                    logger.info(
+                        "legacy backfill: %d개 [%s]",
+                        len(legacy_backfill_symbols),
+                        self._format_symbol_sample(legacy_backfill_symbols),
                     )
             except Exception as e:
                 logger.warning("등락률 순위 조회 실패, 정적 풀만 사용: %s", e)
@@ -3543,6 +3814,8 @@ class MomentumScalpStrategy(BaseStrategy):
                 for sym in appeared
                 if self._is_pool_persistent(sym)
             }
+            for sym in math_queue_symbols:
+                pool.add(sym)
             for sym in direct_dynamic:
                 pool.add(sym)
             for sym in appeared:
@@ -3560,9 +3833,15 @@ class MomentumScalpStrategy(BaseStrategy):
         else:
             pool.update(appeared)
 
+        for sym in math_backfill_symbols + legacy_backfill_symbols:
+            pool.add(sym)
         self._latest_direct_dynamic_symbols = set(direct_dynamic)
         self._latest_strong_leader_symbols = set(strong_leader_snapshot.keys())
         self._latest_strong_leader_snapshot = strong_leader_snapshot
+        self._latest_math_queue_symbols = list(math_queue_symbols)
+        self._latest_math_backfill_symbols = list(math_backfill_symbols)
+        self._latest_legacy_backfill_symbols = list(legacy_backfill_symbols)
+        self._latest_math_queue_source = dict(math_queue_source)
         if strong_leader_snapshot:
             logger.info(
                 "장중 강한 리더 후보: %d개 [%s]",
@@ -3573,7 +3852,13 @@ class MomentumScalpStrategy(BaseStrategy):
         self._last_pool_refresh = self._now()
         self._refresh_math_leader_signals()
         leader_rows = []
-        for symbol in sorted(direct_dynamic | set(strong_leader_snapshot.keys())):
+        for symbol in sorted(
+            set(math_queue_symbols)
+            | set(math_backfill_symbols)
+            | set(legacy_backfill_symbols)
+            | direct_dynamic
+            | set(strong_leader_snapshot.keys())
+        ):
             quote = self._quotes_cache.get(symbol)
             signal = self._latest_math_leader_signals.get(symbol)
             leader_rows.append(
@@ -3587,6 +3872,7 @@ class MomentumScalpStrategy(BaseStrategy):
                     "leader_score": round(signal.leader_score, 6) if signal else 0.0,
                     "leader_percentile": round(signal.leader_percentile, 6) if signal else 0.0,
                     "entry_grade_math": signal.entry_grade if signal else "C",
+                    "queue_source": math_queue_source.get(symbol, ""),
                     "direct_dynamic": symbol in direct_dynamic,
                     "strong_leader_candidate": symbol in strong_leader_snapshot,
                 }
@@ -4095,6 +4381,16 @@ class MomentumScalpStrategy(BaseStrategy):
         self,
         quotes: List[Quote],
     ) -> List[tuple[float, Quote]]:
+        if self._math_live_layer_enabled():
+            math_candidates = self._rank_long_entry_candidates_math_first(quotes)
+            if math_candidates:
+                return math_candidates
+        return self._rank_long_entry_candidates_legacy(quotes)
+
+    def _rank_long_entry_candidates_legacy(
+        self,
+        quotes: List[Quote],
+    ) -> List[tuple[float, Quote]]:
         candidates: List[tuple[float, Quote]] = []
         profile_name = self._resolve_regime_profile_name()
         soft_bear_leader_lane = profile_name == "soft_bear" and self._soft_bear_strong_leader_lane_active()
@@ -4141,6 +4437,57 @@ class MomentumScalpStrategy(BaseStrategy):
 
         candidates.sort(key=lambda item: item[0], reverse=True)
         return candidates
+
+    def _rank_long_entry_candidates_math_first(
+        self,
+        quotes: List[Quote],
+    ) -> List[tuple[float, Quote]]:
+        candidates: List[tuple[float, Quote]] = []
+        profile_name = self._resolve_regime_profile_name()
+        if profile_name == "bear":
+            return candidates
+
+        quotes_by_symbol = {quote.symbol: quote for quote in quotes}
+        ordered_symbols: List[str] = []
+        ordered_symbols.extend(self._latest_math_queue_symbols)
+        ordered_symbols.extend(self._latest_math_backfill_symbols)
+        ordered_symbols.extend(self._latest_legacy_backfill_symbols)
+        ordered_symbols.extend([quote.symbol for quote in quotes])
+
+        seen: set[str] = set()
+        for symbol in ordered_symbols:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            quote = quotes_by_symbol.get(symbol) or self._quotes_cache.get(symbol)
+            if quote is None:
+                continue
+            if quote.symbol in self.positions or quote.symbol in self._inverse_symbols:
+                continue
+            if quote.current_price <= 0 or quote.current_price < self.cfg.min_price:
+                continue
+
+            signal = self._leader_signal_for_quote(quote)
+            queue_source = self._math_queue_source_for_symbol(quote.symbol)
+            if not queue_source:
+                continue
+            if (
+                signal.leader_percentile < float(self.cfg.math_queue_percentile_floor)
+                and queue_source == "math_queue"
+            ):
+                continue
+            candidates.append((float(signal.leader_score), quote))
+
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                self._leader_signal_for_quote(item[1]).leader_percentile,
+                self._quote_trade_amount(item[1]),
+                item[1].symbol,
+            ),
+            reverse=True,
+        )
+        return candidates[: max(1, int(self.cfg.math_queue_top_n) + int(self.cfg.math_queue_backfill_slots))]
 
     def _required_volume_spike_ratio(self, quote: Quote, score: float) -> float:
         required_ratio = self._regime_volume_spike_ratio()
@@ -4282,14 +4629,31 @@ class MomentumScalpStrategy(BaseStrategy):
 
         strategy_name = self._current_profile_entry_strategy_name(is_inverse=False)
         if strategy_name and not self._is_strategy_gate_enabled(strategy_name):
-            self._log_setup_reject(
+            override_ok, override_meta = self._can_math_live_override_strategy_gate(
                 quote,
-                "strategy_gate_disabled",
-                "전략 자동 게이트 비활성화: %s (%s)",
-                quote.symbol,
-                strategy_name,
+                strategy_name=strategy_name,
+                regime_label=profile_name,
+                is_inverse=False,
             )
-            return False
+            if override_ok:
+                logger.info(
+                    "수학 live gate 우회 허용: %s (%s) leader_pct=%.4f bull_prob=%.4f neutral_prob=%.4f entry_ev=%.2f",
+                    quote.symbol,
+                    strategy_name,
+                    float(override_meta.get("leader_percentile", 0.0) or 0.0),
+                    float(override_meta.get("bull_prob", 0.0) or 0.0),
+                    float(override_meta.get("neutral_prob", 0.0) or 0.0),
+                    float(override_meta.get("entry_ev", 0.0) or 0.0),
+                )
+            else:
+                self._log_setup_reject(
+                    quote,
+                    "strategy_gate_disabled",
+                    "전략 자동 게이트 비활성화: %s (%s)",
+                    quote.symbol,
+                    strategy_name,
+                )
+                return False
 
         symbol_cooldown_until = self._symbol_cooldown_remaining(quote.symbol, now)
         if symbol_cooldown_until is not None:
@@ -4452,6 +4816,7 @@ class MomentumScalpStrategy(BaseStrategy):
 
         if (
             self.cfg.enable_pool_persistence_gate
+            and not self._is_math_queue_symbol(quote.symbol)
             and quote.symbol not in self._latest_direct_dynamic_symbols
             and not self._is_pool_persistent(quote.symbol)
         ):
@@ -4713,6 +5078,7 @@ class MomentumScalpStrategy(BaseStrategy):
         entry_reason = ""
         strategy_name = ""
         setup_name = ""
+        entry_meta: dict = {}
         if is_scale_in:
             if not self._is_volume_spike(quote, score=score):
                 return None
@@ -4730,6 +5096,16 @@ class MomentumScalpStrategy(BaseStrategy):
             )
             if score < scale_threshold:
                 return None
+            strategy_name = str(getattr(position, "entry_strategy_name", "") or self._current_profile_entry_strategy_name(is_inverse=False))
+            setup_name = str(getattr(position, "entry_setup_name", "") or "scale_in")
+            entry_meta = self._build_entry_metadata(
+                quote.symbol,
+                setup_name,
+                f"setup_name={setup_name} entry_reason=scale_in",
+                strategy_name=strategy_name,
+                quote=quote,
+            )
+            entry_meta["math_admission"] = "passed"
         else:
             if not self._can_open_new_long(
                 quote,
@@ -4766,6 +5142,27 @@ class MomentumScalpStrategy(BaseStrategy):
                     is_inverse=False,
                 )
                 if not gate_ok:
+                    self._record_leader_tape(
+                        "entry_eval",
+                        [
+                            {
+                                "symbol": quote.symbol,
+                                "name": quote.name,
+                                "strategy_name": strategy_name,
+                                "setup_name": setup_name or "backtest_score_entry",
+                                "score": round(score, 4),
+                                "leader_score": float(entry_meta.get("leader_score", 0.0)),
+                                "leader_percentile": float(entry_meta.get("leader_percentile", 0.0)),
+                                "entry_grade_math": entry_meta.get("entry_grade_math", ""),
+                                "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
+                                "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
+                                "queue_source": entry_meta.get("math_queue_source", ""),
+                                "math_admission": "blocked",
+                                "math_admission_reason": gate_reason,
+                                "allowed": False,
+                            }
+                        ],
+                    )
                     self._log_setup_reject(
                         quote,
                         gate_reason,
@@ -4805,6 +5202,27 @@ class MomentumScalpStrategy(BaseStrategy):
                 )
                 if not gate_ok:
                     self._entry_signals.pop(quote.symbol, None)
+                    self._record_leader_tape(
+                        "entry_eval",
+                        [
+                            {
+                                "symbol": quote.symbol,
+                                "name": quote.name,
+                                "strategy_name": strategy_name,
+                                "setup_name": setup_name,
+                                "score": round(score, 4),
+                                "leader_score": float(entry_meta.get("leader_score", 0.0)),
+                                "leader_percentile": float(entry_meta.get("leader_percentile", 0.0)),
+                                "entry_grade_math": entry_meta.get("entry_grade_math", ""),
+                                "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
+                                "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
+                                "queue_source": entry_meta.get("math_queue_source", ""),
+                                "math_admission": "blocked",
+                                "math_admission_reason": gate_reason,
+                                "allowed": False,
+                            }
+                        ],
+                    )
                     self._log_setup_reject(
                         quote,
                         gate_reason,
@@ -4815,7 +5233,25 @@ class MomentumScalpStrategy(BaseStrategy):
                     return None
                 if self._resolve_regime_profile_name() == "neutral" and self._is_neutral_post_loss_retry_available(now):
                     entry_meta["neutral_post_loss_retry"] = True
+                entry_meta["math_admission"] = "passed"
                 entry_reason = self._append_entry_context(decision.payload, entry_meta)
+
+        math_size_multiplier = self._math_size_multiplier(
+            strategy_name=strategy_name or "unknown_strategy",
+            entry_meta=entry_meta,
+            is_inverse=False,
+        )
+        entry_meta["size_multiplier"] = round(math_size_multiplier, 4)
+        logger.info(
+            "수학 admission 통과: %s (%s) leader_pct=%.4f entry_ev=%.2f queue=%s size_mul=%.4f",
+            quote.symbol,
+            strategy_name or "unknown_strategy",
+            float(entry_meta.get("leader_percentile", 0.0) or 0.0),
+            float(entry_meta.get("entry_ev", 0.0) or 0.0),
+            entry_meta.get("math_queue_source", "") or "none",
+            math_size_multiplier,
+        )
+        entry_reason = self._append_math_shadow_context(entry_reason, {"size_multiplier": entry_meta.get("size_multiplier", 1.0)})
 
         if quote.change_rate >= self.cfg.overheated_jump_change_pct:
             retrace_anchor = quote.open_price * (
@@ -4861,17 +5297,17 @@ class MomentumScalpStrategy(BaseStrategy):
                 and entry_grade == "A"
             ),
             per_stock_amount_multiplier=(
-                float(self.cfg.bull_priority_per_stock_amount_multiplier)
+                float(self.cfg.bull_priority_per_stock_amount_multiplier) * math_size_multiplier
                 if bull_priority_entry
-                else 1.0
+                else math_size_multiplier
             ),
             max_per_stock_amount_multiplier=(
-                float(self.cfg.bull_priority_max_per_stock_amount_multiplier)
+                float(self.cfg.bull_priority_max_per_stock_amount_multiplier) * math_size_multiplier
                 if bull_priority_entry
-                else 1.0
+                else math_size_multiplier
             ),
             max_single_position_pct_override=(
-                float(self.cfg.bull_priority_max_single_position_pct)
+                float(self.cfg.bull_priority_max_single_position_pct) * max(1.0, math_size_multiplier)
                 if bull_priority_entry
                 else None
             ),
@@ -4919,10 +5355,13 @@ class MomentumScalpStrategy(BaseStrategy):
                     "entry_grade_math": entry_meta.get("entry_grade_math", ""),
                     "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
                     "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
+                    "queue_source": entry_meta.get("math_queue_source", ""),
+                    "math_admission": entry_meta.get("math_admission", "passed"),
                     "bull_prob": float(entry_meta.get("bull_prob", 0.0)),
                     "neutral_prob": float(entry_meta.get("neutral_prob", 0.0)),
                     "soft_bear_prob": float(entry_meta.get("soft_bear_prob", 0.0)),
                     "bear_prob": float(entry_meta.get("bear_prob", 0.0)),
+                    "size_multiplier": float(entry_meta.get("size_multiplier", 1.0)),
                     "allowed": True,
                 }
             ],
@@ -4986,14 +5425,30 @@ class MomentumScalpStrategy(BaseStrategy):
 
         strategy_name = self._current_profile_entry_strategy_name(is_inverse=True)
         if strategy_name and not self._is_strategy_gate_enabled(strategy_name):
-            self._log_setup_reject(
+            override_ok, override_meta = self._can_math_live_override_strategy_gate(
                 quote,
-                "strategy_gate_disabled",
-                "%s (%s)",
-                quote.symbol,
-                strategy_name,
+                strategy_name=strategy_name,
+                regime_label=profile_name,
+                is_inverse=True,
             )
-            return None
+            if override_ok:
+                logger.info(
+                    "수학 live gate 우회 허용: %s (%s) soft_bear_prob=%.4f bear_prob=%.4f entry_ev=%.2f",
+                    quote.symbol,
+                    strategy_name,
+                    float(override_meta.get("soft_bear_prob", 0.0) or 0.0),
+                    float(override_meta.get("bear_prob", 0.0) or 0.0),
+                    float(override_meta.get("entry_ev", 0.0) or 0.0),
+                )
+            else:
+                self._log_setup_reject(
+                    quote,
+                    "strategy_gate_disabled",
+                    "%s (%s)",
+                    quote.symbol,
+                    strategy_name,
+                )
+                return None
 
         symbol_cooldown_until = self._symbol_cooldown_remaining(quote.symbol, now)
         if symbol_cooldown_until is not None:
@@ -5045,6 +5500,25 @@ class MomentumScalpStrategy(BaseStrategy):
             is_inverse=True,
         )
         if not gate_ok:
+            self._record_leader_tape(
+                "entry_eval",
+                [
+                    {
+                        "symbol": quote.symbol,
+                        "name": quote.name,
+                        "strategy_name": decision.strategy_name,
+                        "setup_name": decision.setup_name,
+                        "score": round(score, 4),
+                        "entry_grade_math": entry_meta.get("entry_grade_math", ""),
+                        "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
+                        "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
+                        "queue_source": entry_meta.get("math_queue_source", ""),
+                        "math_admission": "blocked",
+                        "math_admission_reason": gate_reason,
+                        "allowed": False,
+                    }
+                ],
+            )
             self._log_setup_reject(
                 quote,
                 gate_reason,
@@ -5053,12 +5527,31 @@ class MomentumScalpStrategy(BaseStrategy):
                 gate_reason,
             )
             return None
+        entry_meta["math_admission"] = "passed"
         entry_reason = self._append_entry_context(decision.payload, entry_meta)
+        math_size_multiplier = self._math_size_multiplier(
+            strategy_name=decision.strategy_name,
+            entry_meta=entry_meta,
+            is_inverse=True,
+        )
+        entry_meta["size_multiplier"] = round(math_size_multiplier, 4)
+        logger.info(
+            "수학 admission 통과: %s (%s) leader_pct=%.4f entry_ev=%.2f queue=%s size_mul=%.4f",
+            quote.symbol,
+            decision.strategy_name,
+            float(entry_meta.get("leader_percentile", 0.0) or 0.0),
+            float(entry_meta.get("entry_ev", 0.0) or 0.0),
+            entry_meta.get("math_queue_source", "") or "none",
+            math_size_multiplier,
+        )
+        entry_reason = self._append_math_shadow_context(entry_reason, {"size_multiplier": entry_meta.get("size_multiplier", 1.0)})
 
         alloc = self._compute_buy_allocation(
             symbol=quote.symbol,
             current_price=quote.current_price,
             pending_orders=pending_orders,
+            per_stock_amount_multiplier=math_size_multiplier,
+            max_per_stock_amount_multiplier=math_size_multiplier,
         )
         quantity = alloc // quote.current_price
         if quantity <= 0:
@@ -5082,10 +5575,13 @@ class MomentumScalpStrategy(BaseStrategy):
                     "entry_grade_math": entry_meta.get("entry_grade_math", ""),
                     "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
                     "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
+                    "queue_source": entry_meta.get("math_queue_source", ""),
+                    "math_admission": entry_meta.get("math_admission", "passed"),
                     "bull_prob": float(entry_meta.get("bull_prob", 0.0)),
                     "neutral_prob": float(entry_meta.get("neutral_prob", 0.0)),
                     "soft_bear_prob": float(entry_meta.get("soft_bear_prob", 0.0)),
                     "bear_prob": float(entry_meta.get("bear_prob", 0.0)),
+                    "size_multiplier": float(entry_meta.get("size_multiplier", 1.0)),
                     "allowed": True,
                 }
             ],

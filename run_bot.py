@@ -270,6 +270,16 @@ def get_strategy():
         quote_tape_root=os.path.join(PROJECT_ROOT, "data", "intraday_tape"),
         ev_window_days=5,
         ev_min_samples=4,
+        math_queue_top_n=12,
+        math_queue_percentile_floor=0.80,
+        math_queue_backfill_slots=6,
+        math_gate_regime_margin=0.08,
+        math_gate_min_leader_percentile=0.80,
+        math_gate_positive_ev_required=True,
+        math_size_min_multiplier=0.70,
+        math_size_max_multiplier=1.50,
+        math_size_bull_a_max_multiplier=1.65,
+        math_ev_scale_krw=2500,
         bear_market_mode='A',             # 점수 2는 제한적 대응, 점수 3부터는 예외 통과형
         min_bear_score_for_new_long=2,
         bear_market_entry_score=4.0,      # 강한 약세장 예외 진입은 더 강한 모멘텀만 허용

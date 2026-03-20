@@ -262,4 +262,118 @@ class MathShadowTests(unittest.TestCase):
             strong_leader_count=3,
             strong_leader_avg_score=1.8,
         )
-        self.assertEqual(strategy._resolve_regime_profile_name(), "neutral")
+        self.assertEqual(strategy._resolve_regime_profile_name(), "bull")
+
+    def test_math_live_can_override_disabled_bull_strategy_gate(self):
+        cfg = MomentumScalpConfig(
+            enable_math_shadow_layer=True,
+            enable_math_live_layer=True,
+            quote_tape_enabled=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        quote = Quote(
+            symbol="AAA",
+            name="AAA",
+            current_price=12000,
+            change=1000,
+            change_rate=9.1,
+            open_price=11000,
+            high_price=12100,
+            low_price=10800,
+            volume=500000,
+            trade_amount=6_000_000_000,
+            timestamp=datetime(2026, 3, 19, 10, 30, 0),
+        )
+        strategy._quotes_cache[quote.symbol] = quote
+        strategy._recent_quotes[quote.symbol] = deque([quote], maxlen=8)
+        strategy._latest_math_leader_signals = build_leader_signals([quote], recent_quotes_by_symbol={quote.symbol: [quote]})
+        strategy._latest_regime_probabilities = compute_regime_probabilities(
+            index_gap_ma20_pct=2.5,
+            index_gap_ma5_pct=1.3,
+            avg_change=1.6,
+            decliner_ratio=0.30,
+            strong_leader_count=3,
+            strong_leader_avg_score=1.9,
+        )
+        allowed, meta = strategy._can_math_live_override_strategy_gate(
+            quote,
+            strategy_name="bull_breakout_strategy",
+            regime_label="neutral",
+            is_inverse=False,
+        )
+        self.assertTrue(allowed)
+        self.assertGreater(float(meta.get("bull_prob", 0.0)), 0.0)
+
+    def test_active_pool_quotes_prioritize_math_queue_before_legacy_pool_order(self):
+        cfg = MomentumScalpConfig(enable_math_shadow_layer=True, enable_math_live_layer=True, quote_tape_enabled=False)
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 3, 19, 10, 40, 0)
+        for symbol in ["AAA", "BBB", "CCC"]:
+            strategy._quotes_cache[symbol] = Quote(
+                symbol=symbol,
+                name=symbol,
+                current_price=10000,
+                change=100,
+                change_rate=1.0,
+                open_price=9900,
+                high_price=10100,
+                low_price=9800,
+                volume=100000,
+                trade_amount=1_000_000_000,
+                timestamp=now,
+            )
+        strategy._pool = ["CCC", "BBB", "AAA"]
+        strategy._latest_math_queue_symbols = ["AAA"]
+        strategy._latest_math_backfill_symbols = ["BBB"]
+        strategy._latest_legacy_backfill_symbols = ["CCC"]
+
+        ordered = [quote.symbol for quote in strategy._active_pool_quotes()]
+        self.assertEqual(ordered[:3], ["AAA", "BBB", "CCC"])
+
+    def test_math_size_multiplier_scales_with_leader_and_ev_and_caps_by_strategy(self):
+        cfg = MomentumScalpConfig(
+            enable_math_shadow_layer=True,
+            enable_math_live_layer=True,
+            quote_tape_enabled=False,
+            math_size_min_multiplier=0.70,
+            math_size_max_multiplier=1.50,
+            math_size_bull_a_max_multiplier=1.65,
+            math_ev_scale_krw=2500,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+
+        bull_multiplier = strategy._math_size_multiplier(
+            strategy_name="bull_breakout_strategy",
+            entry_meta={
+                "entry_grade": "A",
+                "leader_percentile": 0.98,
+                "entry_ev": 2500.0,
+                "entry_ev_closed_trades": 10,
+            },
+            is_inverse=False,
+        )
+        neutral_multiplier = strategy._math_size_multiplier(
+            strategy_name="neutral_pullback_strategy",
+            entry_meta={
+                "entry_grade": "B",
+                "leader_percentile": 0.85,
+                "entry_ev": 2000.0,
+                "entry_ev_closed_trades": 10,
+            },
+            is_inverse=False,
+        )
+        low_conf_multiplier = strategy._math_size_multiplier(
+            strategy_name="neutral_pullback_strategy",
+            entry_meta={
+                "entry_grade": "C",
+                "leader_percentile": 0.55,
+                "entry_ev": -1000.0,
+                "entry_ev_closed_trades": 2,
+            },
+            is_inverse=False,
+        )
+
+        self.assertGreater(bull_multiplier, neutral_multiplier)
+        self.assertLessEqual(bull_multiplier, 1.65)
+        self.assertLessEqual(neutral_multiplier, 1.10)
+        self.assertLessEqual(low_conf_multiplier, 1.0)

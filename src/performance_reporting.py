@@ -62,6 +62,7 @@ _SELL_NET_PNL_RE = re.compile(r"순손익:\s*([-\d,]+)원")
 _SELL_PNL_RE = re.compile(r"손익:\s*([-\d,]+)원")
 _RISK_STAGE_RE = re.compile(r"리스크 단계 전환:\s*([a-zA-Z0-9_]+)")
 _SHADOW_OUTCOME_RE = re.compile(r"outcome=([a-zA-Z0-9_]+)")
+_QUEUE_COUNT_RE = re.compile(r":\s*(\d+)개")
 
 
 def _parse_line_timestamp(raw_line: str) -> Optional[datetime]:
@@ -332,6 +333,9 @@ def analyze_trading_log(
     math_shadow_gate_counts: Dict[str, int] = defaultdict(int)
     math_shadow_reason_counts: Dict[str, int] = defaultdict(int)
     regime_shadow_disagreements: Dict[str, int] = defaultdict(int)
+    math_queue_counts: Dict[str, int] = defaultdict(int)
+    math_eval_reached_counts: Dict[str, int] = defaultdict(int)
+    math_admission_counts: Dict[str, int] = defaultdict(int)
     active_entries: Dict[str, Dict[str, str]] = {}
     daily_hard_stop_triggered = False
     daily_profit_target_triggered = False
@@ -364,6 +368,29 @@ def analyze_trading_log(
             discrete_regime = _extract_context_token(message, "discrete_regime", "unknown")
             shadow_regime = _extract_context_token(message, "shadow_regime", "unknown")
             regime_shadow_disagreements[f"{discrete_regime}->{shadow_regime}"] += 1
+        if message.startswith("math leader queue:"):
+            match = _QUEUE_COUNT_RE.search(message)
+            if match:
+                math_queue_counts["math_queue"] += _safe_int(match.group(1))
+        elif message.startswith("math backfill:"):
+            match = _QUEUE_COUNT_RE.search(message)
+            if match:
+                math_queue_counts["math_backfill"] += _safe_int(match.group(1))
+        elif message.startswith("legacy backfill:"):
+            match = _QUEUE_COUNT_RE.search(message)
+            if match:
+                math_queue_counts["legacy_backfill"] += _safe_int(match.group(1))
+        if message.startswith("수학 admission 통과:"):
+            queue_source = _extract_context_token(message, "queue", "unknown")
+            math_admission_counts["passed"] += 1
+            math_eval_reached_counts[queue_source or "unknown"] += 1
+        elif "진입 거부[" in message:
+            queue_source = _extract_context_token(message, "math_queue_source", "")
+            if queue_source:
+                math_eval_reached_counts[queue_source] += 1
+            reject_reason = reject_match.group(1) if reject_match else ""
+            if reject_reason.startswith("math_"):
+                math_admission_counts["blocked"] += 1
 
         setup_match = _SETUP_NAME_RE.search(message)
         entry_reason_match = _ENTRY_REASON_RE.search(message)
@@ -390,6 +417,9 @@ def analyze_trading_log(
                     "leader_pct": _extract_context_token(message, "leader_pct", "0"),
                     "entry_ev": _extract_context_token(message, "entry_ev", "0"),
                     "entry_ev_conf": _extract_context_token(message, "entry_ev_conf", "none"),
+                    "math_queue_source": _extract_context_token(message, "math_queue_source", ""),
+                    "math_dominant_profile": _extract_context_token(message, "math_dominant_profile", ""),
+                    "size_multiplier": _extract_context_token(message, "size_multiplier", "1"),
                     "bull_prob": _extract_context_token(message, "bull_prob", "0"),
                     "neutral_prob": _extract_context_token(message, "neutral_prob", "0"),
                     "soft_bear_prob": _extract_context_token(message, "soft_bear_prob", "0"),
@@ -454,6 +484,9 @@ def analyze_trading_log(
                     "leader_pct": _safe_float(entry_meta.get("leader_pct")),
                     "entry_ev": entry_ev,
                     "entry_ev_conf": entry_meta.get("entry_ev_conf") or "none",
+                    "math_queue_source": entry_meta.get("math_queue_source") or "",
+                    "math_dominant_profile": entry_meta.get("math_dominant_profile") or "",
+                    "size_multiplier": _safe_float(entry_meta.get("size_multiplier"), 1.0),
                     "bull_prob": _safe_float(entry_meta.get("bull_prob")),
                     "neutral_prob": _safe_float(entry_meta.get("neutral_prob")),
                     "soft_bear_prob": _safe_float(entry_meta.get("soft_bear_prob")),
@@ -553,6 +586,9 @@ def analyze_trading_log(
             "shadow_gate_counts": dict(sorted(math_shadow_gate_counts.items())),
             "shadow_reason_counts": dict(sorted(math_shadow_reason_counts.items())),
             "regime_shadow_disagreements": dict(sorted(regime_shadow_disagreements.items())),
+            "queue_counts": dict(sorted(math_queue_counts.items())),
+            "queue_eval_reached_counts": dict(sorted(math_eval_reached_counts.items())),
+            "admission_counts": dict(sorted(math_admission_counts.items())),
         },
         "symbols": {
             "net_pnl": dict(sorted(symbol_pnl.items())),
@@ -843,8 +879,17 @@ def evaluate_math_shadow_report(
     ev_rollup: Dict[str, Dict[str, float]] = defaultdict(
         lambda: {"closed_trades": 0, "net_pnl": 0.0}
     )
+    leader_percentile_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    regime_profile_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
     shadow_gate_counts: Dict[str, int] = defaultdict(int)
     regime_disagreements: Dict[str, int] = defaultdict(int)
+    queue_counts: Dict[str, int] = defaultdict(int)
+    queue_eval_reached_counts: Dict[str, int] = defaultdict(int)
+    admission_counts: Dict[str, int] = defaultdict(int)
     leader_hits: List[Dict[str, Any]] = []
 
     for card in window_cards:
@@ -862,6 +907,12 @@ def evaluate_math_shadow_report(
             shadow_gate_counts[key] += _safe_int(value)
         for key, value in (math_shadow.get("regime_shadow_disagreements") or {}).items():
             regime_disagreements[key] += _safe_int(value)
+        for key, value in (math_shadow.get("queue_counts") or {}).items():
+            queue_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("queue_eval_reached_counts") or {}).items():
+            queue_eval_reached_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("admission_counts") or {}).items():
+            admission_counts[key] += _safe_int(value)
         for record in (log_analysis.get("trade_records") or []):
             if _safe_float(record.get("leader_pct")) >= 0.95:
                 leader_hits.append(
@@ -875,6 +926,27 @@ def evaluate_math_shadow_report(
                         "net_pnl": _safe_int(record.get("net_pnl")),
                     }
                 )
+            leader_pct = _safe_float(record.get("leader_pct"))
+            if leader_pct >= 0.90:
+                pct_bucket = "0.90-1.00"
+            elif leader_pct >= 0.80:
+                pct_bucket = "0.80-0.89"
+            else:
+                pct_bucket = "<0.80"
+            leader_percentile_rollup[pct_bucket]["closed_trades"] += 1
+            leader_percentile_rollup[pct_bucket]["net_pnl"] += _safe_float(record.get("net_pnl"))
+
+            dominant_profile = str(record.get("math_dominant_profile") or "").strip()
+            if not dominant_profile:
+                probs = {
+                    "bull": _safe_float(record.get("bull_prob")),
+                    "neutral": _safe_float(record.get("neutral_prob")),
+                    "soft_bear": _safe_float(record.get("soft_bear_prob")),
+                    "bear": _safe_float(record.get("bear_prob")),
+                }
+                dominant_profile = sorted(probs.items(), key=lambda item: (item[1], item[0]), reverse=True)[0][0]
+            regime_profile_rollup[dominant_profile]["closed_trades"] += 1
+            regime_profile_rollup[dominant_profile]["net_pnl"] += _safe_float(record.get("net_pnl"))
 
     grade_summary = {
         grade: {
@@ -897,6 +969,26 @@ def evaluate_math_shadow_report(
         }
         for bucket, metrics in sorted(ev_rollup.items())
     }
+    leader_percentile_summary = {
+        bucket: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for bucket, metrics in sorted(leader_percentile_rollup.items())
+    }
+    regime_profile_summary = {
+        regime: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for regime, metrics in sorted(regime_profile_rollup.items())
+    }
     promotion_ready = any(
         metrics["closed_trades"] >= min_closed_trades and metrics["expectancy"] > 0
         for metrics in grade_summary.values()
@@ -904,6 +996,11 @@ def evaluate_math_shadow_report(
         metrics["closed_trades"] >= min_closed_trades and metrics["expectancy"] > 0
         for metrics in ev_summary.values()
     )
+    admission_total = _safe_int(admission_counts.get("passed")) + _safe_int(admission_counts.get("blocked"))
+    admission_pass_rate = round(
+        (_safe_int(admission_counts.get("passed")) / admission_total),
+        4,
+    ) if admission_total else 0.0
 
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -911,8 +1008,14 @@ def evaluate_math_shadow_report(
         "min_closed_trades": min_closed_trades,
         "grades": grade_summary,
         "ev_buckets": ev_summary,
+        "leader_percentile_buckets": leader_percentile_summary,
+        "dominant_regime_profiles": regime_profile_summary,
         "shadow_gate_counts": dict(sorted(shadow_gate_counts.items())),
         "regime_shadow_disagreements": dict(sorted(regime_disagreements.items())),
+        "queue_counts": dict(sorted(queue_counts.items())),
+        "queue_eval_reached_counts": dict(sorted(queue_eval_reached_counts.items())),
+        "admission_counts": dict(sorted(admission_counts.items())),
+        "admission_pass_rate": admission_pass_rate,
         "top_leader_trades": sorted(
             leader_hits,
             key=lambda item: (item.get("leader_pct", 0.0), item.get("net_pnl", 0)),
@@ -948,6 +1051,40 @@ def render_math_shadow_markdown(payload: Dict[str, Any]) -> str:
         for bucket, metrics in ev_buckets.items():
             lines.append(
                 f"- {bucket}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Math Queue"])
+    queue_counts = payload.get("queue_counts", {})
+    queue_eval_reached = payload.get("queue_eval_reached_counts", {})
+    admission_counts = payload.get("admission_counts", {})
+    if queue_counts:
+        for key, value in queue_counts.items():
+            reached = _safe_int(queue_eval_reached.get(key))
+            lines.append(f"- {key}: 큐 {_safe_int(value)}건 / 실제 평가 도달 {reached}건")
+    else:
+        lines.append("- 집계 없음")
+    lines.append(
+        f"- admission 통과율: {_safe_float(payload.get('admission_pass_rate')) * 100:.2f}% "
+        f"(통과 {_safe_int(admission_counts.get('passed'))}건 / 차단 {_safe_int(admission_counts.get('blocked'))}건)"
+    )
+    lines.extend(["", "## Leader Percentile Buckets"])
+    leader_pct_buckets = payload.get("leader_percentile_buckets", {})
+    if leader_pct_buckets:
+        for bucket, metrics in leader_pct_buckets.items():
+            lines.append(
+                f"- {bucket}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Dominant Regime Profiles"])
+    regime_profiles = payload.get("dominant_regime_profiles", {})
+    if regime_profiles:
+        for regime, metrics in regime_profiles.items():
+            lines.append(
+                f"- {regime}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
                 f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
             )
     else:

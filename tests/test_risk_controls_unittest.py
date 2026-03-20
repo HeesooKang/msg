@@ -711,6 +711,8 @@ class RiskControlTests(unittest.TestCase):
             neutral_leader_top_n=2,
             neutral_leader_relative_strength_pp=0.0,
             neutral_pullback_min_ticks=1,
+            enable_math_shadow_layer=False,
+            enable_math_live_layer=False,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
         strategy._bear_score = 1
@@ -744,6 +746,8 @@ class RiskControlTests(unittest.TestCase):
             enable_expected_net_filter=False,
             enable_pool_persistence_gate=False,
             enable_entry_confirmation=False,
+            enable_math_shadow_layer=False,
+            enable_math_live_layer=False,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
         strategy._bear_score = 1
@@ -1196,6 +1200,8 @@ class RiskControlTests(unittest.TestCase):
             enable_expected_net_filter=False,
             enable_pool_persistence_gate=False,
             enable_backtest_score_entry_fallback=False,
+            enable_math_shadow_layer=False,
+            enable_math_live_layer=False,
             bullish_min_momentum_score=3.0,
             bullish_min_momentum_score_floor=3.0,
             bull_breakout_hold_ticks=2,
@@ -1371,6 +1377,8 @@ class RiskControlTests(unittest.TestCase):
             enable_expected_net_filter=False,
             enable_pool_persistence_gate=False,
             enable_backtest_score_entry_fallback=False,
+            enable_math_shadow_layer=False,
+            enable_math_live_layer=False,
             bullish_min_momentum_score=3.0,
             bullish_min_momentum_score_floor=3.0,
             bull_breakout_hold_ticks=2,
@@ -1443,6 +1451,8 @@ class RiskControlTests(unittest.TestCase):
             enable_expected_net_filter=False,
             enable_pool_persistence_gate=False,
             enable_backtest_score_entry_fallback=False,
+            enable_math_shadow_layer=False,
+            enable_math_live_layer=False,
             bullish_min_momentum_score=3.0,
             bullish_min_momentum_score_floor=3.0,
             bull_breakout_hold_ticks=2,
@@ -2373,6 +2383,8 @@ class RiskControlTests(unittest.TestCase):
             enable_pool_persistence_gate=False,
             soft_bear_inverse_min_change_rate=0.0,
             soft_bear_inverse_min_momentum=0.0,
+            enable_math_shadow_layer=False,
+            enable_math_live_layer=False,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
         now = datetime(2026, 3, 16, 10, 0)
@@ -2442,6 +2454,8 @@ class RiskControlTests(unittest.TestCase):
             inverse_min_momentum=0.0,
             inverse_min_bear_score=2,
             bearish_threshold=2,
+            enable_math_shadow_layer=False,
+            enable_math_live_layer=False,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
         strategy._bear_score = 3

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from src.performance_reporting import (
     build_daily_scorecard,
+    evaluate_math_shadow_report,
     evaluate_strategy_gates,
     evaluate_real_trading_readiness,
     update_performance_reports,
@@ -231,6 +232,48 @@ class PerformanceReportingTests(unittest.TestCase):
         self.assertEqual(strategy_gate["closed_trades"], 4)
         self.assertAlmostEqual(strategy_gate["expectancy"], -350.0)
         self.assertIn("10", strategy_gate["hour_bucket_expectancy"])
+
+    def test_evaluate_math_shadow_report_summarizes_queue_and_admission_metrics(self):
+        payload = evaluate_math_shadow_report(
+            [
+                {
+                    "date": "2026-03-19",
+                    "log_analysis": {
+                        "trade_records": [
+                            {
+                                "symbol": "263750",
+                                "strategy_name": "bull_breakout_strategy",
+                                "entry_grade_math": "A",
+                                "leader_pct": 0.96,
+                                "entry_ev": 850.0,
+                                "net_pnl": 2100,
+                                "bull_prob": 0.72,
+                                "neutral_prob": 0.18,
+                                "soft_bear_prob": 0.07,
+                                "bear_prob": 0.03,
+                                "math_dominant_profile": "bull",
+                            }
+                        ],
+                        "math_shadow": {
+                            "entries_by_grade": {"A": 1},
+                            "grade_pnl": {"A": {"closed_trades": 1, "net_pnl": 2100}},
+                            "ev_buckets": {"positive": {"closed_trades": 1, "net_pnl": 2100}},
+                            "queue_counts": {"math_queue": 12},
+                            "queue_eval_reached_counts": {"math_queue": 4},
+                            "admission_counts": {"passed": 2, "blocked": 1},
+                        },
+                    },
+                }
+            ],
+            window_days=5,
+            min_closed_trades=1,
+        )
+
+        self.assertEqual(payload["queue_counts"]["math_queue"], 12)
+        self.assertEqual(payload["queue_eval_reached_counts"]["math_queue"], 4)
+        self.assertAlmostEqual(payload["admission_pass_rate"], 2 / 3, places=4)
+        self.assertIn("0.90-1.00", payload["leader_percentile_buckets"])
+        self.assertIn("bull", payload["dominant_regime_profiles"])
 
     def test_readiness_passes_when_sample_profit_factor_and_expectancy_are_good(self):
         scorecards = []
