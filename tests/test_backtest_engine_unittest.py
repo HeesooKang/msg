@@ -46,9 +46,9 @@ class DummyBacktestStrategy(BaseStrategy):
         if result.side == OrderSide.BUY:
             self.has_position = True
             self.positions[result.symbol] = SimpleNamespace(
-                entry_strategy_name="bull_breakout_strategy",
-                entry_setup_name="bull_breakout",
-                entry_reason="local_high_breakout",
+                entry_strategy_name="opening_conviction_long_strategy",
+                entry_setup_name="opening_conviction",
+                entry_reason="opening_conviction",
                 regime_label="bull",
                 bear_score=0,
                 planned_risk_stage="normal",
@@ -102,9 +102,9 @@ class PartialExitBacktestStrategy(BaseStrategy):
         if result.side == OrderSide.BUY:
             self.positions[result.symbol] = SimpleNamespace(
                 quantity=result.quantity,
-                entry_strategy_name="bull_breakout_strategy",
-                entry_setup_name="bull_breakout",
-                entry_reason="local_high_breakout",
+                entry_strategy_name="opening_conviction_long_strategy",
+                entry_setup_name="opening_conviction",
+                entry_reason="opening_conviction",
                 regime_label="bull",
                 bear_score=0,
                 planned_risk_stage="normal",
@@ -151,8 +151,8 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertEqual(len(result.daily_records), 1)
         self.assertEqual(result.daily_records[0].trade_count, 2)
         self.assertEqual([record.date for record in result.trade_records], ["20260102", "20260102"])
-        self.assertEqual(result.trade_records[0].strategy_name, "bull_breakout_strategy")
-        self.assertEqual(result.trade_records[0].setup_name, "bull_breakout")
+        self.assertEqual(result.trade_records[0].strategy_name, "opening_conviction_long_strategy")
+        self.assertEqual(result.trade_records[0].setup_name, "opening_conviction")
         self.assertEqual(result.trade_records[1].regime_label, "bull")
         self.assertTrue(strategy.simulated_times)
         self.assertEqual(strategy.simulated_times[0].strftime("%Y%m%d"), "20260102")

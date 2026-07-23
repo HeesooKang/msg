@@ -111,6 +111,33 @@ class NotificationTests(unittest.TestCase):
         self.assertFalse(ok)
         mock_post.assert_not_called()
 
+    def test_invalid_kakao_refresh_token_disables_repeated_refresh_attempts(self):
+        cfg = AlertConfig(
+            enabled=True,
+            channel="kakao",
+            kakao_rest_api_key="rest-key",
+            kakao_client_secret="client-secret",
+            kakao_refresh_token="expired-refresh-token",
+            kakao_message_web_url="https://example.com",
+            min_interval_seconds=0,
+        )
+        mgr = AlertManager(cfg=cfg)
+
+        with patch(
+            "src.notifications.requests.post",
+            return_value=DummyResp(
+                400,
+                text='{"error":"invalid_grant","error_description":"expired_or_invalid_refresh_token","error_code":"KOE322"}',
+            ),
+        ) as mock_post:
+            first = mgr.send(event_key="k1", title="t1", message="m1")
+            second = mgr.send(event_key="k2", title="t2", message="m2")
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mgr._kakao_auth_disabled_reason, "invalid_refresh_token")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,9 +12,10 @@ class DummyResponse:
 
 
 class DummyClient:
-    def __init__(self, response):
+    def __init__(self, response, *, is_paper=False):
         self.response = response
         self.last_get_kwargs = None
+        self.config = type("Cfg", (), {"is_paper": is_paper})()
 
     def get(self, **kwargs):
         self.last_get_kwargs = kwargs
@@ -70,6 +71,21 @@ class AccountRealizedPnLTests(unittest.TestCase):
         pnl = account.get_realized_profit_loss()
 
         self.assertIsNone(pnl)
+
+    def test_get_realized_profit_loss_skips_api_in_paper_mode(self):
+        client = DummyClient(
+            DummyResponse(
+                success=True,
+                output2=[{"rlzt_pfls": "1,000"}],
+            ),
+            is_paper=True,
+        )
+        account = AccountAPI(client)
+
+        pnl = account.get_realized_profit_loss()
+
+        self.assertIsNone(pnl)
+        self.assertIsNone(client.last_get_kwargs)
 
 
 if __name__ == "__main__":

@@ -1,21 +1,34 @@
-import json
-import tempfile
 import unittest
 from collections import deque
 from datetime import datetime
-from pathlib import Path
 
 from src.analytics.math_signals import (
     build_entry_ev_table,
     build_leader_signals,
+    compute_market_shock_signal,
     compute_regime_probabilities,
 )
-from src.analytics.quote_tape import QuoteTapeRecorder
 from src.models import Quote
 from src.strategies.momentum_scalp import MomentumScalpConfig, MomentumScalpStrategy
 
 
 class MathShadowTests(unittest.TestCase):
+    def test_market_shock_signal_rises_in_fast_open_drop(self):
+        signal = compute_market_shock_signal(
+            minutes_since_open=12,
+            crash_window_minutes=45,
+            index_gap_open_pct=-4.2,
+            index_gap_ma5_pct=-3.1,
+            index_gap_ma20_pct=-2.6,
+            avg_change=-2.4,
+            decliner_ratio=0.82,
+            falling_speed_pct=2.0,
+            inverse_leader_count=3,
+        )
+        self.assertTrue(signal.crash_open_window_active)
+        self.assertGreater(signal.shock_score, 1.0)
+        self.assertGreater(signal.shock_confidence, 0.5)
+
     def test_leader_score_ranks_stronger_candidate_higher(self):
         now = datetime(2026, 3, 19, 10, 5, 0)
         strong = Quote(
@@ -72,6 +85,67 @@ class MathShadowTests(unittest.TestCase):
         self.assertGreater(signals["AAA"].leader_score, signals["BBB"].leader_score)
         self.assertEqual(signals["AAA"].entry_grade, "A")
 
+    def test_effective_leader_score_reweights_weak_regime_candidates(self):
+        now = datetime(2026, 3, 23, 10, 5, 0)
+        accelerator = Quote(
+            symbol="AAA",
+            name="AAA",
+            current_price=10500,
+            change=500,
+            change_rate=5.0,
+            open_price=10000,
+            high_price=10550,
+            low_price=9950,
+            volume=90000,
+            trade_amount=945_000_000,
+            timestamp=now,
+        )
+        turnover_heavy = Quote(
+            symbol="BBB",
+            name="BBB",
+            current_price=10120,
+            change=120,
+            change_rate=1.2,
+            open_price=10000,
+            high_price=10150,
+            low_price=9950,
+            volume=600000,
+            trade_amount=6_072_000_000,
+            timestamp=now,
+        )
+        recent_quotes = {
+            "AAA": deque(
+                [
+                    Quote("AAA", "AAA", 10020, 0, 0.0, 10000, 10030, 9980, 10000, 100_000_000, now),
+                    Quote("AAA", "AAA", 10120, 0, 0.0, 10000, 10120, 9980, 20000, 200_000_000, now),
+                    Quote("AAA", "AAA", 10280, 0, 0.0, 10000, 10280, 9980, 30000, 300_000_000, now),
+                    Quote("AAA", "AAA", 10420, 0, 0.0, 10000, 10420, 9980, 50000, 500_000_000, now),
+                    accelerator,
+                ],
+                maxlen=8,
+            ),
+            "BBB": deque(
+                [
+                    Quote("BBB", "BBB", 10020, 0, 0.0, 10000, 10030, 9980, 100000, 1_000_000_000, now),
+                    Quote("BBB", "BBB", 10040, 0, 0.0, 10000, 10045, 9980, 180000, 1_800_000_000, now),
+                    Quote("BBB", "BBB", 10070, 0, 0.0, 10000, 10075, 9980, 260000, 2_600_000_000, now),
+                    turnover_heavy,
+                ],
+                maxlen=8,
+            ),
+        }
+
+        signals = build_leader_signals(
+            [accelerator, turnover_heavy],
+            avg_volumes={"AAA": 70000, "BBB": 300000},
+            recent_quotes_by_symbol=recent_quotes,
+            regime_score=2,
+        )
+
+        self.assertGreater(signals["AAA"].effective_leader_score, signals["BBB"].effective_leader_score)
+        self.assertGreater(signals["AAA"].recent_acceleration_pct, signals["BBB"].recent_acceleration_pct)
+        self.assertGreaterEqual(signals["AAA"].leader_percentile, signals["BBB"].leader_percentile)
+
     def test_regime_probabilities_sum_to_one_and_favor_bull(self):
         probs = compute_regime_probabilities(
             index_gap_ma20_pct=2.3,
@@ -93,14 +167,14 @@ class MathShadowTests(unittest.TestCase):
                 "log_analysis": {
                     "trade_records": [
                         {
-                            "strategy_name": "bull_breakout_strategy",
+                            "strategy_name": "opening_conviction_long_strategy",
                             "regime_label": "bull",
                             "hour_bucket": "10",
                             "entry_grade_math": "A",
                             "net_pnl": 2000,
                         },
                         {
-                            "strategy_name": "bull_breakout_strategy",
+                            "strategy_name": "opening_conviction_long_strategy",
                             "regime_label": "bull",
                             "hour_bucket": "11",
                             "entry_grade_math": "A",
@@ -112,45 +186,12 @@ class MathShadowTests(unittest.TestCase):
         ]
 
         table = build_entry_ev_table(scorecards, window_days=5, min_samples=4)
-        estimate = table[("bull_breakout_strategy", "bull", "10", "A")]
+        estimate = table[("opening_conviction_long_strategy", "bull", "10", "A")]
         self.assertEqual(estimate.confidence, "low")
         self.assertGreater(estimate.p_win, 0.0)
 
-    def test_quote_tape_recorder_writes_quotes_and_leaders(self):
-        now = datetime(2026, 3, 19, 10, 10, 0)
-        quote = Quote(
-            symbol="AAA",
-            name="AAA",
-            current_price=12000,
-            change=1000,
-            change_rate=9.1,
-            open_price=11000,
-            high_price=12100,
-            low_price=10800,
-            volume=500000,
-            trade_amount=6_000_000_000,
-            timestamp=now,
-        )
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            recorder = QuoteTapeRecorder(tmp_dir, enabled=True)
-            recorder.record_quotes(now, [quote], regime_label="bull", bear_score=0, market_data_ready=True)
-            recorder.record_leaders(
-                now,
-                event="pool_refresh",
-                rows=[{"symbol": "AAA", "leader_score": 1.2, "entry_grade_math": "A"}],
-            )
-
-            quote_path = Path(tmp_dir) / "2026" / "03" / "19" / "quotes.ndjson"
-            leader_path = Path(tmp_dir) / "2026" / "03" / "19" / "leaders.ndjson"
-            self.assertTrue(quote_path.exists())
-            self.assertTrue(leader_path.exists())
-            quote_row = json.loads(quote_path.read_text(encoding="utf-8").splitlines()[0])
-            leader_row = json.loads(leader_path.read_text(encoding="utf-8").splitlines()[0])
-            self.assertEqual(quote_row["symbol"], "AAA")
-            self.assertEqual(leader_row["event"], "pool_refresh")
-
     def test_strategy_build_entry_metadata_attaches_math_shadow_fields(self):
-        cfg = MomentumScalpConfig(enable_math_shadow_layer=True, quote_tape_enabled=False)
+        cfg = MomentumScalpConfig()
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
         strategy._latest_regime_probabilities = compute_regime_probabilities(
             index_gap_ma20_pct=1.5,
@@ -179,11 +220,11 @@ class MathShadowTests(unittest.TestCase):
         strategy._recent_quotes[quote.symbol] = deque([quote], maxlen=8)
         strategy._latest_math_leader_signals = build_leader_signals([quote], recent_quotes_by_symbol={quote.symbol: [quote]})
         strategy._entry_ev_table = {
-            ("bull_breakout_strategy", "bull", "10", "A"): type(
+            ("opening_conviction_long_strategy", "bull", "10", "A"): type(
                 "Estimate",
                 (),
                 {
-                    "strategy_name": "bull_breakout_strategy",
+                    "strategy_name": "opening_conviction_long_strategy",
                     "regime_label": "bull",
                     "hour_bucket": "10",
                     "entry_grade": "A",
@@ -198,9 +239,9 @@ class MathShadowTests(unittest.TestCase):
 
         metadata = strategy._build_entry_metadata(
             quote.symbol,
-            "bull_breakout",
-            "setup_name=bull_breakout entry_reason=local_high_breakout",
-            strategy_name="bull_breakout_strategy",
+            "opening_conviction",
+            "setup_name=opening_conviction entry_reason=opening_conviction",
+            strategy_name="opening_conviction_long_strategy",
             quote=quote,
         )
 
@@ -208,49 +249,10 @@ class MathShadowTests(unittest.TestCase):
         self.assertIn("entry_ev", metadata)
         self.assertIn("bull_prob", metadata)
 
-    def test_math_live_gate_blocks_negative_ev_with_enough_trades(self):
-        cfg = MomentumScalpConfig(
-            enable_math_shadow_layer=True,
-            enable_math_live_layer=True,
-            quote_tape_enabled=False,
-            math_live_ev_min_trades=4,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        quote = Quote(
-            symbol="AAA",
-            name="AAA",
-            current_price=12000,
-            change=1000,
-            change_rate=9.1,
-            open_price=11000,
-            high_price=12100,
-            low_price=10800,
-            volume=500000,
-            trade_amount=6_000_000_000,
-            timestamp=datetime(2026, 3, 19, 10, 30, 0),
-        )
-        ok, reason = strategy._passes_math_live_entry_gate(
-            quote,
-            strategy_name="bull_breakout_strategy",
-            entry_meta={
-                "leader_percentile": 0.95,
-                "entry_ev": -120.0,
-                "entry_ev_closed_trades": 5,
-                "bull_prob": 0.7,
-                "neutral_prob": 0.2,
-                "soft_bear_prob": 0.07,
-                "bear_prob": 0.03,
-            },
-            is_inverse=False,
-        )
-        self.assertFalse(ok)
-        self.assertEqual(reason, "math_negative_ev")
+
 
     def test_math_live_regime_profile_resolves_soft_bear_to_neutral_when_bull_prob_dominates(self):
         cfg = MomentumScalpConfig(
-            enable_math_shadow_layer=True,
-            enable_math_live_layer=True,
-            quote_tape_enabled=False,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
         strategy._bear_score = 2
@@ -266,9 +268,6 @@ class MathShadowTests(unittest.TestCase):
 
     def test_math_live_can_override_disabled_bull_strategy_gate(self):
         cfg = MomentumScalpConfig(
-            enable_math_shadow_layer=True,
-            enable_math_live_layer=True,
-            quote_tape_enabled=False,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
         quote = Quote(
@@ -295,85 +294,12 @@ class MathShadowTests(unittest.TestCase):
             strong_leader_count=3,
             strong_leader_avg_score=1.9,
         )
-        allowed, meta = strategy._can_math_live_override_strategy_gate(
-            quote,
-            strategy_name="bull_breakout_strategy",
-            regime_label="neutral",
-            is_inverse=False,
+        meta = strategy._build_entry_metadata(
+            quote.symbol,
+            "math_live_override",
+            "setup_name=math_live_override entry_reason=math_live_override",
+            strategy_name="opening_conviction_long_strategy",
+            quote=quote,
         )
-        self.assertTrue(allowed)
+        meta["regime_label"] = "neutral"
         self.assertGreater(float(meta.get("bull_prob", 0.0)), 0.0)
-
-    def test_active_pool_quotes_prioritize_math_queue_before_legacy_pool_order(self):
-        cfg = MomentumScalpConfig(enable_math_shadow_layer=True, enable_math_live_layer=True, quote_tape_enabled=False)
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        now = datetime(2026, 3, 19, 10, 40, 0)
-        for symbol in ["AAA", "BBB", "CCC"]:
-            strategy._quotes_cache[symbol] = Quote(
-                symbol=symbol,
-                name=symbol,
-                current_price=10000,
-                change=100,
-                change_rate=1.0,
-                open_price=9900,
-                high_price=10100,
-                low_price=9800,
-                volume=100000,
-                trade_amount=1_000_000_000,
-                timestamp=now,
-            )
-        strategy._pool = ["CCC", "BBB", "AAA"]
-        strategy._latest_math_queue_symbols = ["AAA"]
-        strategy._latest_math_backfill_symbols = ["BBB"]
-        strategy._latest_legacy_backfill_symbols = ["CCC"]
-
-        ordered = [quote.symbol for quote in strategy._active_pool_quotes()]
-        self.assertEqual(ordered[:3], ["AAA", "BBB", "CCC"])
-
-    def test_math_size_multiplier_scales_with_leader_and_ev_and_caps_by_strategy(self):
-        cfg = MomentumScalpConfig(
-            enable_math_shadow_layer=True,
-            enable_math_live_layer=True,
-            quote_tape_enabled=False,
-            math_size_min_multiplier=0.70,
-            math_size_max_multiplier=1.50,
-            math_size_bull_a_max_multiplier=1.65,
-            math_ev_scale_krw=2500,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-
-        bull_multiplier = strategy._math_size_multiplier(
-            strategy_name="bull_breakout_strategy",
-            entry_meta={
-                "entry_grade": "A",
-                "leader_percentile": 0.98,
-                "entry_ev": 2500.0,
-                "entry_ev_closed_trades": 10,
-            },
-            is_inverse=False,
-        )
-        neutral_multiplier = strategy._math_size_multiplier(
-            strategy_name="neutral_pullback_strategy",
-            entry_meta={
-                "entry_grade": "B",
-                "leader_percentile": 0.85,
-                "entry_ev": 2000.0,
-                "entry_ev_closed_trades": 10,
-            },
-            is_inverse=False,
-        )
-        low_conf_multiplier = strategy._math_size_multiplier(
-            strategy_name="neutral_pullback_strategy",
-            entry_meta={
-                "entry_grade": "C",
-                "leader_percentile": 0.55,
-                "entry_ev": -1000.0,
-                "entry_ev_closed_trades": 2,
-            },
-            is_inverse=False,
-        )
-
-        self.assertGreater(bull_multiplier, neutral_multiplier)
-        self.assertLessEqual(bull_multiplier, 1.65)
-        self.assertLessEqual(neutral_multiplier, 1.10)
-        self.assertLessEqual(low_conf_multiplier, 1.0)

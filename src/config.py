@@ -27,6 +27,8 @@ class Config:
 
     # 레이트 리미팅
     rate_limit_interval: float  # 초
+    request_connect_timeout: float
+    request_read_timeout: float
 
     # 로깅
     log_level: str
@@ -64,6 +66,8 @@ class Config:
         account_product_code = os.getenv("ACCOUNT_PRODUCT_CODE", "01").strip()
         hts_id = os.getenv("HTS_ID", "").strip()
         log_level = os.getenv("LOG_LEVEL", "INFO")
+        request_connect_timeout = float(os.getenv("REQUEST_CONNECT_TIMEOUT_SECONDS", "3.05"))
+        request_read_timeout = float(os.getenv("REQUEST_READ_TIMEOUT_SECONDS", "10"))
         off_hours_check_interval = int(os.getenv("OFF_HOURS_CHECK_INTERVAL_SECONDS", "1800"))
 
         config = cls(
@@ -77,6 +81,8 @@ class Config:
             base_url=base_url,
             ws_url=ws_url,
             rate_limit_interval=rate_limit_interval,
+            request_connect_timeout=max(0.5, request_connect_timeout),
+            request_read_timeout=max(1.0, request_read_timeout),
             log_level=log_level,
             off_hours_check_interval=max(60, off_hours_check_interval),
         )

@@ -42,6 +42,12 @@ class Order:
     order_type: OrderType = OrderType.MARKET
     quantity: int = 0
     price: int = 0  # 시장가일 때 0
+    reference_price: int = 0  # 시장가 주문 로그/보정용 기준 시세
+    protective_exit_mode: str = ""
+    protective_limit_price: int = 0
+    protective_fallback_polls: int = 0
+    stop_reference_amount_krw: int = 0
+    requested_reason: str = ""
 
 
 @dataclass
@@ -49,11 +55,21 @@ class OrderResult:
     success: bool
     order_no: str = ""
     message: str = ""
+    error_code: str = ""
+    error_category: str = ""
     symbol: str = ""
     side: Optional[OrderSide] = None
     quantity: int = 0
     price: int = 0
+    requested_price: int = 0
+    reference_price: int = 0
+    fill_mode: str = ""
+    protective_exit_mode: str = ""
+    protective_fallback_used: bool = False
+    stop_reference_amount_krw: int = 0
+    requested_reason: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
+    requested_quantity: int = 0
 
 
 @dataclass

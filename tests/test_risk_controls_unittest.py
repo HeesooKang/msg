@@ -1,2562 +1,4075 @@
 import unittest
 from collections import deque
 from datetime import datetime, timedelta
-from unittest.mock import Mock, patch
+import json
+import os
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
-from src.api_client import KISClient
-from src.config import Config
-from src.market_data import MarketDataAPI
-from src.models import OrderResult, OrderSide, Position, Quote, RankingItem
+
+from src.analytics.price_prediction import ShortHorizonPrediction
+from src.analytics.math_signals import (
+    ExpectedValueEstimate,
+    LeaderSignal,
+)
+from src.models import Order, OrderResult, OrderSide, Quote
 from src.strategies.momentum_scalp import (
+    ExpectedValueCandidate,
+    ExpectedValueTradePlan,
+    INTRADAY_STRATEGY,
+    OPENING_STRATEGY,
     MomentumScalpConfig,
     MomentumScalpStrategy,
-    PositionState,
 )
-
-
-class DummyTokenManager:
-    def get_token(self):
-        return "dummy-token"
-
-
-class DummyResponse:
-    def __init__(self, success, error_code="", error_message="", output=None):
-        self.success = success
-        self.error_code = error_code
-        self.error_message = error_message
-        self.output = output
-
-
-class DummyClient:
-    def __init__(self, response):
-        self.response = response
-        self.calls = 0
-
-    def get(self, **kwargs):
-        self.calls += 1
-        return self.response
-
-
-class DummyRankingMarketData:
-    def __init__(self, items):
-        self.items = items
-
-    def get_fluctuation_ranking(self, **kwargs):
-        return list(self.items)
+from src.strategies.momentum_scalp_micro import symbol_micro_edge_metrics
+from src.strategies.momentum_scalp_pnl import calculate_trade_pnl_from_prices
+from src.strategies.momentum_scalp_types import PositionState
 
 
 class RiskControlTests(unittest.TestCase):
-    def test_market_open_opsq_warn_once_and_cache(self):
-        client = DummyClient(
-            DummyResponse(
-                success=False,
-                error_code="OPSQ0002",
-                error_message="Service code does not exist",
-            )
-        )
-        market = MarketDataAPI(client)
-        date = "20260213"  # Friday
-
-        with patch("src.market_data.logger.warning") as mock_warn:
-            first = market.is_market_open(date)
-            second = market.is_market_open(date)
-
-        self.assertTrue(first)
-        self.assertTrue(second)
-        self.assertEqual(client.calls, 1)
-        self.assertEqual(mock_warn.call_count, 1)
-
-    def test_momentum_allocation_respects_total_and_stock_caps(self):
-        cfg = MomentumScalpConfig(
-            seed_money=1_000_000,
-            per_stock_amount=200_000,
-            max_per_stock_amount=400_000,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.positions["AAA"] = PositionState(symbol="AAA", buy_price=10_000, quantity=30)  # 300,000
-        strategy.positions["BBB"] = PositionState(symbol="BBB", buy_price=13_000, quantity=50)  # 650,000
-
-        alloc = strategy._compute_buy_allocation("AAA", current_price=10_000)
-        # total_room=50,000, stock_room=100,000 -> alloc=50,000
-        self.assertEqual(alloc, 50_000)
-
-    def test_momentum_allocation_uses_regime_budget_ratios(self):
-        cfg = MomentumScalpConfig(
-            seed_money=1_000_000,
-            max_position_count=2,
-            bull_max_position_count=2,
-            neutral_max_position_count=1,
-            per_stock_amount=220_000,
-            max_per_stock_amount=500_000,
-            capital_utilization_pct=0.60,
-            bull_capital_utilization_pct=0.84,
-            neutral_capital_utilization_pct=0.68,
-            max_single_position_pct=0.50,
-            bull_max_single_position_pct=0.42,
-            neutral_max_single_position_pct=0.36,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-
-        strategy._bear_score = 0
-        bull_alloc = strategy._compute_buy_allocation("AAA", current_price=10_000)
-        self.assertEqual(bull_alloc, 420_000)
-
-        strategy._bear_score = 1
-        neutral_alloc = strategy._compute_buy_allocation("BBB", current_price=10_000)
-        self.assertEqual(neutral_alloc, 360_000)
-
-    def test_momentum_allocation_compounds_realized_pnl_intraday(self):
-        cfg = MomentumScalpConfig(
-            seed_money=1_000_000,
-            max_position_count=2,
-            per_stock_amount=200_000,
-            max_per_stock_amount=500_000,
-            capital_utilization_pct=0.60,
-            max_single_position_pct=0.50,
-            profit_protect_threshold=999_999,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.daily_pnl.realized_net_pnl = 100_000
-
-        alloc = strategy._compute_buy_allocation("AAA", current_price=10_000)
-        self.assertEqual(alloc, 330_000)
-
-    def test_momentum_allocation_allows_expensive_single_share_for_bull_a_grade(self):
-        cfg = MomentumScalpConfig(
-            seed_money=1_000_000,
-            per_stock_amount=200_000,
-            max_per_stock_amount=350_000,
-            bull_max_single_position_pct=0.25,
-            allow_expensive_single_share_override=True,
-            expensive_single_share_min_price=120_000,
-            expensive_single_share_cap_multiplier=1.5,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-
-        blocked = strategy._compute_buy_allocation("AAA", current_price=320_000)
-        allowed = strategy._compute_buy_allocation(
-            "AAA",
-            current_price=320_000,
-            allow_expensive_single_share_override=True,
-        )
-
-        self.assertEqual(blocked, 0)
-        self.assertEqual(allowed, 320_000)
-
-    def test_momentum_allocation_supports_priority_bull_concentration(self):
-        cfg = MomentumScalpConfig(
-            seed_money=1_000_000,
-            max_position_count=2,
-            bull_max_position_count=2,
-            per_stock_amount=200_000,
-            max_per_stock_amount=350_000,
-            capital_utilization_pct=0.70,
-            bull_max_single_position_pct=0.35,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-
-        base_alloc = strategy._compute_buy_allocation("AAA", current_price=60_000)
-        priority_alloc = strategy._compute_buy_allocation(
-            "AAA",
-            current_price=60_000,
-            per_stock_amount_multiplier=3.0,
-            max_per_stock_amount_multiplier=3.0,
-            max_single_position_pct_override=0.65,
-            side_slot_override=1,
-        )
-
-        self.assertEqual(base_alloc, 350_000)
-        self.assertEqual(priority_alloc, 650_000)
-        self.assertGreater(priority_alloc, base_alloc)
-
-    def test_api_client_keeps_ctca_tr_id_in_paper(self):
-        config = Config(
-            trading_mode="paper",
-            is_paper=True,
-            api_key="k",
-            api_secret="s",
-            account_number="12345678",
-            account_product_code="01",
-            hts_id="id",
-            base_url="https://example.com",
-            ws_url="ws://example.com",
-            rate_limit_interval=0.5,
-            log_level="INFO",
-        )
-        client = KISClient(config, DummyTokenManager())
-
-        holiday_headers = client._build_headers("CTCA0903R")
-        order_headers = client._build_headers("TTTC0012U")
-
-        self.assertEqual(holiday_headers["tr_id"], "CTCA0903R")
-        self.assertEqual(order_headers["tr_id"], "VTTC0012U")
-
-    def test_momentum_daily_hard_stop_uses_net_realized_pnl(self):
-        cfg = MomentumScalpConfig(
-            daily_profit_target=20_000,
-            daily_loss_limit=-5_000,
-            commission_rate=0.00015,
-            tax_slippage_rate=0.002,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.initialize()
-
-        strategy.on_order_filled(
-            OrderResult(
-                success=True,
-                symbol="005930",
-                side=OrderSide.BUY,
-                quantity=10,
-                price=10_000,
-            )
-        )
-        strategy.on_order_filled(
-            OrderResult(
-                success=True,
-                symbol="005930",
-                side=OrderSide.SELL,
-                quantity=10,
-                price=12_000,
-            )
-        )
-
-        # gross: +20,000 / net: +19,727 (매수수수료15 + 매도수수료18 + 세금/슬리피지240 차감)
-        self.assertEqual(strategy.daily_pnl.realized_gross_pnl, 20_000)
-        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 19_727)
-
-        # 순손익 기준이므로 목표(+20,000) 미달 상태
-        strategy.on_batch_tick([])
-        self.assertFalse(strategy._halted)
-
-    def test_momentum_sell_failure_keeps_position(self):
-        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=3,
-            invested_amount=30_000,
-        )
-
-        strategy.on_order_filled(
-            OrderResult(
-                success=False,
-                symbol="005930",
-                side=OrderSide.SELL,
-                quantity=3,
-                price=9_500,
-            )
-        )
-
-        self.assertIn("005930", strategy.positions)
-
-    def test_momentum_unrealized_loss_guard_liquidates_all(self):
-        cfg = MomentumScalpConfig(
-            daily_loss_limit=-5_000,
-            daily_total_loss_limit=-5_000,
-            enable_unrealized_loss_guard=True,
-            enable_regime_adaptive=False,
-            per_position_stop_loss=-100_000,  # 개별 손절보다 보조컷이 먼저 작동하도록 완화
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=1,
-            invested_amount=10_000,
-        )
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=4_000,
-            change=-6_000,
-            change_rate=-60.0,
-            open_price=10_000,
-            high_price=10_100,
-            low_price=3_900,
-            volume=1_000_000,
-            trade_amount=4_000_000_000,
-        )
-
-        orders = strategy.on_batch_tick([quote])
-
-        self.assertTrue(strategy._halted)
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0].symbol, "005930")
-        self.assertEqual(orders[0].side, OrderSide.SELL)
-
-    def test_momentum_daily_breaker_uses_effective_pnl_after_restore_offset(self):
-        cfg = MomentumScalpConfig(
-            daily_profit_target=500,
-            daily_loss_limit=-500,
-            use_restored_pnl_for_daily_breaker=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-
-        # 재시작 복구값(누적 +1,500원)이 있어도 브레이커 시작값은 0원으로 본다.
-        strategy.daily_pnl.realized_net_pnl = 1_500
-        strategy._daily_breaker_pnl_offset = 1_500
-        strategy.on_batch_tick([])
-        self.assertFalse(strategy._halted)
-
-        # 세션 중 신규 순실현이 +650원으로 늘면(강세 프로파일 목표 600원 초과) 목표 달성 처리.
-        strategy.daily_pnl.realized_net_pnl = 2_150
-        strategy.on_batch_tick([])
-        self.assertTrue(strategy._halted)
-
-    def test_momentum_daily_loss_limit_waits_for_open_profit_offset(self):
-        cfg = MomentumScalpConfig(
-            daily_loss_limit=-500,
-            daily_total_loss_limit=-1_500,
-            enable_regime_adaptive=False,
-            take_profit_pct=20.0,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.initialize()
-        strategy.daily_pnl.realized_net_pnl = -600
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=1,
-            invested_amount=10_000,
-        )
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_600,
-            change=600,
-            change_rate=6.0,
-            open_price=10_050,
-            high_price=10_650,
-            low_price=9_980,
-            volume=500_000,
-            trade_amount=5_300_000_000,
-        )
-
-        orders = strategy.on_batch_tick([quote])
-
-        self.assertFalse(strategy._halted)
-
-    def test_momentum_backtest_regime_uses_quotes_without_market_data(self):
-        strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(inverse_enabled=False),
-        )
-        quotes = [
-            Quote(
-                symbol="AAA",
-                name="AAA",
-                current_price=9_000,
-                change=-1_000,
-                change_rate=-10.0,
-                open_price=9_800,
-                high_price=9_900,
-                low_price=8_900,
-                volume=500_000,
-                trade_amount=4_500_000_000,
-            ),
-            Quote(
-                symbol="BBB",
-                name="BBB",
-                current_price=9_200,
-                change=-800,
-                change_rate=-8.0,
-                open_price=9_700,
-                high_price=9_800,
-                low_price=9_100,
-                volume=420_000,
-                trade_amount=3_864_000_000,
-            ),
-            Quote(
-                symbol="CCC",
-                name="CCC",
-                current_price=9_400,
-                change=-600,
-                change_rate=-6.0,
-                open_price=9_900,
-                high_price=10_000,
-                low_price=9_300,
-                volume=410_000,
-                trade_amount=3_854_000_000,
-            ),
-        ]
-
-        strategy.on_batch_tick(quotes)
-
-        self.assertGreaterEqual(strategy._bear_score, 2)
-        self.assertTrue(strategy._bear_market)
-
-    def test_momentum_regime_profile_uses_neutral_for_bear_score_one(self):
-        strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(inverse_enabled=False),
-        )
-        strategy._bear_score = 1
-
-        self.assertEqual(strategy._resolve_regime_profile_name(), "neutral")
-        self.assertFalse(strategy._is_bullish_regime())
-
-    def test_momentum_regime_profile_uses_soft_bear_for_bear_score_two(self):
-        strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(inverse_enabled=False),
-        )
-        strategy._bear_score = 2
-
-        self.assertEqual(strategy._resolve_regime_profile_name(), "soft_bear")
-        self.assertFalse(strategy._is_bullish_regime())
-
-    def test_momentum_regime_specific_max_position_count(self):
-        strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(
-                max_position_count=3,
-                bull_max_position_count=4,
-                neutral_max_position_count=2,
-                soft_bear_max_position_count=1,
-                bear_max_position_count=1,
-                inverse_enabled=False,
-            ),
-        )
-
-        strategy._bear_score = 0
-        self.assertEqual(strategy._effective_max_position_count(), 4)
-
-        strategy._bear_score = 1
-        self.assertEqual(strategy._effective_max_position_count(), 2)
-
-        strategy._bear_score = 2
-        self.assertEqual(strategy._effective_max_position_count(), 1)
-
-        strategy._bear_score = 3
-        self.assertEqual(strategy._effective_max_position_count(), 1)
-
-    def test_momentum_soft_bear_inverse_profile_relaxes_thresholds(self):
-        strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(
-                inverse_enabled=True,
-                inverse_max_positions=2,
-                soft_bear_inverse_max_positions=1,
-                inverse_min_bear_score=3,
-                inverse_min_change_rate=1.4,
-                inverse_min_momentum=3.0,
-            ),
-        )
-
-        strategy._bear_score = 2
-        self.assertEqual(strategy._resolve_regime_profile_name(), "soft_bear")
-        self.assertEqual(strategy._regime_inverse_max_positions(), 1)
-        self.assertEqual(strategy._regime_inverse_min_bear_score(), 2)
-        self.assertLess(strategy._regime_inverse_min_change_rate(), 1.4)
-        self.assertLess(strategy._regime_inverse_min_momentum(), 3.0)
-
-        strategy._bear_score = 3
-        self.assertEqual(strategy._resolve_regime_profile_name(), "bear")
-        self.assertEqual(strategy._regime_inverse_max_positions(), 2)
-        self.assertEqual(strategy._regime_inverse_min_bear_score(), 3)
-
-    def test_neutral_profile_relaxes_long_entry_thresholds(self):
-        cfg = MomentumScalpConfig()
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-
-        self.assertEqual(strategy._resolve_regime_profile_name(), "neutral")
-        self.assertLess(strategy._regime_min_change_rate(), cfg.min_change_rate)
-        self.assertLess(strategy._regime_min_momentum_score(), cfg.min_momentum_score)
-        self.assertLess(strategy._regime_volume_spike_ratio(), cfg.volume_spike_ratio)
-
-    def test_momentum_daily_loss_limit_still_halts_when_total_net_below_limit(self):
-        cfg = MomentumScalpConfig(
-            daily_loss_limit=-500,
-            daily_total_loss_limit=-500,
-            enable_regime_adaptive=False,
-            take_profit_pct=20.0,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.initialize()
-        strategy.daily_pnl.realized_net_pnl = -600
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=1,
-            invested_amount=10_000,
-        )
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_050,
-            change=50,
-            change_rate=0.5,
-            open_price=10_000,
-            high_price=10_080,
-            low_price=9_980,
-            volume=500_000,
-            trade_amount=5_025_000_000,
-        )
-
-        orders = strategy.on_batch_tick([quote])
-
-        self.assertTrue(strategy._halted)
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0].symbol, "005930")
-        self.assertEqual(orders[0].side, OrderSide.SELL)
-
-    def test_sell_fill_triggers_daily_hard_stop_alert_immediately(self):
-        cfg = MomentumScalpConfig(
-            daily_loss_limit=-500,
-            daily_total_loss_limit=-500,
-            enable_regime_adaptive=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.initialize()
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=1,
-            invested_amount=10_000,
-        )
-
-        with patch.object(strategy._alerts, "send") as mock_send:
-            strategy.on_order_filled(
-                OrderResult(
-                    success=True,
-                    symbol="005930",
-                    side=OrderSide.SELL,
-                    quantity=1,
-                    price=9_000,
-                )
-            )
-
-        self.assertTrue(strategy._halted)
-        event_keys = [call.kwargs.get("event_key") for call in mock_send.call_args_list]
-        self.assertIn("daily_total_loss_limit_hit", event_keys)
-
-    def test_neutral_chase_block_rejects_day_high_without_pullback(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-
-        history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_120, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 40_000, 400_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        ok, _, reject = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.4)
-        self.assertFalse(ok)
-        self.assertEqual(reject, "neutral_chase_block")
-
-    def test_neutral_pullback_reclaim_requires_pullback_and_reclaim(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-
-        history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_150, 150, 1.5, 10_000, 10_220, 9_950, 35_000, 350_000),
-            Quote("011700", "미원", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 40_000, 400_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        strategy.daily_pnl.trade_count = 1
-        ok, setup_name, reason = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.1)
-        self.assertTrue(ok)
-        self.assertEqual(setup_name, "neutral_pullback_reclaim")
-        self.assertIn("pullback_reclaim", reason)
-
-    def test_soft_bear_inverse_setup_allows_reclaim_after_pullback(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=True,
-            inverse_etfs=["252670"],
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            soft_bear_inverse_min_runup_pct=0.6,
-            soft_bear_inverse_min_drop_pct=0.15,
-            soft_bear_inverse_max_drop_pct=0.8,
-            soft_bear_inverse_reclaim_buffer_pct=0.03,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 2
-
-        history = [
-            Quote("252670", "KODEX 인버스", 2_000, 0, 0.0, 2_000, 2_000, 1_995, 10_000, 20_000_000),
-            Quote("252670", "KODEX 인버스", 2_030, 30, 1.5, 2_000, 2_030, 1_995, 20_000, 40_000_000),
-            Quote("252670", "KODEX 인버스", 2_020, 20, 1.0, 2_000, 2_030, 1_995, 30_000, 60_000_000),
-            Quote("252670", "KODEX 인버스", 2_032, 32, 1.6, 2_000, 2_032, 1_995, 40_000, 80_000_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        ok, setup_name, reason = strategy._passes_soft_bear_inverse_setup(history[-1], score=2.4)
-        self.assertTrue(ok)
-        self.assertEqual(setup_name, "soft_bear_inverse_breakdown")
-        self.assertIn("weak_rebound_failure", reason)
-
-    def test_soft_bear_profile_rejects_long_entries(self):
-        strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(
-                enable_volume_spike_filter=False,
-                enable_expected_net_filter=False,
-                enable_pool_persistence_gate=False,
-            ),
-        )
-        strategy._bear_score = 2
-        quote = Quote(
-            "005930",
-            "삼성전자",
-            60_000,
-            600,
-            1.0,
-            59_500,
-            60_100,
-            59_400,
-            500_000,
-            30_000_000_000,
-        )
-
-        self.assertFalse(strategy._can_open_new_long(quote, score=3.0))
-
-    def test_soft_bear_strong_leader_lane_ranks_candidate(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            bull_leader_top_n=3,
-            bull_leader_relative_strength_pp=0.0,
-            bull_breakout_hold_ticks=2,
-            bull_breakout_buffer_pct=0.03,
-            soft_bear_strong_leader_min_change_rate=3.0,
-            soft_bear_strong_leader_min_momentum=2.5,
-            soft_bear_strong_leader_min_trade_amount=1_500_000_000,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 2
-        leader = [
-            Quote("263750", "펄어비스", 60_000, 0, 0.0, 60_000, 60_000, 59_500, 20_000, 1_200_000_000),
-            Quote("263750", "펄어비스", 61_500, 1_500, 2.5, 60_000, 61_500, 59_500, 30_000, 1_845_000_000),
-            Quote("263750", "펄어비스", 62_800, 2_800, 4.7, 60_000, 62_800, 59_500, 45_000, 2_826_000_000),
-            Quote("263750", "펄어비스", 63_200, 3_200, 5.3, 60_000, 63_200, 59_500, 55_000, 3_476_000_000),
-        ]
-        others = [
-            Quote("005930", "삼성전자", 60_500, 500, 0.8, 60_000, 60_550, 59_900, 120_000, 7_260_000_000),
-            Quote("000660", "SK하이닉스", 81_200, 600, 0.7, 80_600, 81_250, 80_400, 90_000, 7_308_000_000),
-        ]
-        for quote in leader + others:
-            strategy._quotes_cache[quote.symbol] = quote
-            strategy._record_recent_quote(quote)
-        strategy._pool = [quote.symbol for quote in leader[-1:] + others]
-        strategy._latest_strong_leader_symbols = {"263750"}
-        strategy._latest_strong_leader_snapshot = {
-            "263750": {
-                "change_rate": leader[-1].change_rate,
-                "trade_amount": leader[-1].trade_amount,
-                "rank": 1,
-            }
-        }
-
-        ranked = strategy._rank_long_entry_candidates([leader[-1], *others])
-
-        self.assertEqual([quote.symbol for _, quote in ranked], ["263750"])
-
-    def test_direct_dynamic_symbol_bypasses_persistence_gate(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=True,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-        strategy._latest_direct_dynamic_symbols = {"047040"}
-        quote = Quote(
-            "047040",
-            "대우건설",
-            4_500,
-            220,
-            5.1,
-            4_280,
-            4_520,
-            4_240,
-            1_200_000,
-            5_400_000_000,
-        )
-
-        self.assertTrue(strategy._can_open_new_long(quote, score=3.5))
-
-    def test_neutral_leader_filter_blocks_low_rank_candidate(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            neutral_leader_top_n=2,
-            neutral_leader_relative_strength_pp=0.0,
-            neutral_pullback_min_ticks=1,
-            enable_math_shadow_layer=False,
-            enable_math_live_layer=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-
-        pool_quotes = [
-            Quote("AAA", "A", 10_300, 300, 3.0, 10_000, 10_300, 9_950, 200_000, 2_060_000_000),
-            Quote("BBB", "B", 10_250, 250, 2.5, 10_000, 10_250, 9_950, 180_000, 1_845_000_000),
-            Quote("CCC", "C", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 50_000, 511_000_000),
-        ]
-        for quote in pool_quotes:
-            strategy._quotes_cache[quote.symbol] = quote
-            strategy._pool.append(quote.symbol)
-        history = [
-            Quote("CCC", "C", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000_000),
-            Quote("CCC", "C", 10_260, 260, 2.6, 10_000, 10_260, 9_950, 20_000, 200_000_000),
-            Quote("CCC", "C", 10_170, 170, 1.7, 10_000, 10_260, 9_950, 25_000, 250_000_000),
-            Quote("CCC", "C", 10_280, 280, 2.8, 10_000, 10_280, 9_950, 30_000, 300_000_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        strategy.daily_pnl.trade_count = 1
-        ok, _, reject = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.8)
-        self.assertFalse(ok)
-        self.assertEqual(reject, "neutral_low_turnover_rank")
-
-    def test_order_fill_preserves_entry_metadata(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            enable_entry_confirmation=False,
-            enable_math_shadow_layer=False,
-            enable_math_live_layer=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-
-        history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_150, 150, 1.5, 10_000, 10_220, 9_950, 35_000, 350_000),
-            Quote("011700", "미원", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 40_000, 400_000),
-        ]
-        for quote in history:
-            strategy._quotes_cache[quote.symbol] = quote
-            strategy._record_recent_quote(quote)
-
-        strategy.daily_pnl.trade_count = 1
-        order = strategy._evaluate_buy(history[-1])
-        self.assertIsNotNone(order)
-
-        strategy.on_order_filled(
-            OrderResult(
-                success=True,
-                symbol="011700",
-                side=OrderSide.BUY,
-                quantity=order.quantity,
-                price=history[-1].current_price,
-            )
-        )
-
-        pos = strategy.positions["011700"]
-        self.assertEqual(pos.entry_setup_name, "neutral_pullback_reclaim")
-        self.assertEqual(pos.entry_reason, "pullback_reclaim")
-        self.assertEqual(pos.regime_label, "neutral")
-        self.assertEqual(pos.bear_score, 1)
-
-    def test_neutral_pullback_reclaim_rejects_too_early_in_session(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 9, 20))
-
-        history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 40_000, 400_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        ok, _, reject = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.1)
-        self.assertFalse(ok)
-        self.assertEqual(reject, "neutral_too_early")
-
-    def test_bull_bias_override_routes_neutral_market_to_bull_breakout(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            bull_breakout_hold_ticks=2,
-            bull_breakout_buffer_pct=0.03,
-            bull_leader_top_n=4,
-            bull_leader_relative_strength_pp=0.40,
-            bull_bias_avg_change_rate_threshold=0.7,
-            bull_bias_max_decliner_ratio=0.45,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy._cached_index_regime_info = (5_700.0, 5_620.0, 5_650.0)
-        strategy.set_simulated_now(datetime(2026, 3, 18, 10, 30))
-
-        leader_history = [
-            Quote("090710", "휴림로봇", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 80_000, 800_000_000),
-            Quote("090710", "휴림로봇", 10_100, 100, 1.0, 10_000, 10_100, 9_950, 120_000, 1_212_000_000),
-            Quote("090710", "휴림로봇", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 180_000, 1_836_000_000),
-            Quote("090710", "휴림로봇", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 240_000, 2_452_800_000),
-            Quote("090710", "휴림로봇", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 300_000, 3_072_000_000),
-        ]
-        for quote in leader_history:
-            strategy._record_recent_quote(quote)
-            strategy._quotes_cache[quote.symbol] = quote
-
-        for symbol, change_rate, volume in (
-            ("005930", 0.8, 150_000),
-            ("000660", 0.9, 140_000),
-            ("035420", 1.1, 130_000),
-        ):
-            quote = Quote(
-                symbol,
-                symbol,
-                10_000,
-                100,
-                change_rate,
-                9_900,
-                10_050,
-                9_850,
-                volume,
-                1_000_000_000,
-            )
-            strategy._quotes_cache[symbol] = quote
-
-        self.assertEqual(strategy._current_profile_entry_strategy_name(is_inverse=False), "bull_breakout_strategy")
-        score = strategy._calc_momentum_score(leader_history[-1])
-        decision = strategy._regime_router.evaluate_long_entry(strategy, leader_history[-1], score)
-
-        self.assertTrue(decision.allowed)
-        self.assertEqual(decision.strategy_name, "bull_breakout_strategy")
-        self.assertIn("entry_grade=A", decision.payload)
-
-    def test_bull_breakout_requires_higher_score_in_late_session(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            bullish_min_momentum_score=3.0,
-            bullish_min_momentum_score_floor=3.0,
-            bull_breakout_hold_ticks=2,
-            bull_breakout_buffer_pct=0.03,
-            bull_breakout_late_entry_start_minutes_after_open=255,
-            bull_breakout_late_entry_score_bonus=0.35,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-        strategy.set_simulated_now(datetime(2026, 3, 18, 13, 45))
-
-        history = [
-            Quote("090710", "휴림로봇", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 80_000, 800_000_000),
-            Quote("090710", "휴림로봇", 10_100, 100, 1.0, 10_000, 10_100, 9_950, 120_000, 1_212_000_000),
-            Quote("090710", "휴림로봇", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 180_000, 1_836_000_000),
-            Quote("090710", "휴림로봇", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 240_000, 2_452_800_000),
-            Quote("090710", "휴림로봇", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 300_000, 3_072_000_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-            strategy._quotes_cache[quote.symbol] = quote
-
-        for symbol, change_rate, volume in (
-            ("005930", 0.8, 150_000),
-            ("000660", 0.9, 140_000),
-            ("035420", 1.1, 130_000),
-        ):
-            quote = Quote(
-                symbol,
-                symbol,
-                10_000,
-                100,
-                change_rate,
-                9_900,
-                10_050,
-                9_850,
-                volume,
-                1_000_000_000,
-            )
-            strategy._quotes_cache[symbol] = quote
-
-        ok, _, reject = strategy._passes_bull_breakout_setup(history[-1], score=3.0)
-        self.assertFalse(ok)
-        self.assertEqual(reject, "bull_late_day_score")
-
-    def test_strong_bull_override_caps_soft_bear_to_neutral(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            strong_bull_override_index_gap_pct=1.5,
-            strong_bull_override_avg_change_rate_threshold=2.0,
-            strong_bull_override_max_decliner_ratio=0.25,
-            strong_bull_override_min_quote_count=8,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.market_data = object()
-        now = datetime(2026, 3, 18, 12, 30)
-        strategy.set_simulated_now(now)
-        strategy._bear_score = 2
-        strategy._last_regime_check_at = now - timedelta(seconds=30)
-        strategy._last_index_regime_check_at = now
-        strategy._cached_index_regime_score = 2
-        strategy._cached_index_regime_info = (5850.0, 5700.0, 5620.0)
-
-        quotes = []
-        for idx in range(8):
-            quotes.append(
-                Quote(
-                    symbol=f"A{idx:03d}",
-                    name=f"A{idx:03d}",
-                    current_price=10_000 + idx,
-                    change=300,
-                    change_rate=3.0,
-                    open_price=9_700,
-                    high_price=10_050 + idx,
-                    low_price=9_650,
-                    volume=200_000 + idx * 1_000,
-                    trade_amount=2_500_000_000 + idx * 10_000_000,
-                )
-            )
-
-        strategy._check_market_regime(quotes=quotes)
-
-        self.assertEqual(strategy._bear_score, 1)
-        self.assertTrue(strategy._strong_bull_override_active)
-
-    def test_index_support_bull_bias_override_reclassifies_soft_bear(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            index_support_bull_bias_index_gap_pct=1.0,
-            index_support_bull_bias_avg_change_rate_threshold=1.0,
-            index_support_bull_bias_max_decliner_ratio=0.55,
-            index_support_bull_bias_min_quote_count=8,
-            strong_bull_override_index_gap_pct=3.0,
-            strong_bull_override_avg_change_rate_threshold=3.0,
-            strong_bull_override_max_decliner_ratio=0.20,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.market_data = object()
-        now = datetime(2026, 3, 19, 12, 15)
-        strategy.set_simulated_now(now)
-        strategy._bear_score = 2
-        strategy._last_regime_check_at = now - timedelta(seconds=30)
-        strategy._last_index_regime_check_at = now
-        strategy._cached_index_regime_score = 2
-        strategy._cached_index_regime_info = (5858.5, 5721.5, 5692.2)
-
-        quotes = []
-        for idx in range(10):
-            change_rate = 1.8 if idx < 5 else (1.2 if idx < 8 else -0.2)
-            change = int(10_000 * (change_rate / 100))
-            quotes.append(
-                Quote(
-                    symbol=f"B{idx:03d}",
-                    name=f"B{idx:03d}",
-                    current_price=10_000 + change,
-                    change=change,
-                    change_rate=change_rate,
-                    open_price=10_000,
-                    high_price=10_200,
-                    low_price=9_900,
-                    volume=150_000 + idx * 1_000,
-                    trade_amount=1_600_000_000 + idx * 50_000_000,
-                )
-            )
-
-        strategy._check_market_regime(quotes=quotes)
-
-        self.assertEqual(strategy._bear_score, 1)
-        self.assertTrue(strategy._index_support_bull_bias_active)
-        self.assertTrue(strategy._is_bull_bias_market())
-        self.assertEqual(strategy._resolve_regime_profile_name(), "bull")
-
-    def test_leader_support_bull_bias_override_reclassifies_soft_bear(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            leader_support_bull_bias_min_count=1,
-            leader_support_bull_bias_min_change_rate=4.0,
-            leader_support_bull_bias_min_trade_amount=2_000_000_000,
-            leader_support_bull_bias_max_decliner_ratio=0.70,
-            strong_bull_override_index_gap_pct=9.0,
-            strong_bull_override_avg_change_rate_threshold=9.0,
-            index_support_bull_bias_index_gap_pct=9.0,
-            index_support_bull_bias_avg_change_rate_threshold=9.0,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.market_data = object()
-        now = datetime(2026, 3, 19, 10, 30)
-        strategy.set_simulated_now(now)
-        strategy._bear_score = 2
-        strategy._last_regime_check_at = now - timedelta(seconds=30)
-        strategy._last_index_regime_check_at = now
-        strategy._cached_index_regime_score = 2
-        strategy._cached_index_regime_info = (5850.0, 5830.0, 5825.0)
-        strategy._latest_strong_leader_snapshot = {
-            "263750": {
-                "change_rate": 6.2,
-                "trade_amount": 3_400_000_000,
-                "rank": 1,
+    def setUp(self):
+        self._state_tmpdir = tempfile.TemporaryDirectory()
+        self._config_init_defaults = MomentumScalpConfig.__init__.__defaults__
+        isolated_defaults = list(self._config_init_defaults)
+        isolated_defaults[-2] = str(Path(self._state_tmpdir.name) / "forecast-outcomes")
+        isolated_defaults[-1] = str(Path(self._state_tmpdir.name) / "momentum-state.json")
+        MomentumScalpConfig.__init__.__defaults__ = tuple(isolated_defaults)
+
+    def tearDown(self):
+        MomentumScalpConfig.__init__.__defaults__ = self._config_init_defaults
+        self._state_tmpdir.cleanup()
+
+    def _install_strong_ev_prediction(
+        self,
+        strategy,
+        *,
+        predicted_return_pct: float = 1.60,
+        lower_bound_return_pct: float = 0.20,
+        upper_bound_return_pct: float = 2.10,
+        confidence: float = 0.78,
+        direction_score: float = 0.74,
+    ):
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_ev_ready",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=predicted_return_pct,
+            lower_bound_return_pct=lower_bound_return_pct,
+            upper_bound_return_pct=upper_bound_return_pct,
+            confidence=confidence,
+            direction_score=direction_score,
+            volatility_pct=0.24,
+            features={
+                "continuation_quality": 0.72,
+                "follow_through_score": 0.70,
+                "rejection_risk_score": 0.08,
+                "chase_risk_score": 0.10,
+                "trap_risk_score": 0.07,
             },
+        )
+
+    def test_expected_value_plan_allows_small_positive_net_below_daily_target(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=300_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=2_500,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 5, 27, 10, 30, 0)
+        strategy.set_simulated_now(now)
+        quote = Quote("EV001", "EV001", 10_000, 200, 2.0, 9_800, 10_050, 9_700, 200_000, 2_000_000_000, now)
+        self._install_strong_ev_prediction(strategy, predicted_return_pct=1.35, lower_bound_return_pct=-0.25)
+        meta = {"strategy_name": INTRADAY_STRATEGY, "live_route": INTRADAY_STRATEGY}
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertGreater(plan.expected_net, 0.0)
+        self.assertGreater(plan.predicted_net, 0)
+        self.assertLess(plan.planned_target_net, 10_000)
+
+
+    def test_expected_value_plan_rejects_one_share_unrounded_net_loss(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=3_500,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 7, 14, 15, 7, 40)
+        strategy.set_simulated_now(now)
+        quote = Quote(
+            "025870",
+            "신라에스지",
+            2_235,
+            0,
+            0.0,
+            1_695,
+            2_235,
+            1_695,
+            1_000_000,
+            2_235_000_000,
+            now,
+        )
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_rounding_artifact",
+            horizon_seconds=180,
+            sample_count=15,
+            predicted_return_pct=0.40,
+            lower_bound_return_pct=-0.798,
+            upper_bound_return_pct=1.50,
+            confidence=0.946,
+            direction_score=0.662,
+            volatility_pct=0.30,
+            features={},
+        )
+
+        plan = strategy._build_expected_value_trade_plan(
+            quote,
+            {"strategy_name": INTRADAY_STRATEGY, "live_route": INTRADAY_STRATEGY},
+            pending_orders=[],
+        )
+
+        self.assertFalse(plan.allowed)
+        self.assertEqual(plan.reject_reason, "ev_no_positive_quantity")
+        self.assertEqual(plan.quantity, 1)
+        self.assertEqual(plan.reject_detail, "predicted_net_non_positive")
+
+
+
+
+
+    def test_expected_value_plan_keeps_robust_breakout_despite_prior_soft_reject(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        first_seen = datetime(2026, 6, 19, 11, 10, 50)
+        strategy.set_simulated_now(first_seen)
+        strategy._session_start_at = first_seen.replace(hour=9, minute=0, second=0, microsecond=0)
+        quote = Quote("085620", "085620", 35_200, 1_200, 3.53, 34_000, 35_250, 33_900, 750_000, 26_400_000_000, first_seen)
+        meta = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "live_route": INTRADAY_STRATEGY,
+            "leader_percentile": 0.95,
+            "effective_leader_score": 1.053,
         }
-        strategy._latest_strong_leader_symbols = {"263750"}
-
-        quotes = [
-            Quote(
-                symbol=f"L{idx:03d}",
-                name=f"L{idx:03d}",
-                current_price=10_000,
-                change=100 if idx < 7 else -50,
-                change_rate=1.0 if idx < 7 else -0.5,
-                open_price=9_900,
-                high_price=10_050,
-                low_price=9_850,
-                volume=150_000 + idx * 1_000,
-                trade_amount=1_200_000_000 + idx * 50_000_000,
-            )
-            for idx in range(10)
-        ]
-
-        strategy._check_market_regime(quotes=quotes)
-
-        self.assertEqual(strategy._bear_score, 1)
-        self.assertTrue(strategy._leader_support_bull_bias_active)
-
-    def test_invalid_zero_index_response_keeps_previous_index_cache(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_prior_soft_lower",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=0.637,
+            lower_bound_return_pct=-0.228,
+            upper_bound_return_pct=1.10,
+            confidence=0.653,
+            direction_score=0.62,
+            volatility_pct=0.30,
+            features={
+                "continuation_quality": 0.62,
+                "follow_through_score": 0.61,
+                "rejection_risk_score": 0.06,
+                "chase_risk_score": 0.05,
+                "trap_risk_score": 0.05,
+            },
         )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.market_data = Mock()
-        strategy.market_data.get_index_daily_prices.return_value = pd.DataFrame(
-            {
-                "stck_bsop_date": [20260319 - idx for idx in range(20)],
-                "bstp_nmix_prpr": [0 for _ in range(20)],
-            }
+        strategy._build_expected_value_trade_plan(quote, dict(meta), pending_orders=[])
+
+        entry_time = first_seen + timedelta(seconds=42)
+        strategy.set_simulated_now(entry_time)
+        quote = Quote("085620", "085620", 35_700, 1_700, 5.00, 34_000, 35_750, 33_900, 900_000, 32_130_000_000, entry_time)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_robust_breakout",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=2.243,
+            lower_bound_return_pct=1.604,
+            upper_bound_return_pct=2.80,
+            confidence=0.684,
+            direction_score=0.740,
+            volatility_pct=0.32,
+            features={
+                "continuation_quality": 0.76,
+                "follow_through_score": 0.74,
+                "rejection_risk_score": 0.05,
+                "chase_risk_score": 0.05,
+                "trap_risk_score": 0.04,
+            },
         )
-        now = datetime(2026, 3, 19, 12, 30)
-        strategy.set_simulated_now(now)
-        strategy._last_index_regime_check_at = now - timedelta(minutes=10)
-        strategy._cached_index_regime_score = 2
-        strategy._cached_index_regime_info = (5858.5, 5721.5, 5692.2)
+        live_meta = dict(meta)
+        plan = strategy._build_expected_value_trade_plan(quote, live_meta, pending_orders=[])
 
-        quotes = [
-            Quote(
-                symbol=f"C{idx:03d}",
-                name=f"C{idx:03d}",
-                current_price=10_100,
-                change=100,
-                change_rate=1.0,
-                open_price=10_000,
-                high_price=10_150,
-                low_price=9_980,
-                volume=120_000 + idx * 1_000,
-                trade_amount=1_200_000_000 + idx * 10_000_000,
-            )
-            for idx in range(8)
-        ]
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertGreater(plan.expected_net, 0.0)
+        self.assertLess(live_meta.get("ev_prediction_stability_penalty", 0.0), 0.35)
 
-        strategy._check_market_regime(quotes=quotes, force=True)
 
-        self.assertEqual(strategy._cached_index_regime_score, 2)
-        self.assertEqual(strategy._cached_index_regime_info, (5858.5, 5721.5, 5692.2))
 
-    def test_market_data_warmup_blocks_new_entries_until_ready(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=False,
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            startup_market_data_ready_ticks=2,
-            startup_market_data_min_valid_quote_count=2,
-        )
-        strategy = MomentumScalpStrategy(market_data=Mock(), config=cfg)
-        now = datetime(2026, 3, 19, 9, 5)
-        strategy.set_simulated_now(now)
-        strategy._last_index_regime_check_at = now
-
-        quote = Quote(
-            symbol="090710",
-            name="휴림로봇",
-            current_price=10_200,
-            change=200,
-            change_rate=2.0,
-            open_price=10_000,
-            high_price=10_220,
-            low_price=9_950,
-            volume=180_000,
-            trade_amount=1_836_000_000,
-        )
-        strategy._rank_long_entry_candidates = Mock(return_value=[(5.0, quote)])
-        strategy._evaluate_buy = Mock()
-
-        orders = strategy.on_batch_tick([quote])
-
-        self.assertEqual(orders, [])
-        strategy._rank_long_entry_candidates.assert_not_called()
-        strategy._evaluate_buy.assert_not_called()
-        self.assertFalse(strategy._market_data_ready_for_entries)
-
-    def test_market_data_warmup_allows_sell_while_blocking_new_entries(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=False,
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=Mock(), config=cfg)
-        now = datetime(2026, 3, 19, 9, 6)
-        strategy.set_simulated_now(now)
-        strategy._last_index_regime_check_at = now
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=1,
-            invested_amount=10_000,
-        )
-
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=7_000,
-            change=-3_000,
-            change_rate=-30.0,
-            open_price=10_000,
-            high_price=10_050,
-            low_price=6_950,
-            volume=500_000,
-            trade_amount=3_500_000_000,
-        )
-
-        orders = strategy.on_batch_tick([quote])
-
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0].side, OrderSide.SELL)
-        self.assertEqual(orders[0].symbol, "005930")
-        self.assertFalse(strategy._market_data_ready_for_entries)
-
-    def test_market_data_warmup_requires_consecutive_valid_ticks(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=False,
-            startup_market_data_ready_ticks=2,
-            startup_market_data_min_valid_quote_count=2,
-        )
-        strategy = MomentumScalpStrategy(market_data=Mock(), config=cfg)
-        now = datetime(2026, 3, 19, 9, 7)
-        strategy.set_simulated_now(now)
-        strategy._cached_index_regime_info = (5858.5, 5721.5, 5692.2)
-
-        quotes = [
-            Quote("AAA", "A", 10_100, 100, 1.0, 10_000, 10_150, 9_980, 100_000, 1_010_000_000),
-            Quote("BBB", "B", 10_200, 200, 2.0, 10_000, 10_220, 9_970, 120_000, 1_224_000_000),
-        ]
-
-        first = strategy._update_market_data_readiness(quotes, now)
-        second = strategy._update_market_data_readiness(quotes, now + timedelta(seconds=1))
-
-        self.assertFalse(first)
-        self.assertTrue(second)
-        self.assertTrue(strategy._market_data_ready_for_entries)
-
-    def test_bull_post_loss_requires_stronger_score(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            enable_backtest_score_entry_fallback=False,
-            enable_math_shadow_layer=False,
-            enable_math_live_layer=False,
-            bullish_min_momentum_score=3.0,
-            bullish_min_momentum_score_floor=3.0,
-            bull_breakout_hold_ticks=2,
-            bull_breakout_buffer_pct=0.03,
-            bull_post_loss_score_bonus=0.30,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-        strategy.set_simulated_now(datetime(2026, 3, 18, 11, 0))
-
-        history = [
-            Quote("090710", "휴림로봇", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 80_000, 800_000_000),
-            Quote("090710", "휴림로봇", 10_100, 100, 1.0, 10_000, 10_100, 9_950, 120_000, 1_212_000_000),
-            Quote("090710", "휴림로봇", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 180_000, 1_836_000_000),
-            Quote("090710", "휴림로봇", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 240_000, 2_452_800_000),
-            Quote("090710", "휴림로봇", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 300_000, 3_072_000_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-            strategy._quotes_cache[quote.symbol] = quote
-
-        for symbol, change_rate, volume in (
-            ("005930", 0.8, 150_000),
-            ("000660", 0.9, 140_000),
-            ("035420", 1.1, 130_000),
-        ):
-            quote = Quote(
-                symbol,
-                symbol,
-                10_000,
-                100,
-                change_rate,
-                9_900,
-                10_050,
-                9_850,
-                volume,
-                1_000_000_000,
-            )
-            strategy._quotes_cache[symbol] = quote
-
-        allowed_order = strategy._evaluate_buy(history[-1], score_hint=3.0)
-        self.assertIsNotNone(allowed_order)
-
-        strategy._bull_loss_count_today = 1
-        blocked_order = strategy._evaluate_buy(history[-1], score_hint=3.0)
-        self.assertIsNone(blocked_order)
-
-    def test_build_pool_mixes_in_high_turnover_cached_leader(self):
-        cfg = MomentumScalpConfig(
-            dynamic_pool_size=2,
-            dynamic_pool_ranking_fetch_count=4,
-            dynamic_pool_turnover_slots=1,
-            dynamic_pool_quote_trade_amount_slots=1,
-            dynamic_pool_quote_min_change_rate=0.8,
-            enable_pool_persistence_gate=False,
-        )
-        ranking_items = [
-            RankingItem("AAA", "AAA", 10_000, 5.0, 10_000, 1),
-            RankingItem("BBB", "BBB", 9_000, 4.5, 12_000, 2),
-            RankingItem("CCC", "CCC", 8_000, 4.0, 150_000, 3),
-            RankingItem("DDD", "DDD", 7_000, 3.5, 11_000, 4),
-        ]
+    def test_expected_value_plan_allows_rebound_when_ev_is_positive(self):
         strategy = MomentumScalpStrategy(
-            market_data=DummyRankingMarketData(ranking_items),
-            config=cfg,
-        )
-        strategy._quotes_cache["ZZZ"] = Quote(
-            "ZZZ",
-            "ZZZ",
-            12_000,
-            360,
-            3.1,
-            11_640,
-            12_120,
-            11_600,
-            500_000,
-            6_000_000_000,
-        )
-
-        strategy._build_pool()
-
-        self.assertIn("AAA", strategy._pool)
-        self.assertIn("CCC", strategy._pool)
-        self.assertIn("ZZZ", strategy._pool)
-
-    def test_build_pool_directly_includes_turnover_leader_with_persistence_gate(self):
-        cfg = MomentumScalpConfig(
-            dynamic_pool_size=2,
-            dynamic_pool_ranking_fetch_count=4,
-            dynamic_pool_turnover_slots=2,
-            dynamic_pool_quote_trade_amount_slots=0,
-            dynamic_pool_direct_turnover_slots=1,
-            dynamic_pool_direct_quote_leader_slots=0,
-            enable_pool_persistence_gate=True,
-            momentum_pool_persistence_window=3,
-            momentum_pool_min_appearances=2,
-        )
-        ranking_items = [
-            RankingItem("AAA", "AAA", 10_000, 5.0, 10_000, 1),
-            RankingItem("BBB", "BBB", 9_000, 4.5, 12_000, 2),
-            RankingItem("CCC", "CCC", 40_000, 4.0, 150_000, 3),
-            RankingItem("DDD", "DDD", 7_000, 3.5, 11_000, 4),
-        ]
-        strategy = MomentumScalpStrategy(
-            market_data=DummyRankingMarketData(ranking_items),
-            config=cfg,
-        )
-
-        strategy._build_pool()
-
-        self.assertIn("CCC", strategy._pool)
-
-    def test_build_pool_directly_includes_top_rank_leader_with_persistence_gate(self):
-        cfg = MomentumScalpConfig(
-            dynamic_pool_size=2,
-            dynamic_pool_ranking_fetch_count=4,
-            dynamic_pool_turnover_slots=0,
-            dynamic_pool_quote_trade_amount_slots=0,
-            dynamic_pool_direct_rank_slots=1,
-            dynamic_pool_direct_turnover_slots=0,
-            dynamic_pool_direct_quote_leader_slots=0,
-            enable_pool_persistence_gate=True,
-            momentum_pool_persistence_window=3,
-            momentum_pool_min_appearances=2,
-        )
-        ranking_items = [
-            RankingItem("AAA", "AAA", 10_000, 5.0, 10_000, 1),
-            RankingItem("BBB", "BBB", 9_000, 4.5, 12_000, 2),
-        ]
-        strategy = MomentumScalpStrategy(
-            market_data=DummyRankingMarketData(ranking_items),
-            config=cfg,
-        )
-
-        strategy._build_pool()
-
-        self.assertIn("AAA", strategy._pool)
-        self.assertIn("AAA", strategy._latest_direct_dynamic_symbols)
-
-    def test_build_pool_tracks_strong_leader_snapshot(self):
-        cfg = MomentumScalpConfig(
-            dynamic_pool_size=2,
-            dynamic_pool_ranking_fetch_count=4,
-            dynamic_pool_turnover_slots=1,
-            dynamic_pool_quote_trade_amount_slots=0,
-            enable_pool_persistence_gate=False,
-            strong_leader_min_change_rate=2.0,
-            strong_leader_min_trade_amount=1_000_000_000,
-            strong_leader_top_rank=5,
-        )
-        ranking_items = [
-            RankingItem("AAA", "AAA", 20_000, 4.5, 80_000, 4),
-            RankingItem("BBB", "BBB", 9_000, 1.5, 12_000, 2),
-        ]
-        strategy = MomentumScalpStrategy(
-            market_data=DummyRankingMarketData(ranking_items),
-            config=cfg,
-        )
-
-        strategy._build_pool()
-
-        self.assertIn("AAA", strategy._latest_strong_leader_symbols)
-
-    def test_bull_a_grade_initial_entry_uses_scaled_allocation(self):
-        base_kwargs = dict(
-            seed_money=1_000_000,
-            max_position_count=2,
-            per_stock_amount=220_000,
-            max_per_stock_amount=500_000,
-            capital_utilization_pct=0.60,
-            bull_max_single_position_pct=0.42,
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            enable_backtest_score_entry_fallback=False,
-            enable_math_shadow_layer=False,
-            enable_math_live_layer=False,
-            bullish_min_momentum_score=3.0,
-            bullish_min_momentum_score_floor=3.0,
-            bull_breakout_hold_ticks=2,
-            bull_breakout_buffer_pct=0.03,
-            bull_priority_turnover_rank_max=1,
-        )
-        scaled_strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(**base_kwargs, bull_breakout_initial_entry_scale=0.5),
-        )
-        full_strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(**base_kwargs, bull_breakout_initial_entry_scale=1.0),
-        )
-        scaled_strategy._bear_score = 0
-        full_strategy._bear_score = 0
-        now = datetime(2026, 3, 18, 11, 5)
-        scaled_strategy.set_simulated_now(now)
-        full_strategy.set_simulated_now(now)
-
-        history = [
-            Quote("090710", "휴림로봇", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 80_000, 800_000_000),
-            Quote("090710", "휴림로봇", 10_100, 100, 1.0, 10_000, 10_100, 9_950, 120_000, 1_212_000_000),
-            Quote("090710", "휴림로봇", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 180_000, 1_836_000_000),
-            Quote("090710", "휴림로봇", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 240_000, 2_452_800_000),
-            Quote("090710", "휴림로봇", 10_240, 240, 2.4, 10_000, 10_240, 9_950, 300_000, 3_072_000_000),
-        ]
-        for quote in history:
-            scaled_strategy._record_recent_quote(quote)
-            scaled_strategy._quotes_cache[quote.symbol] = quote
-            full_strategy._record_recent_quote(quote)
-            full_strategy._quotes_cache[quote.symbol] = quote
-
-        for symbol, price, change_rate, volume in (
-            ("005930", 70_000, 0.8, 50_000),
-            ("000660", 10_000, 0.9, 140_000),
-            ("035420", 10_000, 1.1, 130_000),
-        ):
-            quote = Quote(
-                symbol,
-                symbol,
-                price,
-                100,
-                change_rate,
-                price - 100,
-                price + 50,
-                price - 150,
-                volume,
-                price * volume,
-            )
-            scaled_strategy._quotes_cache[symbol] = quote
-            full_strategy._quotes_cache[symbol] = quote
-
-        scaled_order = scaled_strategy._evaluate_buy(history[-1])
-        full_order = full_strategy._evaluate_buy(history[-1])
-        self.assertIsNotNone(scaled_order)
-        self.assertIsNotNone(full_order)
-        self.assertLess(scaled_order.quantity, full_order.quantity)
-
-    def test_bull_priority_entry_sizes_top_leader_more_aggressively(self):
-        base_kwargs = dict(
-            seed_money=1_000_000,
-            max_position_count=2,
-            bull_max_position_count=2,
-            per_stock_amount=200_000,
-            max_per_stock_amount=350_000,
-            capital_utilization_pct=0.70,
-            bull_max_single_position_pct=0.35,
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            enable_backtest_score_entry_fallback=False,
-            enable_math_shadow_layer=False,
-            enable_math_live_layer=False,
-            bullish_min_momentum_score=3.0,
-            bullish_min_momentum_score_floor=3.0,
-            bull_breakout_hold_ticks=2,
-            bull_breakout_buffer_pct=0.03,
-        )
-        priority_strategy = MomentumScalpStrategy(
             market_data=None,
             config=MomentumScalpConfig(
-                **base_kwargs,
-                bull_priority_turnover_rank_max=2,
-                bull_priority_per_stock_amount_multiplier=3.0,
-                bull_priority_max_per_stock_amount_multiplier=3.0,
-                bull_priority_max_single_position_pct=0.65,
-                bull_priority_effective_slots=1,
-                bull_priority_initial_entry_scale=0.85,
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
             ),
         )
-        plain_strategy = MomentumScalpStrategy(
+        entry_time = datetime(2026, 6, 25, 13, 37, 9)
+        strategy.set_simulated_now(entry_time)
+        strategy._session_start_at = datetime(2026, 6, 25, 9, 0, 0)
+        quote = Quote("002990", "002990", 5_440, 380, 7.60, 5_056, 9_800, 5_000, 2_000_000, 10_880_000_000, entry_time)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_today_002990_rebound_after_noise_floor",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=1.966,
+            lower_bound_return_pct=0.325,
+            upper_bound_return_pct=2.350,
+            confidence=0.603,
+            direction_score=0.705,
+            volatility_pct=0.35,
+            features={
+                "continuation_quality": 0.64,
+                "follow_through_score": 0.62,
+                "rejection_risk_score": 0.10,
+                "chase_risk_score": 0.12,
+                "trap_risk_score": 0.10,
+            },
+        )
+        meta = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "live_route": INTRADAY_STRATEGY,
+            "queue_source": "math_queue",
+            "conviction_rank": 1,
+            "conviction_score": 1.3108,
+            "leader_percentile": 0.96,
+            "effective_leader_score": 0.8413,
+            "vs_open_pct": 7.60,
+            "high_proximity": 0.555,
+            "entry_grade": "A",
+        }
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_detail)
+        self.assertGreater(plan.expected_net, 0)
+        self.assertGreater(plan.predicted_net, 0)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 5_000)
+
+
+    def test_expected_value_plan_metadata_uses_live_plan_ev_for_position(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
+        )
+        meta = {
+            "entry_ev": -2_436.89,
+            "entry_ev_confidence": "medium",
+            "entry_ev_closed_trades": 6,
+        }
+        plan = ExpectedValueTradePlan(
+            allowed=True,
+            quantity=5,
+            budget=591_500,
+            expected_net=637.91,
+            predicted_net=3_883,
+            lower_net=-1_024,
+            upper_net=5_200,
+            win_probability=0.605,
+            break_even_probability=0.527,
+            planned_target_net=3_883,
+            planned_stop_net_loss_abs=3_500,
+            planned_risk_net_loss_abs=4_323,
+        )
+
+        strategy._apply_expected_value_trade_plan_metadata(meta, plan)
+
+        self.assertEqual(meta["historical_entry_ev"], -2_436.89)
+        self.assertEqual(meta["historical_entry_ev_confidence"], "medium")
+        self.assertEqual(meta["historical_entry_ev_closed_trades"], 6)
+        self.assertEqual(meta["entry_ev"], 637.91)
+        self.assertEqual(meta["entry_ev_confidence"], "live_plan")
+        self.assertEqual(meta["entry_expected_net_pnl"], 637.91)
+
+    def test_expected_value_plan_rejects_weak_context_prediction_when_tick_history_is_not_ready(self):
+        strategy = MomentumScalpStrategy(
             market_data=None,
             config=MomentumScalpConfig(
-                **base_kwargs,
-                bull_priority_turnover_rank_max=1,
-                bull_priority_per_stock_amount_multiplier=1.0,
-                bull_priority_max_per_stock_amount_multiplier=1.0,
-                bull_priority_max_single_position_pct=0.35,
-                bull_priority_effective_slots=2,
-                bull_priority_initial_entry_scale=0.65,
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
             ),
         )
-        priority_strategy._bear_score = 0
-        plain_strategy._bear_score = 0
-        now = datetime(2026, 3, 18, 10, 30)
-        priority_strategy.set_simulated_now(now)
-        plain_strategy.set_simulated_now(now)
-
-        leader_history = [
-            Quote("263750", "펄어비스", 60_000, 0, 0.0, 60_000, 60_000, 59_500, 30_000, 1_800_000_000),
-            Quote("263750", "펄어비스", 60_800, 800, 1.33, 60_000, 60_800, 59_500, 45_000, 2_736_000_000),
-            Quote("263750", "펄어비스", 61_400, 1_400, 2.33, 60_000, 61_400, 59_500, 60_000, 3_684_000_000),
-            Quote("263750", "펄어비스", 61_800, 1_800, 3.00, 60_000, 61_800, 59_500, 72_000, 4_449_600_000),
-            Quote("263750", "펄어비스", 62_000, 2_000, 3.33, 60_000, 62_000, 59_500, 78_000, 4_836_000_000),
-        ]
-        for quote in leader_history:
-            priority_strategy._record_recent_quote(quote)
-            priority_strategy._quotes_cache[quote.symbol] = quote
-            plain_strategy._record_recent_quote(quote)
-            plain_strategy._quotes_cache[quote.symbol] = quote
-
-        higher_turnover = Quote(
-            "005930",
-            "삼성전자",
-            70_000,
-            700,
-            1.0,
-            69_300,
-            70_100,
-            69_000,
-            80_000,
-            5_600_000_000,
+        now = datetime(2026, 5, 27, 12, 58, 0)
+        strategy.set_simulated_now(now)
+        quote = Quote("EV005", "EV005", 10_000, 260, 2.67, 9_740, 10_050, 9_650, 300_000, 3_000_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=False,
+            reason="insufficient_samples",
+            horizon_seconds=180,
+            sample_count=1,
+            predicted_return_pct=0.0,
+            lower_bound_return_pct=0.0,
+            upper_bound_return_pct=0.0,
+            confidence=0.0,
+            direction_score=0.0,
+            volatility_pct=0.0,
         )
-        for strategy in (priority_strategy, plain_strategy):
-            strategy._quotes_cache[higher_turnover.symbol] = higher_turnover
-            for symbol, change_rate, price, volume in (
-                ("000660", 0.9, 40_000, 20_000),
-                ("035420", 1.1, 25_000, 18_000),
-            ):
-                quote = Quote(
-                    symbol,
-                    symbol,
-                    price,
-                    100,
-                    change_rate,
-                    price - 200,
-                    price + 100,
-                    price - 300,
-                    volume,
-                    price * volume,
-                )
-                strategy._quotes_cache[symbol] = quote
+        meta = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "live_route": INTRADAY_STRATEGY,
+            "leader_percentile": 1.0,
+            "effective_leader_score": 1.25,
+            "recent_accel": 0.28,
+            "volume_vs_avg": 1.20,
+            "vs_open_pct": 2.67,
+            "high_proximity": 0.995,
+        }
 
-        priority_order = priority_strategy._evaluate_buy(leader_history[-1])
-        plain_order = plain_strategy._evaluate_buy(leader_history[-1])
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
 
-        self.assertIsNotNone(priority_order)
-        self.assertIsNotNone(plain_order)
-        self.assertGreater(priority_order.quantity, plain_order.quantity)
+        self.assertFalse(plan.allowed)
+        self.assertEqual(plan.reject_reason, "ev_prediction_not_ready")
+        self.assertIsNotNone(plan.prediction)
+        self.assertEqual(plan.prediction.reason, "insufficient_samples")
 
-    def test_neutral_first_entry_requires_stronger_quality_than_later_entries(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            neutral_first_entry_score_bonus=0.4,
-            neutral_first_entry_change_rate_bonus=0.2,
+    def test_ev_reject_log_is_compact_without_legacy_gate_fields(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
         )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-
-        history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_150, 150, 1.5, 10_000, 10_220, 9_950, 35_000, 350_000),
-            Quote("011700", "미원", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 40_000, 400_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        ok, _, reject = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.1)
-        self.assertFalse(ok)
-        self.assertEqual(reject, "neutral_score")
-
-        strategy.daily_pnl.trade_count = 1
-        ok, setup_name, _ = strategy._passes_neutral_pullback_reclaim_setup(history[-1], score=2.1)
-        self.assertTrue(ok)
-        self.assertEqual(setup_name, "neutral_pullback_reclaim")
-
-    def test_bull_a_grade_uses_partial_take_profit_once(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=False,
-            take_profit_pct=1.0,
-            bull_partial_exit_ratio=0.5,
-            enable_cost_aware_profit_exit=False,
+        now = datetime(2026, 5, 27, 12, 59, 51)
+        quote = Quote("308080", "테스트", 10_000, 1_000, 11.27, 8_987, 10_560, 8_860, 300_000, 3_000_000_000, now)
+        prediction = ShortHorizonPrediction(
+            ready=True,
+            reason="context_quote_projection",
+            horizon_seconds=180,
+            sample_count=1,
+            predicted_return_pct=-0.12,
+            lower_bound_return_pct=-0.74,
+            upper_bound_return_pct=0.31,
+            confidence=0.42,
+            direction_score=0.37,
+            volatility_pct=0.30,
         )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
+        plan = ExpectedValueTradePlan(
+            allowed=False,
+            reject_reason="ev_prediction_non_positive",
+            prediction=prediction,
+        )
+        meta = {
+            "queue_source": "math_queue",
+            "conviction_rank": 6,
+            "conviction_score": 0.133,
+            "vs_open_pct": 11.27,
+            "high_proximity": 0.560,
+        }
+
+        with self.assertLogs("kis_trader.strategy.momentum_scalp", level="INFO") as captured:
+            strategy._log_ev_reject(quote, INTRADAY_STRATEGY, plan.reject_reason, meta, plan)
+
+        line = captured.output[0]
+        self.assertIn("EV 진입 거부[ev_prediction_non_positive]", line)
+        self.assertIn("pred=-0.120", line)
+        self.assertLess(len(line), 420)
+        self.assertNotIn("target_edge", line)
+        self.assertNotIn("scout_neg_ev", line)
+        self.assertNotIn("risk_sizing", line)
+
+    def test_ev_reject_log_includes_best_rejected_quantity_detail(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
+        )
+        now = datetime(2026, 6, 22, 9, 15, 39)
+        quote = Quote("080220", "080220", 123_000, 11_000, 9.82, 112_000, 123_500, 112_000, 500_000, 61_500_000_000, now)
+        prediction = ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_reject_detail",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=1.332,
+            lower_bound_return_pct=0.580,
+            upper_bound_return_pct=1.75,
+            confidence=0.716,
+            direction_score=0.70,
+            volatility_pct=0.34,
+        )
+        plan = ExpectedValueTradePlan(
+            allowed=False,
+            reject_reason="ev_no_positive_quantity",
             quantity=4,
-            invested_amount=40_000,
-            entry_strategy_name="bull_breakout_strategy",
-            entry_setup_name="bull_breakout",
-            entry_grade="A",
+            budget=492_000,
+            expected_net=312.4,
+            predicted_net=5_210,
+            lower_net=2_080,
+            win_probability=0.442,
+            break_even_probability=0.487,
+            planned_target_net=5_210,
+            planned_stop_net_loss_abs=2_200,
+            planned_risk_net_loss_abs=2_650,
+            prediction=prediction,
+            reject_detail="risk_room_exceeded:need=5800 room=5000",
+        )
+        meta = {
+            "queue_source": "math_queue",
+            "conviction_rank": 3,
+            "conviction_score": 0.83,
+            "vs_open_pct": 9.82,
+            "high_proximity": 0.996,
+        }
+
+        with self.assertLogs("kis_trader.strategy.momentum_scalp", level="INFO") as captured:
+            strategy._log_ev_reject(quote, INTRADAY_STRATEGY, plan.reject_reason, meta, plan)
+
+        line = captured.output[0]
+        self.assertIn("EV 진입 거부[ev_no_positive_quantity]", line)
+        self.assertIn("qty=4", line)
+        self.assertIn("pnet=5210", line)
+        self.assertIn("detail=risk_room_exceeded:need=5800 room=5000", line)
+
+    def test_expected_value_plan_allows_small_recovery_trade_when_loss_room_supports_risk(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=2_500,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        strategy.daily_pnl.realized_net_pnl = -4_519
+        now = datetime(2026, 6, 1, 13, 32, 57)
+        strategy.set_simulated_now(now)
+        quote = Quote("006660", "006660", 17_640, 1_250, 7.63, 16_390, 17_700, 16_390, 500_000, 8_820_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_recovery_continuation",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=1.50,
+            lower_bound_return_pct=0.20,
+            upper_bound_return_pct=2.20,
+            confidence=0.860,
+            direction_score=0.860,
+            volatility_pct=0.30,
+            features={
+                "continuation_quality": 0.88,
+                "follow_through_score": 0.88,
+                "rejection_risk_score": 0.02,
+                "chase_risk_score": 0.03,
+                "trap_risk_score": 0.02,
+            },
+        )
+        meta = {"strategy_name": INTRADAY_STRATEGY, "live_route": INTRADAY_STRATEGY}
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertGreater(plan.expected_net, 0.0)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 481)
+        self.assertLess(plan.planned_target_net, 10_000)
+
+
+
+
+    def test_expected_value_plan_allows_late_session_high_extension_continuation(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=2_500,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 11, 12, 6, 40)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 6, 11, 9, 0, 0)
+        quote = Quote("001820", "001820", 121_900, 15_620, 14.69, 106_280, 121_900, 106_000, 1_000_000, 121_900_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_late_high_extension_continuation",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=1.155,
+            lower_bound_return_pct=0.175,
+            upper_bound_return_pct=1.700,
+            confidence=0.776,
+            direction_score=0.776,
+            volatility_pct=0.30,
+            features={
+                "continuation_quality": 0.72,
+                "follow_through_score": 0.70,
+                "rejection_risk_score": 0.05,
+                "chase_risk_score": 0.08,
+                "trap_risk_score": 0.06,
+            },
+        )
+        meta = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "live_route": INTRADAY_STRATEGY,
+            "queue_source": "math_queue",
+            "conviction_rank": 1,
+            "conviction_score": 0.6423,
+            "vs_open_pct": 14.69,
+            "high_proximity": 1.0,
+        }
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertGreater(plan.expected_net, 0.0)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 4_750)
+
+
+
+    def test_expected_value_plan_sizes_down_opening_budget_consuming_b_trade(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=2_500,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 12, 9, 4, 20)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 6, 12, 9, 0, 0)
+        quote = Quote("089030", "089030", 66_000, 1_900, 2.96, 64_100, 66_100, 63_900, 600_000, 39_600_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_opening_budget_consuming_b_trade",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=1.960,
+            lower_bound_return_pct=0.203,
+            upper_bound_return_pct=2.300,
+            confidence=0.721,
+            direction_score=0.721,
+            volatility_pct=0.30,
+            features={
+                "continuation_quality": 0.68,
+                "follow_through_score": 0.66,
+                "rejection_risk_score": 0.05,
+                "chase_risk_score": 0.08,
+                "trap_risk_score": 0.06,
+            },
+        )
+        meta = {
+            "strategy_name": OPENING_STRATEGY,
+            "live_route": OPENING_STRATEGY,
+            "queue_source": "opening_hot_queue",
+            "entry_grade": "B",
+            "leader_percentile": 0.7895,
+            "conviction_rank": 1,
+            "conviction_score": 0.4211,
+            "vs_open_pct": 2.96,
+            "high_proximity": 0.998,
+        }
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertLess(plan.quantity, 15)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 5_000)
+
+    def test_expected_value_plan_allows_opening_ev_within_loss_room_today_089030(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 25, 9, 2, 50)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 6, 25, 9, 0, 0)
+        quote = Quote("089030", "089030", 55_400, 2_900, 5.52, 52_500, 60_950, 52_400, 900_000, 49_860_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_today_089030_opening_ev",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=2.021,
+            lower_bound_return_pct=1.392,
+            upper_bound_return_pct=2.450,
+            confidence=0.568,
+            direction_score=0.836,
+            volatility_pct=0.30,
+            features={
+                "continuation_quality": 0.72,
+                "follow_through_score": 0.70,
+                "rejection_risk_score": 0.05,
+                "chase_risk_score": 0.08,
+                "trap_risk_score": 0.06,
+            },
+        )
+        meta = {
+            "strategy_name": OPENING_STRATEGY,
+            "live_route": OPENING_STRATEGY,
+            "queue_source": "opening_fast_queue",
+            "entry_grade": "A",
+            "leader_percentile": 0.90,
+            "conviction_rank": 1,
+            "conviction_score": 0.7728,
+            "effective_leader_score": 0.95,
+            "vs_open_pct": 5.52,
+            "high_proximity": 0.909,
+        }
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_detail)
+        self.assertGreater(plan.expected_net, 0)
+        self.assertGreater(plan.predicted_net, 0)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 5_000)
+        self.assertNotIn("ev_opening_risk_share_ceiling", meta)
+
+    def test_prediction_uncertainty_does_not_masquerade_as_execution_cost(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.00015,
+                tax_slippage_rate=0.002,
+                entry_market_slippage_rate=0.001,
+                exit_market_slippage_rate=0.001,
+            ),
+        )
+        prediction = ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_high_uncertainty",
+            horizon_seconds=180,
+            sample_count=5,
+            predicted_return_pct=1.0,
+            lower_bound_return_pct=-2.0,
+            upper_bound_return_pct=4.0,
+            confidence=0.2,
+            direction_score=0.6,
+            volatility_pct=1.8,
+            features={
+                "opening_instability_risk": 1.0,
+                "intraday_impulse_instability_risk": 1.0,
+                "quote_gap_risk": 1.0,
+                "trap_risk_score": 1.0,
+            },
         )
 
+        self.assertEqual(strategy._entry_execution_slippage_rate(prediction), 0.001)
+        self.assertAlmostEqual(strategy._round_trip_execution_cost_pct(), 0.43)
+
+    def test_long_shortlist_excludes_symbols_that_cannot_be_bought_even_one_share(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(seed_money=1_000_000),
+        )
+        now = datetime(2026, 7, 23, 10, 30, 0)
+        expensive = Quote("000660", "000660", 1_860_000, 0, 0.0, 1_860_000, 1_860_000, 1_860_000, 1, 1, now)
+        affordable = Quote("005930", "005930", 70_000, 0, 0.0, 70_000, 70_000, 70_000, 1, 1, now)
+        strategy._fresh_market_state_quotes = lambda _quotes: [expensive, affordable]
+        strategy._long_ev_strategy_name_for_quote = lambda _quote: INTRADAY_STRATEGY
+        strategy._remaining_long_exposure_budget = lambda _orders: 1_000_000
+        strategy._remaining_long_seed_exposure_budget = lambda _orders: 1_000_000
+
+        shortlist = strategy._long_entry_shortlist([expensive, affordable])
+
+        self.assertEqual([quote.symbol for quote in shortlist], ["005930"])
+
+
+
+
+
+    def test_expected_value_plan_sizes_126730_shape_inside_loss_room(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 5, 27, 13, 46, 58)
+        strategy.set_simulated_now(now)
+        quote = Quote("126730", "126730", 26_400, 1_400, 5.60, 25_000, 26_500, 24_900, 400_000, 10_000_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_126730_shape",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=1.018,
+            lower_bound_return_pct=-0.814,
+            upper_bound_return_pct=1.55,
+            confidence=0.534,
+            direction_score=0.648,
+            volatility_pct=0.35,
+        )
+        meta = {"strategy_name": INTRADAY_STRATEGY, "live_route": INTRADAY_STRATEGY}
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_detail)
+        self.assertGreater(plan.expected_net, 0.0)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 5_000)
+
+
+    def test_expected_value_plan_caps_quantity_by_lower_bound_loss_risk(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 5, 27, 13, 50, 0)
+        strategy.set_simulated_now(now)
+        quote = Quote("EV006", "EV006", 26_400, 1_400, 5.60, 25_000, 26_500, 24_900, 400_000, 10_000_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_lower_risk_cap",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=3.20,
+            lower_bound_return_pct=-0.814,
+            upper_bound_return_pct=3.80,
+            confidence=0.82,
+            direction_score=0.82,
+            volatility_pct=0.35,
+        )
+        meta = {"strategy_name": INTRADAY_STRATEGY, "live_route": INTRADAY_STRATEGY}
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertLess(plan.quantity, 37)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 5_000)
+        self.assertLessEqual(abs(min(0, int(plan.lower_net))), 5_000)
+        self.assertLessEqual(plan.planned_stop_net_loss_abs, plan.planned_risk_net_loss_abs)
+
+    def test_expected_value_plan_reserves_execution_buffer_inside_daily_loss_room(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 5, 9, 2, 53)
+        strategy.set_simulated_now(now)
+        quote = Quote("403870", "403870", 49_800, 2_500, 5.29, 47_300, 49_900, 47_300, 500_000, 24_900_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_403870_loss_room_buffer",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=1.869,
+            lower_bound_return_pct=-0.100,
+            upper_bound_return_pct=2.20,
+            confidence=0.597,
+            direction_score=0.603,
+            volatility_pct=0.35,
+            features={
+                "continuation_quality": 0.70,
+                "follow_through_score": 0.68,
+                "rejection_risk_score": 0.05,
+                "chase_risk_score": 0.08,
+                "trap_risk_score": 0.06,
+            },
+        )
+        meta = {"strategy_name": OPENING_STRATEGY, "live_route": OPENING_STRATEGY}
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertLess(plan.planned_stop_net_loss_abs, plan.planned_risk_net_loss_abs)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 5_000)
+        self.assertLessEqual(plan.planned_stop_net_loss_abs, 4_100)
+
+    def test_expected_value_plan_allows_opening_positive_lower_without_double_counted_noise(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 7, 6, 9, 0, 16)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = now.replace(hour=9, minute=0, second=0, microsecond=0)
         quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_120,
-            change=120,
-            change_rate=1.2,
-            open_price=10_000,
-            high_price=10_120,
-            low_price=9_980,
-            volume=200_000,
-            trade_amount=2_024_000_000,
+            "000210",
+            "000210",
+            47_150,
+            0,
+            2.06,
+            46_198,
+            47_150,
+            46_100,
+            100_000,
+            4_715_000_000,
+            now,
+        )
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_opening_positive_lower_no_double_counted_noise",
+            horizon_seconds=180,
+            sample_count=5,
+            predicted_return_pct=0.725,
+            lower_bound_return_pct=0.277,
+            upper_bound_return_pct=0.90,
+            confidence=0.699,
+            direction_score=0.715,
+            volatility_pct=0.20,
+        )
+        meta = {
+            "strategy_name": OPENING_STRATEGY,
+            "live_route": OPENING_STRATEGY,
+            "queue_source": "opening_hot_queue",
+            "vs_open_pct": 2.06,
+            "high_proximity": 1.0,
+        }
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertGreater(plan.predicted_net, 0)
+        self.assertGreater(plan.expected_net, 0.0)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 4_750)
+
+
+    def test_expected_value_plan_counts_open_long_risk_against_daily_loss_room(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=3_500,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 8, 10, 30, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["006220"] = PositionState(
+            symbol="006220",
+            buy_price=11_930,
+            quantity=16,
+            invested_amount=190_880,
+            buy_time=now - timedelta(minutes=85),
+            planned_stop_net_loss_abs=1_339,
+            planned_risk_net_loss_abs=1_741,
+        )
+        quote = Quote("036170", "036170", 5_490, 120, 2.23, 5_370, 5_510, 5_360, 500_000, 2_745_000_000, now)
+        self._install_strong_ev_prediction(
+            strategy,
+            predicted_return_pct=1.80,
+            lower_bound_return_pct=-0.12,
+            upper_bound_return_pct=2.20,
+            confidence=0.76,
+            direction_score=0.74,
+        )
+        meta = {"strategy_name": INTRADAY_STRATEGY, "live_route": INTRADAY_STRATEGY}
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertEqual(meta["open_long_planned_loss_risk"], 1_741)
+        self.assertEqual(meta["committed_long_planned_loss_risk"], 1_741)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 3_259)
+
+
+    def test_expected_value_plan_does_not_let_historical_ev_block_live_positive_ev(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 5, 27, 13, 57, 42)
+        strategy.set_simulated_now(now)
+        quote = Quote("001540", "001540", 11_650, 650, 5.91, 11_000, 11_700, 11_000, 500_000, 5_825_000_000, now)
+        strategy._price_prediction_for_entry = lambda *_args, **_kwargs: ShortHorizonPrediction(
+            ready=True,
+            reason="unit_test_001540_shape",
+            horizon_seconds=180,
+            sample_count=8,
+            predicted_return_pct=2.554,
+            lower_bound_return_pct=0.304,
+            upper_bound_return_pct=3.10,
+            confidence=0.779,
+            direction_score=0.775,
+            volatility_pct=0.40,
+        )
+        meta = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "live_route": INTRADAY_STRATEGY,
+            "entry_ev": -1_896.56,
+            "entry_ev_confidence": "high",
+            "entry_ev_closed_trades": 8,
+        }
+
+        plan = strategy._build_expected_value_trade_plan(quote, meta, pending_orders=[])
+
+        self.assertTrue(plan.allowed, plan.reject_reason)
+        self.assertGreater(plan.quantity, 0)
+        self.assertLess(plan.quantity, 85)
+        self.assertLessEqual(plan.planned_risk_net_loss_abs, 5_000)
+
+
+
+
+
+
+    def test_ev_precheck_honors_recent_loss_symbol_cooldown(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                enable_intraday_conviction_lane=True,
+                loss_symbol_cooldown_seconds=1800,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 5, 13, 52, 0)
+        strategy.set_simulated_now(now)
+        quote = Quote("090360", "090360", 151_300, 3_300, 2.23, 148_000, 152_000, 144_000, 900_000, 90_000_000_000, now)
+        strategy._mark_symbol_entry_cooldown("090360", seconds=1800)
+
+        reason = strategy._long_ev_precheck_reject_reason(
+            quote,
+            pending_orders=[],
+            strategy_name_override=INTRADAY_STRATEGY,
+        )
+
+        self.assertEqual(reason, "symbol_recent_loss_cooldown")
+
+    def test_ev_precheck_rejects_unsupported_long_symbol_shape(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                enable_intraday_conviction_lane=True,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 11, 10, 13, 43)
+        strategy.set_simulated_now(now)
+        quote = Quote("0195S0", "0195S0", 20_515, 3_000, 16.74, 17_570, 20_520, 17_500, 500_000, 10_257_500_000, now)
+
+        reason = strategy._long_ev_precheck_reject_reason(
+            quote,
+            pending_orders=[],
+            strategy_name_override=INTRADAY_STRATEGY,
+        )
+
+        self.assertEqual(reason, "unsupported_long_symbol")
+
+
+    def test_ev_precheck_blocks_unresolved_market_pending_long_entry(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                enable_intraday_conviction_lane=True,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 5, 15, 13, 0)
+        strategy.set_simulated_now(now)
+        strategy._pending_entry_meta["001820"] = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "live_route": INTRADAY_STRATEGY,
+            "pending_order_quantity": 7,
+            "pending_order_reference_price": 114_800,
+            "planned_risk_net_loss_abs": 4_537,
+        }
+        quote = Quote("242040", "242040", 8_630, 650, 8.14, 7_980, 8_700, 7_950, 700_000, 6_041_000_000, now)
+
+        reason = strategy._long_ev_precheck_reject_reason(
+            quote,
+            pending_orders=[],
+            strategy_name_override=INTRADAY_STRATEGY,
+        )
+
+        self.assertEqual(reason, "pending_long_entry_unresolved")
+
+    def test_planned_stop_exit_runs_before_rebound_guards(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 5, 27, 13, 30, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["EV004"] = PositionState(
+            symbol="EV004",
+            buy_price=10_000,
+            quantity=10,
+            invested_amount=100_000,
+            buy_time=now - timedelta(minutes=5),
+            planned_stop_net_loss_abs=200,
+            planned_target_net_pnl=500,
+        )
+        quote = Quote("EV004", "EV004", 9_950, -50, -0.5, 10_000, 10_010, 9_940, 100_000, 995_000_000, now)
+
+        order = strategy._default_long_exit(quote)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order.side, OrderSide.SELL)
+        self.assertEqual(order.requested_reason, "ev_planned_stop_net")
+
+    def test_planned_stop_runs_while_market_buy_reconcile_is_pending(self):
+        strategy = MomentumScalpStrategy(
+            market_data=SimpleNamespace(
+                client=SimpleNamespace(config=SimpleNamespace(is_paper=True)),
+            ),
+            config=MomentumScalpConfig(
+                paper_position_exit_grace_seconds=20,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 7, 16, 9, 2, 10)
+        strategy.set_simulated_now(now)
+        strategy.positions["051980"] = PositionState(
+            symbol="051980",
+            buy_price=1_219,
+            quantity=301,
+            invested_amount=366_919,
+            buy_time=now - timedelta(seconds=5),
+            planned_stop_net_loss_abs=2_575,
+            planned_target_net_pnl=3_660,
+            pending_entry_started_at=now - timedelta(seconds=5),
+            pending_entry_reference_price=1_219,
+            pending_entry_fill_mode="market_pending",
+        )
+        quote = Quote(
+            "051980", "051980", 1_172, 63, 5.68, 1_109, 1_219, 1_109,
+            1_000_000, 1_172_000_000, now,
         )
 
         order = strategy._default_long_exit(quote)
+
         self.assertIsNotNone(order)
-        self.assertEqual(order.quantity, 2)
+        self.assertEqual(order.quantity, 301)
+        self.assertEqual(order.requested_reason, "ev_planned_stop_net")
 
-        strategy.on_order_filled(
-            OrderResult(
-                success=True,
-                symbol="005930",
-                side=OrderSide.SELL,
-                quantity=2,
-                price=10_120,
-            )
-        )
+    def test_entry_ev_loader_ignores_stale_scorecards_by_calendar_age(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                report_dir = Path("reports/2026/05")
+                report_dir.mkdir(parents=True)
+                today = datetime.now().date()
+                stale_date = today - timedelta(days=30)
+                recent_date = today - timedelta(days=1)
+                stale_card = {
+                    "date": stale_date.isoformat(),
+                    "log_analysis": {
+                        "trade_records": [
+                            {
+                                "strategy_name": INTRADAY_STRATEGY,
+                                "regime_label": "neutral",
+                                "hour_bucket": "10",
+                                "entry_grade_math": "A",
+                                "net_pnl": -5000,
+                            }
+                        ]
+                    },
+                }
+                recent_card = {
+                    "date": recent_date.isoformat(),
+                    "log_analysis": {
+                        "trade_records": [
+                            {
+                                "strategy_name": INTRADAY_STRATEGY,
+                                "regime_label": "neutral",
+                                "hour_bucket": "10",
+                                "entry_grade_math": "A",
+                                "net_pnl": 1500,
+                            }
+                        ]
+                    },
+                }
+                (report_dir / f"daily-scorecard.{stale_date.isoformat()}.json").write_text(
+                    json.dumps(stale_card),
+                    encoding="utf-8",
+                )
+                (report_dir / f"daily-scorecard.{recent_date.isoformat()}.json").write_text(
+                    json.dumps(recent_card),
+                    encoding="utf-8",
+                )
+                cfg = MomentumScalpConfig(
+                    ev_window_days=5,
+                    conviction_ev_window_days=20,
+                    ev_scorecard_max_age_days=8,
+                    conviction_ev_scorecard_max_age_days=14,
+                    ev_min_samples=1,
+                    daily_state_path=str(Path(tmpdir) / "state.json"),
+                    strategy_gate_path=str(Path(tmpdir) / "strategy-gates.json"),
+                )
 
-        self.assertIn("005930", strategy.positions)
-        self.assertEqual(strategy.positions["005930"].quantity, 2)
-        self.assertTrue(strategy.positions["005930"].partial_exit_done)
-        self.assertEqual(strategy.daily_pnl.trade_count, 1)
-        self.assertIsNone(strategy._default_long_exit(quote))
+                strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+                strategy._load_entry_ev_data()
 
-    def test_neutral_long_is_blocked_after_one_neutral_loss(self):
+                self.assertEqual(len(strategy._entry_ev_history_records), 1)
+                self.assertEqual(strategy._entry_ev_history_records[0]["net_pnl"], 1500)
+            finally:
+                os.chdir(previous_cwd)
+
+    def test_intraday_conviction_remains_active_until_late_cutoff(self):
         cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            neutral_max_losses_per_day=1,
+            enable_intraday_conviction_lane=True,
+            opening_conviction_window_minutes=5,
+            intraday_conviction_end_minutes_after_open=381,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-        strategy._neutral_loss_count_today = 1
+        strategy._session_start_at = datetime(2026, 5, 13, 9, 0, 0)
 
-        quote = Quote(
-            "011700",
-            "미원",
-            10_220,
-            220,
-            2.2,
-            10_000,
-            10_220,
-            9_950,
-            40_000,
-            400_000,
-        )
+        strategy.set_simulated_now(datetime(2026, 5, 13, 15, 10, 0))
+        self.assertTrue(strategy._intraday_conviction_window_active())
 
-        can_open = strategy._can_open_new_long(quote)
-        self.assertFalse(can_open)
+        strategy.set_simulated_now(datetime(2026, 5, 13, 15, 22, 0))
+        self.assertFalse(strategy._intraday_conviction_window_active())
 
-    def test_neutral_long_blocks_during_post_loss_cooldown(self):
+    def test_sell_fill_uses_recent_quote_when_broker_price_is_zero(self):
         cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            neutral_max_losses_per_day=1,
-            neutral_post_loss_cooldown_minutes=30,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy._neutral_loss_count_today = 1
-        strategy._neutral_last_loss_at = datetime(2026, 3, 16, 9, 40)
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-
-        quote = Quote(
-            "011700",
-            "미원",
-            10_220,
-            220,
-            2.2,
-            10_000,
-            10_220,
-            9_950,
-            40_000,
-            400_000,
-        )
-
-        with patch("src.strategies.momentum_scalp.logger.info") as mock_info:
-            can_open = strategy._can_open_new_long(quote, score=2.6)
-
-        self.assertFalse(can_open)
-        log_args = " ".join(str(call.args) for call in mock_info.call_args_list)
-        self.assertIn("neutral_loss_cooldown", log_args)
-
-    def test_loss_stage1_allows_only_high_quality_neutral_entries(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            stage1_loss_threshold=-2_000,
-            stage1_neutral_score_bonus=0.5,
-            stage1_neutral_change_rate_bonus=0.2,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-        strategy.daily_pnl.realized_net_pnl = -2_500
-        strategy.daily_pnl.trade_count = 1
-
-        weak_quote = Quote(
-            "011700",
-            "미원",
-            10_220,
-            220,
-            2.2,
-            10_000,
-            10_220,
-            9_950,
-            40_000,
-            400_000,
-        )
-        strong_quote = Quote(
-            "011700",
-            "미원",
-            10_220,
-            220,
-            2.6,
-            10_000,
-            10_220,
-            9_950,
-            40_000,
-            400_000,
-        )
-
-        self.assertFalse(strategy._can_open_new_long(weak_quote, score=2.5))
-        self.assertTrue(strategy._can_open_new_long(strong_quote, score=3.2))
-
-    def test_neutral_post_loss_retry_requires_stronger_setup(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            neutral_max_losses_per_day=1,
-            neutral_post_loss_cooldown_minutes=20,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy._neutral_loss_count_today = 1
-        strategy._neutral_last_loss_at = datetime(2026, 3, 16, 9, 30)
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 0))
-
-        borderline_history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_150, 150, 1.5, 10_000, 10_220, 9_950, 35_000, 350_000),
-            Quote("011700", "미원", 10_220, 220, 2.2, 10_000, 10_220, 9_950, 40_000, 400_000),
-        ]
-        for quote in borderline_history:
-            strategy._record_recent_quote(quote)
-
-        ok, _, reject = strategy._passes_neutral_pullback_reclaim_setup(borderline_history[-1], score=2.1)
-        self.assertFalse(ok)
-        self.assertEqual(reject, "neutral_chase_block")
-
-        strategy._recent_quotes = {}
-        strong_history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_260, 260, 2.6, 10_000, 10_260, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_150, 150, 1.5, 10_000, 10_260, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_165, 165, 1.65, 10_000, 10_260, 9_950, 35_000, 350_000),
-            Quote("011700", "미원", 10_170, 170, 1.7, 10_000, 10_260, 9_950, 38_000, 380_000),
-            Quote("011700", "미원", 10_280, 280, 2.8, 10_000, 10_280, 9_950, 42_000, 420_000),
-        ]
-        for quote in strong_history:
-            strategy._record_recent_quote(quote)
-
-        can_open = strategy._can_open_new_long(strong_history[-1], score=2.6)
-        ok, setup_name, _ = strategy._passes_neutral_pullback_reclaim_setup(strong_history[-1], score=2.6)
-        self.assertTrue(can_open)
-        self.assertTrue(ok)
-        self.assertEqual(setup_name, "neutral_pullback_reclaim")
-
-    def test_neutral_post_loss_retry_is_limited_to_one_fill(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            neutral_max_losses_per_day=1,
-            neutral_post_loss_cooldown_minutes=20,
-            neutral_post_loss_reentry_limit=1,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy._neutral_loss_count_today = 1
-        strategy._neutral_last_loss_at = datetime(2026, 3, 16, 9, 30)
-        strategy.set_simulated_now(datetime(2026, 3, 16, 10, 5))
-
-        strategy._pending_entry_meta["011700"] = {"neutral_post_loss_retry": True}
-        strategy.on_order_filled(
-            OrderResult(
-                success=True,
-                symbol="011700",
-                side=OrderSide.BUY,
-                quantity=10,
-                price=10_280,
-            )
-        )
-
-        self.assertEqual(strategy._neutral_post_loss_reentries_today, 1)
-
-        quote = Quote(
-            "011700",
-            "미원",
-            10_300,
-            300,
-            3.0,
-            10_000,
-            10_300,
-            9_950,
-            50_000,
-            500_000,
-        )
-        can_open = strategy._can_open_new_long(quote, score=2.8)
-        self.assertFalse(can_open)
-
-    def test_shadow_tracking_records_blocked_neutral_candidate_outcome(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            neutral_max_losses_per_day=1,
-            shadow_blocked_candidate_window_minutes=1,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy._neutral_loss_count_today = 1
-        strategy.set_simulated_now(datetime(2026, 3, 16, 13, 2, 0))
-
-        blocked_quote = Quote(
-            "011700",
-            "미원",
-            10_220,
-            220,
-            2.2,
-            10_000,
-            10_220,
-            9_950,
-            40_000,
-            400_000,
-        )
-
-        with patch("src.strategies.momentum_scalp.logger.info") as mock_info:
-            can_open = strategy._can_open_new_long(blocked_quote)
-            self.assertFalse(can_open)
-            self.assertIn("011700", strategy._shadow_blocked_candidates)
-
-            candidate = strategy._shadow_blocked_candidates["011700"]
-            self.assertEqual(candidate.reject_reason, "neutral_loss_limit_block")
-            self.assertEqual(candidate.entry_price, 10_220)
-
-            target_price = int(candidate.entry_price * (1 + (candidate.target_pct / 100) + 0.01))
-            strategy.set_simulated_now(datetime(2026, 3, 16, 13, 3, 1))
-            strategy._update_shadow_blocked_candidates(
-                [
-                    Quote(
-                        "011700",
-                        "미원",
-                        target_price,
-                        target_price - 10_000,
-                        3.4,
-                        10_000,
-                        target_price,
-                        9_950,
-                        50_000,
-                        500_000,
-                    )
-                ]
-            )
-
-        self.assertEqual(candidate.first_hit_outcome, "take_profit_first")
-        self.assertNotIn("011700", strategy._shadow_blocked_candidates)
-        log_args = " ".join(str(call.args) for call in mock_info.call_args_list)
-        self.assertIn("그림자 후보 추적 시작", log_args)
-        self.assertIn("그림자 후보 종료", log_args)
-        self.assertIn("take_profit_first", log_args)
-
-    def test_soft_bear_profile_can_disable_inverse_by_config(self):
-        strategy = MomentumScalpStrategy(
-            market_data=None,
-            config=MomentumScalpConfig(
-                inverse_enabled=True,
-                inverse_max_positions=1,
-                soft_bear_inverse_max_positions=0,
-            ),
-        )
-        strategy._bear_score = 2
-
-        self.assertEqual(strategy._resolve_regime_profile_name(), "soft_bear")
-        self.assertEqual(strategy._regime_inverse_max_positions(), 0)
-
-    def test_stage1_blocks_new_neutral_long_entries(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            stage1_loss_threshold=-3_000,
-            profit_protect_threshold=999_999,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        strategy.daily_pnl.realized_net_pnl = -3_100
-
-        history = [
-            Quote("011700", "미원", 10_000, 0, 0.0, 10_000, 10_000, 9_950, 10_000, 100_000),
-            Quote("011700", "미원", 10_200, 200, 2.0, 10_000, 10_200, 9_950, 20_000, 200_000),
-            Quote("011700", "미원", 10_120, 120, 1.2, 10_000, 10_220, 9_950, 30_000, 300_000),
-            Quote("011700", "미원", 10_205, 205, 2.05, 10_000, 10_220, 9_950, 40_000, 400_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        order = strategy._evaluate_buy(history[-1])
-        self.assertIsNone(order)
-
-    def test_dynamic_stop_amount_uses_tighter_notional_cap(self):
-        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
-        long_pos = PositionState(symbol="AAA", buy_price=10_000, quantity=20, invested_amount=200_000)
-        inverse_pos = PositionState(symbol="252670", buy_price=2_000, quantity=500, invested_amount=1_000_000)
-
-        self.assertEqual(strategy._long_stop_loss_amount(long_pos), -1_400)
-        self.assertEqual(strategy._inverse_stop_loss_amount(inverse_pos), -1_800)
-
-    def test_bullish_marginal_signal_requires_full_confirmation(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=True,
-            enable_early_session_guard=True,
-            entry_confirmation_ticks=2,
-            bullish_min_momentum_score=2.6,
-            bullish_min_momentum_score_floor=3.4,
-            bullish_fast_entry_score_bonus=0.9,
-            bullish_fast_entry_change_rate_bonus=0.6,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-
-        now = datetime.now()
-        strategy._session_start_at = now - timedelta(minutes=30)
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=71_000,
-            change=800,
-            change_rate=1.14,
-            open_price=70_200,
-            high_price=71_100,
-            low_price=70_100,
-            volume=300_000,
-            trade_amount=21_300_000_000,
-        )
-
-        first = strategy._can_confirm_entry(
-            quote=quote,
-            score=3.4,
-            is_scale_in=False,
-            now=now,
-        )
-        second = strategy._can_confirm_entry(
-            quote=quote,
-            score=3.4,
-            is_scale_in=False,
-            now=now + timedelta(seconds=10),
-        )
-
-        self.assertFalse(first)
-        self.assertTrue(second)
-
-    def test_bullish_exceptional_signal_can_still_fast_enter(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=True,
-            enable_early_session_guard=True,
-            entry_confirmation_ticks=2,
-            bullish_min_momentum_score=2.6,
-            bullish_min_momentum_score_floor=3.4,
-            bullish_fast_entry_score_bonus=0.9,
-            bullish_fast_entry_change_rate_bonus=0.6,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-
-        now = datetime.now()
-        strategy._session_start_at = now - timedelta(minutes=30)
-        quote = Quote(
-            symbol="000660",
-            name="SK하이닉스",
-            current_price=210_000,
-            change=4_500,
-            change_rate=2.19,
-            open_price=205_500,
-            high_price=210_500,
-            low_price=205_000,
-            volume=350_000,
-            trade_amount=73_500_000_000,
-        )
-
-        fast_entry = strategy._can_confirm_entry(
-            quote=quote,
-            score=4.5,
-            is_scale_in=False,
-            now=now,
-        )
-
-        self.assertTrue(fast_entry)
-
-    def test_neutral_entry_requires_multiple_confirmation_ticks(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=True,
-            entry_confirmation_ticks=2,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-
-        now = datetime(2026, 3, 16, 10, 0)
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=71_000,
-            change=900,
-            change_rate=strategy._regime_min_change_rate() + 0.2,
-            open_price=70_100,
-            high_price=71_050,
-            low_price=70_000,
-            volume=300_000,
-            trade_amount=21_300_000_000,
-        )
-
-        first_entry = strategy._can_confirm_entry(
-            quote=quote,
-            score=strategy._regime_min_momentum_score() + 0.4,
-            is_scale_in=False,
-            now=now,
-        )
-        second_entry = strategy._can_confirm_entry(
-            quote=quote,
-            score=strategy._regime_min_momentum_score() + 0.4,
-            is_scale_in=False,
-            now=now + timedelta(seconds=10),
-        )
-        third_entry = strategy._can_confirm_entry(
-            quote=quote,
-            score=strategy._regime_min_momentum_score() + 0.4,
-            is_scale_in=False,
-            now=now + timedelta(seconds=20),
-        )
-
-        self.assertFalse(first_entry)
-        self.assertFalse(second_entry)
-        self.assertTrue(third_entry)
-
-    def test_soft_bear_pullback_filter_relaxes_for_mild_breakout(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=True,
-            enable_pullback_entry_filter=True,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_220,
-            change=220,
-            change_rate=2.2,
-            open_price=10_000,
-            high_price=10_225,
-            low_price=9_980,
-            volume=500_000,
-            trade_amount=5_110_000_000,
-        )
-
-        strategy._bear_score = 2
-        self.assertTrue(strategy._passes_pullback_entry_filter(quote, is_scale_in=False))
-
-        strategy._bear_score = 3
-        self.assertFalse(strategy._passes_pullback_entry_filter(quote, is_scale_in=False))
-
-    def test_bullish_trailing_stop_waits_for_meaningful_gain(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=True,
-            take_profit_pct=5.0,
-            trailing_stop_pct=-0.7,
-            trailing_stop_activation_gain_pct=0.8,
-            bullish_trailing_stop_activation_gain_pct_floor=1.1,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 0
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=1,
-            invested_amount=10_000,
-        )
-
-        pos = strategy.positions["005930"]
-        pos.high_since_buy = 10_100  # +1.0%
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_000,
-            change=0,
-            change_rate=0.0,
-            open_price=10_000,
-            high_price=10_100,
-            low_price=9_980,
-            volume=200_000,
-            trade_amount=2_000_000_000,
-        )
-
-        self.assertIsNone(strategy._evaluate_sell(quote))
-
-    def test_take_profit_defers_when_round_trip_net_is_negative(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=False,
-            take_profit_pct=0.1,
-            enable_cost_aware_profit_exit=True,
-            min_profit_exit_net_pnl=1,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.positions["005930"] = PositionState(
-            symbol="005930",
-            buy_price=10_000,
-            quantity=1,
-            invested_amount=10_000,
-        )
-
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_010,
-            change=10,
-            change_rate=0.1,
-            open_price=10_000,
-            high_price=10_020,
-            low_price=9_990,
-            volume=100_000,
-            trade_amount=100_100_000,
-        )
-
-        self.assertIsNone(strategy._evaluate_sell(quote))
-
-    def test_trailing_stop_defers_when_round_trip_net_is_negative(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=False,
-            take_profit_pct=5.0,
-            trailing_stop_pct=-0.7,
-            trailing_stop_activation_gain_pct=0.5,
-            enable_cost_aware_profit_exit=True,
-            min_profit_exit_net_pnl=1,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 9, 13, 19, 14)
+        strategy.set_simulated_now(now)
         strategy.positions["005930"] = PositionState(
             symbol="005930",
             buy_price=10_000,
             quantity=10,
-            invested_amount=100_000,
+            entry_strategy_name="intraday_conviction_long_strategy",
         )
-        strategy.positions["005930"].high_since_buy = 10_100
-
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_020,
-            change=20,
-            change_rate=0.2,
-            open_price=10_000,
-            high_price=10_100,
-            low_price=9_990,
-            volume=100_000,
-            trade_amount=1_002_000_000,
+        strategy._recent_quotes["005930"] = deque(
+            [
+                Quote(
+                    symbol="005930",
+                    name="삼성전자",
+                    current_price=10_100,
+                    change=100,
+                    change_rate=1.0,
+                    open_price=10_000,
+                    high_price=10_120,
+                    low_price=9_980,
+                    volume=100_000,
+                    trade_amount=1_010_000_000,
+                    timestamp=now,
+                )
+            ],
+            maxlen=8,
         )
 
-        self.assertIsNone(strategy._evaluate_sell(quote))
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="005930",
+                side=OrderSide.SELL,
+                quantity=10,
+                price=0,
+                requested_price=0,
+                timestamp=now,
+            )
+        )
 
-    def test_inverse_take_profit_defers_when_round_trip_net_is_negative(self):
+        self.assertNotIn("005930", strategy.positions)
+        self.assertGreater(strategy.daily_pnl.realized_net_pnl, 0)
+
+    def test_pending_fill_does_not_mutate_strategy_positions(self):
         cfg = MomentumScalpConfig(
-            enable_regime_adaptive=False,
-            inverse_enabled=True,
-            inverse_take_profit_pct=0.1,
-            enable_cost_aware_profit_exit=True,
-            min_profit_exit_net_pnl=1,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy.positions["252670"] = PositionState(
-            symbol="252670",
+        now = datetime(2026, 4, 9, 9, 5, 0)
+        strategy.set_simulated_now(now)
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="005930",
+                side=OrderSide.BUY,
+                quantity=0,
+                price=0,
+                fill_mode="market_pending",
+                timestamp=now,
+            )
+        )
+
+        self.assertNotIn("005930", strategy.positions)
+
+    def test_pending_market_sell_reference_waits_for_reconcile_before_loss_halt(self):
+        cfg = MomentumScalpConfig(
+            enable_unrealized_loss_guard=True,
+            daily_loss_limit=-5_000,
+            daily_total_loss_limit=-5_000,
+            daily_state_path="/tmp/nonexistent-momentum-state.json",
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 6, 9, 12, 36, 19)
+        strategy.set_simulated_now(now)
+        strategy.daily_pnl.realized_net_pnl = -135
+        strategy.positions["128940"] = PositionState(
+            symbol="128940",
+            buy_price=434_000,
+            quantity=2,
+            buy_time=now - timedelta(minutes=1),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+        )
+        strategy._quotes_cache["128940"] = Quote(
+            symbol="128940",
+            name="128940",
+            current_price=431_500,
+            change=-2500,
+            change_rate=-0.58,
+            open_price=415_000,
+            high_price=435_000,
+            low_price=431_000,
+            volume=100_000,
+            trade_amount=43_150_000_000,
+            timestamp=now,
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="128940",
+                side=OrderSide.SELL,
+                quantity=0,
+                price=0,
+                reference_price=433_000,
+                fill_mode="market_pending",
+                requested_reason="ev_planned_stop_net",
+                timestamp=now,
+            )
+        )
+        strategy._update_daily_breakers()
+
+        pending_pnl = calculate_trade_pnl_from_prices(
+            entry_price=434_000,
+            exit_price=433_000,
+            quantity=2,
+            commission_rate=cfg.commission_rate,
+            tax_slippage_rate=cfg.tax_slippage_rate,
+        ).net_pnl
+        self.assertEqual(strategy.positions["128940"].pending_exit_reference_price, 433_000)
+        self.assertLess(pending_pnl, 0)
+        self.assertEqual(strategy._unrealized_net_pnl_for_daily_breaker(), 0)
+        self.assertGreater(int(strategy.daily_pnl.realized_net_pnl) + pending_pnl, -5_000)
+        self.assertFalse(strategy._halted)
+
+    def test_partial_reconciled_pending_market_sell_keeps_remaining_exit_pending_for_breaker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = MomentumScalpConfig(
+                enable_unrealized_loss_guard=True,
+                daily_loss_limit=-500,
+                daily_total_loss_limit=-500,
+                daily_state_path=str(Path(tmpdir) / "state.json"),
+            )
+            strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+            now = datetime(2026, 6, 19, 12, 44, 1)
+            strategy.set_simulated_now(now)
+            strategy.positions["046970"] = PositionState(
+                symbol="046970",
+                buy_price=8_650,
+                quantity=101,
+                buy_time=now - timedelta(minutes=1),
+                entry_strategy_name=INTRADAY_STRATEGY,
+                entry_setup_name="expected_value",
+            )
+            strategy._quotes_cache["046970"] = Quote(
+                symbol="046970",
+                name="046970",
+                current_price=8_625,
+                change=-25,
+                change_rate=-0.29,
+                open_price=8_990,
+                high_price=9_050,
+                low_price=8_600,
+                volume=1_000_000,
+                trade_amount=8_625_000_000,
+                timestamp=now,
+            )
+
+            strategy.on_order_filled(
+                OrderResult(
+                    success=True,
+                    symbol="046970",
+                    side=OrderSide.SELL,
+                    quantity=0,
+                    price=0,
+                    reference_price=8_625,
+                    fill_mode="market_pending",
+                    requested_reason="protective_stop_net",
+                    timestamp=now,
+                )
+            )
+            strategy.on_order_filled(
+                OrderResult(
+                    success=True,
+                    symbol="046970",
+                    side=OrderSide.SELL,
+                    quantity=11,
+                    price=8_625,
+                    reference_price=8_625,
+                    fill_mode="account_reconciled_estimated",
+                    requested_reason="protective_stop_net",
+                    timestamp=now + timedelta(seconds=3),
+                )
+            )
+
+            position = strategy.positions["046970"]
+            self.assertEqual(position.quantity, 90)
+            self.assertEqual(position.pending_exit_quantity, 90)
+            self.assertEqual(position.pending_exit_reference_price, 8_625)
+            self.assertEqual(strategy._unrealized_net_pnl_for_daily_breaker(), 0)
+            self.assertGreater(strategy.daily_pnl.realized_net_pnl, -500)
+            self.assertFalse(strategy._halted)
+
+            strategy.on_order_filled(
+                OrderResult(
+                    success=True,
+                    symbol="046970",
+                    side=OrderSide.SELL,
+                    quantity=90,
+                    price=8_625,
+                    reference_price=8_625,
+                    fill_mode="account_reconciled_estimated",
+                    requested_reason="protective_stop_net",
+                    timestamp=now + timedelta(seconds=19),
+                )
+            )
+
+            self.assertNotIn("046970", strategy.positions)
+            self.assertLessEqual(strategy.daily_pnl.realized_net_pnl, -500)
+            self.assertTrue(strategy._halted)
+            self.assertIn(strategy._halt_reason, {"daily_loss_limit", "daily_total_loss_limit"})
+
+    def test_daily_total_loss_limit_ignores_restored_position_when_config_disabled(self):
+        cfg = MomentumScalpConfig(
+            enable_unrealized_loss_guard=True,
+            daily_total_loss_limit=-500,
+            use_restored_pnl_for_daily_breaker=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 9, 10, 0, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["464930"] = PositionState(
+            symbol="464930",
+            buy_price=20_000,
+            quantity=1,
+            invested_amount=20_000,
+            buy_time=now,
+            is_restored=True,
+            restored_at=now,
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="restored_position",
+            queue_source="account_restore",
+        )
+        strategy._quotes_cache["464930"] = Quote(
+            symbol="464930",
+            name="TIGER 2차전지TOP10 인버스",
+            current_price=19_000,
+            change=-1000,
+            change_rate=-5.0,
+            open_price=20_000,
+            high_price=20_100,
+            low_price=18_900,
+            volume=100_000,
+            trade_amount=1_900_000_000,
+            timestamp=now,
+        )
+        strategy._update_daily_breakers()
+
+        self.assertFalse(strategy._halted)
+
+    def test_realized_restored_sell_counts_for_daily_loss_breaker(self):
+        cfg = MomentumScalpConfig(
+            commission_rate=0.0,
+            tax_slippage_rate=0.0,
+            daily_loss_limit=-5_000,
+            daily_total_loss_limit=-5_000,
+            use_restored_pnl_for_daily_breaker=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 6, 10, 9, 30, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["396300"] = PositionState(
+            symbol="396300",
+            buy_price=5_600,
+            quantity=88,
+            invested_amount=492_800,
+            buy_time=now - timedelta(minutes=25),
+            is_restored=True,
+            restored_at=now - timedelta(minutes=1),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="restored_position",
+            queue_source="account_restore",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="396300",
+                side=OrderSide.SELL,
+                quantity=88,
+                price=4_855,
+                fill_mode="account_reconciled_confirmed",
+                requested_reason="protective_stop_net",
+                timestamp=now,
+            )
+        )
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, -65_560)
+        self.assertEqual(strategy._realized_net_pnl_for_daily_breaker(), -65_560)
+        self.assertTrue(strategy._halted)
+        self.assertIn(strategy._halt_reason, {"daily_loss_limit", "daily_total_loss_limit"})
+        self.assertTrue(strategy._sell_fill_ledger[0]["counts_for_daily_breaker"])
+        self.assertEqual(strategy._bull_loss_count_today, 0)
+
+    def test_loaded_restored_sell_fill_is_migrated_into_daily_breaker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str(Path(tmpdir) / "state.json")
+            now = datetime(2026, 6, 10, 11, 0, 0)
+            payload = {
+                "date": now.strftime("%Y%m%d"),
+                "halted": False,
+                "halt_reason": "",
+                "daily_pnl": {
+                    "realized_gross_pnl": -21_560,
+                    "realized_net_pnl": -22_545,
+                    "fees_paid": 131,
+                    "taxes_paid": 854,
+                    "trade_count": 1,
+                    "win_count": 0,
+                    "loss_count": 1,
+                    "breakeven_count": 0,
+                    "winning_net_pnl_sum": 0,
+                    "losing_net_pnl_sum": -22_545,
+                    "largest_win_net": 0,
+                    "largest_loss_net": -22_545,
+                },
+                "breaker_excluded_realized_net_pnl": -22_545,
+                "ledger_seed_snapshot": {"breaker_excluded_realized_net_pnl": 0},
+                "session_start_at": now.replace(hour=9, minute=0, second=0, microsecond=0).isoformat(),
+                "sell_fill_ledger": [
+                    {
+                        "fill_id": "0000007315",
+                        "order_no": "0000007315",
+                        "symbol": "396300",
+                        "trade_key": "396300:2026-06-10T09:29:20",
+                        "quantity": 88,
+                        "buy_price": 5_100,
+                        "sell_price": 4_855,
+                        "gross_pnl": -21_560,
+                        "net_pnl": -22_545,
+                        "fees": 131,
+                        "taxes": 854,
+                        "counts_for_daily_breaker": False,
+                        "count_as_closed_trade": False,
+                        "price_estimated": False,
+                        "fill_mode": "account_reconciled_confirmed",
+                        "timestamp": now.replace(hour=9, minute=30, second=5, microsecond=0).isoformat(),
+                        "requested_reason": "protective_stop_net",
+                        "entry_strategy_name": INTRADAY_STRATEGY,
+                        "entry_setup_name": "restored_position",
+                    }
+                ],
+                "closed_trade_ledger": {
+                    "396300:2026-06-10T09:29:20": {
+                        "trade_key": "396300:2026-06-10T09:29:20",
+                        "symbol": "396300",
+                        "strategy_name": INTRADAY_STRATEGY,
+                        "setup_name": "restored_position",
+                        "net_pnl": -22_545,
+                    }
+                },
+                "positions": [],
+            }
+            Path(state_path).write_text(json.dumps(payload), encoding="utf-8")
+
+            strategy = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(
+                    daily_loss_limit=-5_000,
+                    daily_total_loss_limit=-5_000,
+                    daily_state_path=state_path,
+                    use_restored_pnl_for_daily_breaker=False,
+                ),
+            )
+            strategy.set_simulated_now(now)
+            strategy.initialize()
+
+            self.assertEqual(strategy._breaker_excluded_realized_net_pnl, 0)
+            self.assertEqual(strategy._realized_net_pnl_for_daily_breaker(), -22_545)
+            self.assertTrue(strategy._sell_fill_ledger[0]["counts_for_daily_breaker"])
+            self.assertEqual(strategy._sell_fill_ledger[0]["daily_breaker_flag_migrated"], "realized_sell_fill")
+            self.assertTrue(strategy._halted)
+            self.assertIn(strategy._halt_reason, {"daily_loss_limit", "daily_total_loss_limit"})
+
+    def test_restored_stale_daily_total_loss_halt_releases_when_actual_pnl_above_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str(Path(tmpdir) / "state.json")
+            now = datetime(2026, 6, 9, 12, 40, 0)
+            payload = {
+                "date": now.strftime("%Y%m%d"),
+                "halted": True,
+                "halt_reason": "daily_total_loss_limit",
+                "daily_pnl": {
+                    "realized_gross_pnl": 996,
+                    "realized_net_pnl": -2_131,
+                    "fees_paid": 407,
+                    "taxes_paid": 2720,
+                    "trade_count": 2,
+                    "win_count": 0,
+                    "loss_count": 2,
+                    "breakeven_count": 0,
+                    "winning_net_pnl_sum": 0,
+                    "losing_net_pnl_sum": -2_131,
+                    "largest_win_net": 0,
+                    "largest_loss_net": -1_996,
+                },
+                "sell_fill_ledger": [],
+                "closed_trade_ledger": {},
+                "positions": [],
+            }
+            Path(state_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            strategy = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(
+                    enable_unrealized_loss_guard=True,
+                    daily_loss_limit=-5_000,
+                    daily_total_loss_limit=-5_000,
+                    daily_state_path=state_path,
+                ),
+            )
+            strategy.set_simulated_now(now)
+
+            strategy._load_daily_state()
+
+            self.assertFalse(strategy._halted)
+            self.assertEqual(strategy._halt_reason, "")
+            self.assertEqual(strategy.daily_pnl.realized_net_pnl, -2_131)
+
+    def test_daily_loss_near_stop_halts_without_position(self):
+        cfg = MomentumScalpConfig(
+            daily_loss_limit=-5_000,
+            daily_total_loss_limit=-5_000,
+            daily_loss_near_stop_buffer=250,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.daily_pnl.realized_net_pnl = -4_965
+
+        strategy._update_daily_breakers()
+
+        self.assertTrue(strategy._halted)
+
+    def test_daily_loss_near_stop_keeps_position_management_open(self):
+        cfg = MomentumScalpConfig(
+            daily_loss_limit=-5_000,
+            daily_total_loss_limit=-5_000,
+            daily_loss_near_stop_buffer=250,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        strategy.daily_pnl.realized_net_pnl = -4_965
+        strategy.positions["005930"] = PositionState(
+            symbol="005930",
             buy_price=10_000,
             quantity=1,
-            invested_amount=10_000,
         )
 
-        quote = Quote(
-            symbol="252670",
-            name="KODEX 200선물인버스2X",
-            current_price=10_010,
-            change=10,
-            change_rate=0.1,
+        strategy._update_daily_breakers()
+
+        self.assertFalse(strategy._halted)
+
+    def test_no_holding_sell_failure_keeps_position_until_account_reconcile(self):
+        cfg = MomentumScalpConfig(
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 9, 13, 27, 1)
+        strategy.set_simulated_now(now)
+        strategy.positions["464930"] = PositionState(
+            symbol="464930",
+            buy_price=19_600,
+            quantity=21,
+            entry_strategy_name=INTRADAY_STRATEGY,
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=False,
+                symbol="464930",
+                side=OrderSide.SELL,
+                error_category="no_holding",
+                timestamp=now,
+            )
+        )
+
+        self.assertIn("464930", strategy.positions)
+
+        strategy.sync_positions_from_account(
+            [
+                SimpleNamespace(
+                    symbol="464930",
+                    quantity=21,
+                    avg_price=19600,
+                    eval_amount=411600,
+                )
+            ]
+        )
+
+        self.assertIn("464930", strategy.positions)
+
+
+
+
+
+
+
+
+
+    def test_daily_profit_lock_halts_when_realized_pnl_is_close_to_target(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                daily_profit_target=10_000,
+                profit_protect_threshold=8_000,
+                daily_profit_lock_buffer=1_500,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        strategy.daily_pnl.realized_net_pnl = 8_950
+
+        strategy._update_daily_breakers()
+
+        self.assertFalse(strategy.should_continue())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def test_long_entry_shortlist_skips_stale_cached_quotes(self):
+        cfg = MomentumScalpConfig(
+            enable_intraday_conviction_lane=True,
+            intraday_conviction_live_top_n=1,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 10, 12, 18, 0)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 4, 10, 9, 0, 0)
+        fresh_quote = Quote(
+            symbol="100002",
+            name="100002",
+            current_price=10_460,
+            change=460,
+            change_rate=4.6,
+            open_price=10_000,
+            high_price=10_560,
+            low_price=9_980,
+            volume=280_000,
+            trade_amount=2_928_800_000,
+            timestamp=now,
+        )
+        stale_time = now - timedelta(seconds=90)
+        stale_quote = Quote(
+            symbol="100001",
+            name="100001",
+            current_price=10_460,
+            change=460,
+            change_rate=4.6,
+            open_price=10_000,
+            high_price=10_560,
+            low_price=9_980,
+            volume=280_000,
+            trade_amount=2_928_800_000,
+            timestamp=stale_time,
+        )
+        strategy._latest_math_queue_symbols = ["100001", "100002"]
+        strategy._latest_math_queue_source["100001"] = "math_queue"
+        strategy._latest_math_queue_source["100002"] = "math_queue"
+        strategy._quotes_cache["100001"] = stale_quote
+        strategy._quotes_cache["100002"] = fresh_quote
+        strategy._recent_quotes["100002"] = deque(
+            [
+                Quote("100002", "100002", 10_040, 40, 0.4, 10_000, 10_040, 9_980, 80_000, 803_200_000, now),
+                Quote("100002", "100002", 10_560, 560, 5.6, 10_000, 10_560, 9_980, 140_000, 1_478_400_000, now),
+                Quote("100002", "100002", 10_300, 300, 3.0, 10_000, 10_560, 9_980, 180_000, 1_854_000_000, now),
+                Quote("100002", "100002", 10_360, 360, 3.6, 10_000, 10_560, 9_980, 220_000, 2_279_200_000, now),
+                Quote("100002", "100002", 10_420, 420, 4.2, 10_000, 10_560, 9_980, 250_000, 2_605_000_000, now),
+                fresh_quote,
+            ],
+            maxlen=8,
+        )
+        strategy._latest_math_leader_signals["100001"] = LeaderSignal(
+            symbol="100001",
+            leader_score=1.40,
+            leader_percentile=0.98,
+            entry_grade="A",
+            change_rate=4.6,
+            trade_amount=2_928_800_000,
+            vs_open_pct=4.6,
+            high_proximity=0.82,
+            volume_vs_avg=1.4,
+            reclaim_speed_ticks=2,
+            recent_acceleration_pct=0.18,
+            effective_leader_score=1.25,
+        )
+        strategy._latest_math_leader_signals["100002"] = LeaderSignal(
+            symbol="100002",
+            leader_score=1.40,
+            leader_percentile=0.98,
+            entry_grade="A",
+            change_rate=4.6,
+            trade_amount=2_928_800_000,
+            vs_open_pct=4.6,
+            high_proximity=0.82,
+            volume_vs_avg=1.4,
+            reclaim_speed_ticks=2,
+            recent_acceleration_pct=0.18,
+            effective_leader_score=1.25,
+        )
+        strategy._entry_ev_for_context = lambda **kwargs: ExpectedValueEstimate(
+            strategy_name="intraday_conviction_long_strategy",
+            regime_label="bull",
+            hour_bucket="12",
+            entry_grade="A",
+            entry_ev=950.0,
+            p_win=0.61,
+            confidence="high",
+            closed_trades=10,
+        )
+
+        shortlist = strategy._long_entry_shortlist([fresh_quote])
+
+        self.assertEqual([quote.symbol for quote in shortlist], ["100002"])
+
+    def test_on_batch_tick_can_emit_inverse_etf_through_regular_ev_route(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                inverse_etfs=["114800"],
+                market_shock_window_minutes_after_open=45,
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                max_position_count=2,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                long_stop_loss_cap_amount=5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 10, 13, 40, 0)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        strategy._entry_ev_for_context = lambda **_kwargs: ExpectedValueEstimate(
+            strategy_name=INTRADAY_STRATEGY,
+            regime_label="bear",
+            hour_bucket="13",
+            entry_grade="A",
+            entry_ev=1_500.0,
+            p_win=0.62,
+            confidence="high",
+            closed_trades=10,
+        )
+        weak_market = Quote("005930", "삼성전자", 70_000, -3_000, -4.1, 73_000, 73_100, 69_900, 1_000_000, 70_000_000_000, now)
+        inverse = Quote("114800", "KODEX 인버스", 2_080, 70, 3.48, 2_010, 2_090, 2_000, 800_000, 1_664_000_000, now)
+        strategy._recent_quotes["005930"] = deque([weak_market], maxlen=8)
+        strategy._recent_quotes["114800"] = deque([inverse], maxlen=8)
+        self._install_strong_ev_prediction(
+            strategy,
+            predicted_return_pct=2.20,
+            lower_bound_return_pct=0.45,
+            upper_bound_return_pct=3.10,
+            confidence=0.82,
+            direction_score=0.80,
+        )
+
+        orders = strategy.on_batch_tick([weak_market, inverse])
+
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].symbol, "114800")
+        self.assertEqual(orders[0].requested_reason, "expected_value")
+        meta = strategy._pending_entry_meta["114800"]
+        self.assertEqual(meta["strategy_name"], INTRADAY_STRATEGY)
+        self.assertEqual(meta["live_route"], INTRADAY_STRATEGY)
+
+    def test_on_batch_tick_evaluates_all_candidates_and_selects_highest_ev(self):
+        cfg = MomentumScalpConfig(
+            enable_intraday_conviction_lane=True,
+            enable_expected_net_filter=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 13, 13, 10, 0)
+        strategy.set_simulated_now(now)
+        strategy._active_day = strategy._today()
+        strategy._session_start_at = datetime(2026, 4, 13, 9, 0, 0)
+
+        candidate = Quote(
+            symbol="100001",
+            name="100001",
+            current_price=10_420,
+            change=420,
+            change_rate=4.2,
+            open_price=10_000,
+            high_price=10_800,
+            low_price=9_900,
+            volume=260_000,
+            trade_amount=2_709_200_000,
+            timestamp=now,
+        )
+        background = Quote(
+            symbol="100002",
+            name="100002",
+            current_price=9_980,
+            change=-20,
+            change_rate=-0.2,
             open_price=10_000,
             high_price=10_020,
-            low_price=9_990,
-            volume=100_000,
-            trade_amount=100_100_000,
+            low_price=9_950,
+            volume=110_000,
+            trade_amount=1_097_800_000,
+            timestamp=now,
+        )
+        strategy._quotes_cache["100001"] = candidate
+        strategy._quotes_cache["100002"] = background
+        strategy._update_market_state = lambda quotes: None
+        strategy._long_entry_shortlist = lambda _candidates: [candidate, background]
+        evaluated = []
+
+        def build_candidate(quote, *, pending_orders):
+            evaluated.append(quote.symbol)
+            expected_net = 300.0 if quote.symbol == "100001" else 900.0
+            return ExpectedValueCandidate(
+                quote=quote,
+                strategy_name=INTRADAY_STRATEGY,
+                metadata={},
+                plan=ExpectedValueTradePlan(
+                    allowed=True,
+                    quantity=1,
+                    expected_net=expected_net,
+                    predicted_net=int(expected_net + 100),
+                    planned_risk_net_loss_abs=200,
+                ),
+            )
+
+        strategy._build_expected_value_candidate = build_candidate
+        strategy._record_expected_value_forecast = lambda *_args, **_kwargs: None
+        strategy._order_from_expected_value_candidate = lambda selected: Order(
+            symbol=selected.quote.symbol,
+            side=OrderSide.BUY,
+            quantity=1,
         )
 
-        self.assertIsNone(strategy._evaluate_inverse_sell(quote))
+        orders = strategy.on_batch_tick([background])
 
-    def test_momentum_sync_positions_from_account(self):
-        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
-        account_positions = [
-            Position(
+        self.assertEqual(evaluated, ["100001", "100002"])
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].symbol, "100002")
+
+
+    def test_losing_trade_sets_bull_loss_count_and_symbol_cooldown(self):
+        cfg = MomentumScalpConfig(
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 7, 11, 5, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["000660"] = PositionState(
+            symbol="000660",
+            buy_price=10_000,
+            quantity=10,
+            invested_amount=100_000,
+            buy_time=now,
+            entry_strategy_name="intraday_conviction_long_strategy",
+            entry_setup_name="intraday_conviction",
+            regime_label="bull",
+            post_loss_admission_class="general",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="000660",
+                side=OrderSide.SELL,
+                quantity=10,
+                price=9_700,
+                timestamp=now,
+            )
+        )
+
+        self.assertEqual(strategy._bull_loss_count_today, 1)
+        self.assertGreater(strategy._symbol_entry_cooldown_remaining("000660"), 0.0)
+
+    def test_intraday_conviction_win_recovers_one_bull_loss_count(self):
+        cfg = MomentumScalpConfig(
+            commission_rate=0.0,
+            tax_slippage_rate=0.0,
+            bull_risk_mode_profit_recovery_min_net=1_200,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 5, 6, 12, 58, 0)
+        strategy.set_simulated_now(now)
+        strategy._bull_loss_count_today = 2
+        strategy.positions["192250"] = PositionState(
+            symbol="192250",
+            buy_price=14_350,
+            quantity=11,
+            invested_amount=157_850,
+            buy_time=now - timedelta(minutes=2),
+            entry_strategy_name="intraday_conviction_long_strategy",
+            entry_setup_name="intraday_conviction",
+            regime_label="bull",
+            post_loss_admission_class="general",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="192250",
+                side=OrderSide.SELL,
+                quantity=11,
+                price=14_590,
+                timestamp=now,
+            )
+        )
+
+        self.assertEqual(strategy._bull_loss_count_today, 1)
+
+    def test_restored_position_win_does_not_recover_bull_loss_count(self):
+        cfg = MomentumScalpConfig(
+            commission_rate=0.0,
+            tax_slippage_rate=0.0,
+            use_restored_pnl_for_daily_breaker=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 5, 6, 12, 24, 0)
+        strategy.set_simulated_now(now)
+        strategy._bull_loss_count_today = 2
+        strategy.positions["005930"] = PositionState(
+            symbol="005930",
+            buy_price=261_750,
+            quantity=1,
+            invested_amount=261_750,
+            buy_time=now - timedelta(minutes=40),
+            is_restored=True,
+            entry_strategy_name="intraday_conviction_long_strategy",
+            entry_setup_name="restored_position",
+            queue_source="account_restore",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
                 symbol="005930",
-                name="삼성전자",
+                side=OrderSide.SELL,
+                quantity=1,
+                price=266_500,
+                timestamp=now,
+            )
+        )
+
+        self.assertEqual(strategy._bull_loss_count_today, 2)
+
+
+    def test_partial_sell_does_not_increment_closed_trade_count_or_bull_loss_count(self):
+        cfg = MomentumScalpConfig(
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 9, 11, 10, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["000660"] = PositionState(
+            symbol="000660",
+            buy_price=10_000,
+            quantity=10,
+            invested_amount=100_000,
+            buy_time=now,
+            entry_strategy_name="intraday_conviction_long_strategy",
+            entry_setup_name="intraday_conviction",
+            regime_label="bull",
+            post_loss_admission_class="general",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="000660",
+                side=OrderSide.SELL,
+                quantity=5,
+                price=9_700,
+                timestamp=now,
+            )
+        )
+
+        self.assertEqual(strategy.daily_pnl.trade_count, 0)
+        self.assertEqual(strategy._bull_loss_count_today, 0)
+        self.assertIn("000660", strategy.positions)
+        self.assertEqual(strategy.positions["000660"].quantity, 5)
+
+    def test_sell_failure_with_no_position_response_waits_for_account_snapshot(self):
+        cfg = MomentumScalpConfig(
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 8, 12, 0, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["015760"] = PositionState(
+            symbol="015760",
+            buy_price=42_000,
+            quantity=9,
+            invested_amount=378_000,
+            buy_time=now,
+            entry_strategy_name="intraday_conviction_long_strategy",
+            entry_setup_name="intraday_conviction",
+            regime_label="bull",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=False,
+                symbol="015760",
+                side=OrderSide.SELL,
+                message="[40240000] 모의투자 잔고내역이 없습니다.",
+                error_code="40240000",
+                error_category="no_holding",
+                timestamp=now,
+            )
+        )
+
+        self.assertIn("015760", strategy.positions)
+
+        strategy.sync_positions_from_account([])
+
+        self.assertNotIn("015760", strategy.positions)
+
+    def test_no_holding_sell_failure_account_absent_records_estimated_exit(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 9, 12, 8, 7)
+        strategy.set_simulated_now(now)
+        strategy.positions["457370"] = PositionState(
+            symbol="457370",
+            buy_price=14_360,
+            quantity=39,
+            invested_amount=560_040,
+            buy_time=now - timedelta(minutes=5),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+            queue_source="opening_hot_queue",
+        )
+
+        inferred = strategy.reconcile_no_holding_sell_failures_from_account(
+            [
+                OrderResult(
+                    success=False,
+                    symbol="457370",
+                    side=OrderSide.SELL,
+                    message="[40240000] 모의투자 잔고내역이 없습니다.",
+                    error_code="40240000",
+                    error_category="no_holding",
+                    reference_price=14_530,
+                    timestamp=now,
+                )
+            ],
+            [],
+        )
+
+        self.assertEqual(len(inferred), 1)
+        self.assertEqual(inferred[0].quantity, 39)
+        self.assertEqual(inferred[0].price, 14_530)
+        self.assertNotIn("457370", strategy.positions)
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 6_630)
+        self.assertEqual(strategy.daily_pnl.trade_count, 1)
+
+    def test_no_holding_sell_failure_clears_stale_unconfirmed_market_buy_without_pnl(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 30, 10, 14, 31)
+        strategy.set_simulated_now(now)
+        strategy.positions["066980"] = PositionState(
+            symbol="066980",
+            buy_price=2_485,
+            quantity=302,
+            invested_amount=750_470,
+            buy_time=now - timedelta(minutes=21),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+            queue_source="math_queue",
+            trade_key="066980:2026-06-30T09:53:22",
+            pending_entry_started_at=now - timedelta(minutes=21),
+            pending_entry_reference_price=2_485,
+            pending_entry_fill_mode="market_pending",
+        )
+
+        inferred = strategy.reconcile_no_holding_sell_failures_from_account(
+            [
+                OrderResult(
+                    success=False,
+                    symbol="066980",
+                    side=OrderSide.SELL,
+                    message="[40240000] 모의투자 잔고내역이 없습니다.",
+                    error_code="40240000",
+                    error_category="no_holding",
+                    reference_price=2_485,
+                    timestamp=now,
+                )
+            ],
+            [],
+        )
+        strategy.sync_positions_from_account([])
+
+        self.assertEqual(inferred, [])
+        self.assertNotIn("066980", strategy.positions)
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 0)
+        self.assertEqual(strategy._sell_fill_ledger, [])
+
+    def test_account_restore_reopens_estimated_no_holding_exit_without_double_counting(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 30, 10, 14, 31)
+        strategy.set_simulated_now(now)
+        strategy.positions["066980"] = PositionState(
+            symbol="066980",
+            buy_price=2_485,
+            quantity=302,
+            invested_amount=750_470,
+            buy_time=now - timedelta(minutes=21),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+            queue_source="math_queue",
+            entry_ev=8_852.19,
+            entry_ev_confidence="live_plan",
+            planned_target_net_pnl=10_000,
+            planned_stop_net_loss_abs=3_839,
+            planned_risk_net_loss_abs=4_991,
+            trade_key="066980:2026-06-30T09:53:22",
+        )
+        inferred = strategy.reconcile_no_holding_sell_failures_from_account(
+            [
+                OrderResult(
+                    success=False,
+                    symbol="066980",
+                    side=OrderSide.SELL,
+                    message="[40240000] 모의투자 잔고내역이 없습니다.",
+                    error_code="40240000",
+                    error_category="no_holding",
+                    reference_price=2_470,
+                    timestamp=now,
+                )
+            ],
+            [],
+        )
+        self.assertEqual(len(inferred), 1)
+        self.assertLess(strategy.daily_pnl.realized_net_pnl, 0)
+        self.assertNotIn("066980", strategy.positions)
+
+        strategy.sync_positions_from_account(
+            [
+                SimpleNamespace(
+                    symbol="066980",
+                    quantity=302,
+                    avg_price=2485,
+                    eval_amount=750470,
+                )
+            ]
+        )
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 0)
+        self.assertEqual(strategy._sell_fill_ledger, [])
+        self.assertNotIn("066980:2026-06-30T09:53:22", strategy._closed_trade_ledger)
+        self.assertIn("066980", strategy.positions)
+        restored = strategy.positions["066980"]
+        self.assertFalse(restored.is_restored)
+        self.assertEqual(restored.entry_setup_name, "expected_value")
+        self.assertEqual(restored.queue_source, "math_queue")
+        self.assertEqual(restored.planned_risk_net_loss_abs, 4_991)
+
+
+
+
+
+    def test_daily_state_round_trip_restores_positions_pool_and_symbol_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "momentum_scalp_daily_state.json"
+            cfg = MomentumScalpConfig(
+                daily_state_path=str(state_path),
+            )
+            now = datetime(2026, 4, 10, 11, 15, 0)
+            strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+            strategy.set_simulated_now(now)
+            strategy._active_day = strategy._today()
+            strategy._session_start_at = datetime(2026, 4, 10, 9, 0, 0)
+            strategy._pool = ["129920", "043260", "046970"]
+            strategy._latest_math_queue_symbols = ["129920", "043260"]
+            strategy._latest_math_backfill_symbols = ["046970"]
+            strategy._latest_opening_fast_symbols = {"129920"}
+            strategy._latest_opening_hot_symbols = {"043260"}
+            strategy._latest_math_queue_source = {
+                "129920": "opening_fast_queue",
+                "043260": "opening_hot_queue",
+                "046970": "math_backfill",
+            }
+            strategy._mark_symbol_entry_cooldown("129920", seconds=900)
+            strategy.positions["129920"] = PositionState(
+                symbol="129920",
+                buy_price=10_400,
                 quantity=3,
-                avg_price=71234.0,
-                current_price=71900,
-                eval_amount=0,
-                profit_loss=0,
-                profit_rate=0.0,
+                invested_amount=31_200,
+                buy_time=datetime(2026, 4, 10, 10, 45, 0),
+                entry_strategy_name="intraday_conviction_long_strategy",
+                entry_setup_name="intraday_conviction",
+                queue_source="math_queue",
+                conviction_score=1.24,
+                conviction_rank=1,
+            )
+            strategy.daily_pnl.realized_net_pnl = 1200
+
+            strategy._save_daily_state()
+
+            restored = MomentumScalpStrategy(market_data=None, config=cfg)
+            restored.set_simulated_now(now)
+            restored.initialize()
+
+            self.assertTrue(restored.has_runtime_state_snapshot())
+            self.assertEqual(restored._pool[:3], ["129920", "043260", "046970"])
+            self.assertEqual(restored._latest_math_queue_symbols, ["129920", "043260"])
+            self.assertIn("129920", restored._latest_opening_fast_symbols)
+            self.assertGreater(restored._symbol_entry_cooldown_remaining("129920"), 0.0)
+            self.assertIn("129920", restored.positions)
+            self.assertEqual(restored.positions["129920"].entry_setup_name, "intraday_conviction")
+            self.assertEqual(restored.positions["129920"].conviction_rank, 1)
+            self.assertEqual(restored.daily_pnl.realized_net_pnl, 1200)
+
+    def test_symbol_order_unavailable_failure_blocks_symbol_for_day(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "momentum_scalp_daily_state.json"
+            cfg = MomentumScalpConfig(
+                daily_state_path=str(state_path),
+            )
+            now = datetime(2026, 7, 7, 9, 13, 0)
+            strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+            strategy.set_simulated_now(now)
+            strategy.initialize()
+
+            strategy.on_order_filled(
+                OrderResult(
+                    success=False,
+                    symbol="114800",
+                    side=OrderSide.BUY,
+                    error_code="40070000",
+                    error_category="symbol_order_unavailable",
+                    message="[40070000] 모의투자 주문처리가 안되었습니다(매매불가 종목)",
+                    timestamp=now,
+                )
+            )
+
+            quote = Quote(
+                symbol="114800",
+                name="KODEX 인버스",
+                current_price=988,
+                change=18,
+                change_rate=1.86,
+                open_price=970,
+                high_price=988,
+                low_price=970,
+                volume=1_000_000,
+                trade_amount=988_000_000,
+                timestamp=now + timedelta(seconds=5),
+            )
+            self.assertTrue(strategy._is_symbol_order_unavailable("114800"))
+            strategy._quotes_cache["114800"] = quote
+            self.assertEqual(strategy._long_entry_shortlist([quote]), [])
+            self.assertEqual(
+                strategy._long_ev_precheck_reject_reason(
+                    quote,
+                    pending_orders=[],
+                    strategy_name_override=INTRADAY_STRATEGY,
+                    skip_capacity=True,
+                ),
+                "symbol_order_unavailable",
+            )
+
+            restored = MomentumScalpStrategy(market_data=None, config=cfg)
+            restored.set_simulated_now(now + timedelta(minutes=1))
+            restored.initialize()
+
+            self.assertTrue(restored._is_symbol_order_unavailable("114800"))
+            self.assertEqual(
+                restored._long_ev_precheck_reject_reason(
+                    quote,
+                    pending_orders=[],
+                    strategy_name_override=INTRADAY_STRATEGY,
+                    skip_capacity=True,
+                ),
+                "symbol_order_unavailable",
+            )
+
+    def test_update_runtime_pool_persists_daily_state_without_manual_save(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "momentum_scalp_daily_state.json"
+            cfg = MomentumScalpConfig(
+                daily_state_path=str(state_path),
+            )
+            now = datetime(2026, 4, 10, 10, 0, 0)
+            strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+            strategy.set_simulated_now(now)
+            strategy.initialize()
+
+            strategy.update_runtime_pool(["129920", "043260", "046970"])
+
+            restored = MomentumScalpStrategy(market_data=None, config=cfg)
+            restored.set_simulated_now(now)
+            restored.initialize()
+
+            self.assertTrue(restored.has_runtime_state_snapshot())
+            self.assertEqual(restored._pool[:3], ["129920", "043260", "046970"])
+
+    def test_symbol_entry_cooldown_persists_without_manual_save(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "momentum_scalp_daily_state.json"
+            cfg = MomentumScalpConfig(
+                daily_state_path=str(state_path),
+            )
+            now = datetime(2026, 4, 10, 11, 0, 0)
+            strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+            strategy.set_simulated_now(now)
+            strategy.initialize()
+
+            strategy._mark_symbol_entry_cooldown("005930", seconds=900)
+
+            restored = MomentumScalpStrategy(market_data=None, config=cfg)
+            restored.set_simulated_now(now)
+            restored.initialize()
+
+            self.assertTrue(restored.has_runtime_state_snapshot())
+            self.assertGreater(restored._symbol_entry_cooldown_remaining("005930"), 0.0)
+
+    def test_halt_state_persists_without_manual_save(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "momentum_scalp_daily_state.json"
+            cfg = MomentumScalpConfig(
+                daily_state_path=str(state_path),
+                daily_profit_target=10_000,
+            )
+            now = datetime(2026, 4, 10, 13, 15, 0)
+            strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+            strategy.set_simulated_now(now)
+            strategy.initialize()
+            strategy.daily_pnl.realized_net_pnl = 10_000
+
+            strategy._update_daily_breakers()
+
+            restored = MomentumScalpStrategy(market_data=None, config=cfg)
+            restored.set_simulated_now(now)
+            restored.initialize()
+
+            self.assertTrue(restored.has_runtime_state_snapshot())
+            self.assertFalse(restored.should_continue())
+            self.assertEqual(restored.daily_pnl.realized_net_pnl, 10_000)
+
+    def test_default_long_exit_uses_net_stop_before_gross_stop(self):
+        cfg = MomentumScalpConfig(
+            long_stop_loss_notional_pct=0.007,
+            long_stop_loss_cap_amount=2_500,
+            commission_rate=0.00015,
+            tax_slippage_rate=0.002,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 10, 9, 3, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["009150"] = PositionState(
+            symbol="009150",
+            buy_price=500_000,
+            quantity=1,
+            invested_amount=500_000,
+            buy_time=datetime(2026, 4, 10, 9, 0, 0),
+            high_since_buy=500_000,
+            entry_strategy_name="opening_conviction_long_strategy",
+        )
+        quote = Quote(
+            symbol="009150",
+            name="삼성전기",
+            current_price=497_600,
+            change=-2_400,
+            change_rate=-0.48,
+            open_price=500_000,
+            high_price=500_500,
+            low_price=497_500,
+            volume=80_000,
+            trade_amount=39_808_000_000,
+            timestamp=now,
+        )
+
+        order = strategy._default_long_exit(quote)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order.requested_reason, "protective_stop_net")
+
+    def test_default_long_exit_uses_adaptive_max_hold_minutes(self):
+        cfg = MomentumScalpConfig(
+            commission_rate=0.0,
+            tax_slippage_rate=0.0,
+            max_position_holding_minutes=45,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 5, 20, 14, 10, 0)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 5, 20, 9, 0, 0)
+        strategy.positions["009150"] = PositionState(
+            symbol="009150",
+            buy_price=100_000,
+            quantity=5,
+            invested_amount=500_000,
+            buy_time=now - timedelta(minutes=13),
+            high_since_buy=100_400,
+            entry_strategy_name=INTRADAY_STRATEGY,
+            adaptive_max_hold_minutes=12,
+        )
+        quote = Quote(
+            symbol="009150",
+            name="009150",
+            current_price=100_000,
+            change=0,
+            change_rate=0.0,
+            open_price=99_500,
+            high_price=100_500,
+            low_price=99_000,
+            volume=150_000,
+            trade_amount=15_000_000_000,
+            timestamp=now,
+        )
+
+        order = strategy._default_long_exit(quote)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order.requested_reason, "time_exit")
+
+    def test_default_long_exit_defers_too_early_trailing_but_allows_later(self):
+        cfg = MomentumScalpConfig(
+            commission_rate=0.0,
+            tax_slippage_rate=0.0,
+            take_profit_pct=1.8,
+            trailing_stop_activation_gain_pct=0.45,
+            trailing_stop_pct=-0.35,
+            max_position_holding_minutes=45,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 5, 20, 13, 20, 0)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 5, 20, 9, 0, 0)
+        strategy.positions["072950"] = PositionState(
+            symbol="072950",
+            buy_price=10_000,
+            quantity=10,
+            invested_amount=100_000,
+            buy_time=now - timedelta(seconds=60),
+            high_since_buy=10_120,
+            entry_strategy_name=INTRADAY_STRATEGY,
+            adaptive_max_hold_minutes=20,
+        )
+        quote = Quote(
+            symbol="072950",
+            name="072950",
+            current_price=10_070,
+            change=70,
+            change_rate=0.70,
+            open_price=10_000,
+            high_price=10_120,
+            low_price=9_980,
+            volume=200_000,
+            trade_amount=2_014_000_000,
+            timestamp=now,
+        )
+
+        early_order = strategy._default_long_exit(quote)
+
+        self.assertIsNone(early_order)
+
+        strategy.positions["072950"].buy_time = now - timedelta(minutes=3)
+        later_order = strategy._default_long_exit(quote)
+
+        self.assertIsNotNone(later_order)
+        self.assertEqual(later_order.requested_reason, "trailing_stop")
+
+    def test_make_sell_order_uses_direct_market_exit_in_paper_mode(self):
+        cfg = MomentumScalpConfig(
+        )
+        strategy = MomentumScalpStrategy(
+            market_data=SimpleNamespace(client=SimpleNamespace(config=SimpleNamespace(is_paper=True))),
+            config=cfg,
+        )
+        pos = PositionState(
+            symbol="005930",
+            buy_price=71_000,
+            quantity=3,
+            invested_amount=213_000,
+            buy_time=datetime(2026, 4, 9, 10, 0, 0),
+            high_since_buy=71_800,
+        )
+        strategy._quotes_cache["005930"] = Quote(
+            "005930",
+            "005930",
+            70_500,
+            -500,
+            -0.70,
+            71_000,
+            71_800,
+            70_400,
+            100_000,
+            7_050_000_000,
+            datetime(2026, 4, 9, 10, 1, 0),
+        )
+
+        order = strategy._make_sell_order(pos, 3, reason="protective_stop")
+
+        self.assertEqual(order.order_type.value, "01")
+        self.assertEqual(order.protective_exit_mode, "")
+        self.assertEqual(order.protective_limit_price, 0)
+        self.assertEqual(order.protective_fallback_polls, 0)
+        self.assertEqual(order.reference_price, 70_500)
+
+    def test_conviction_entry_ev_uses_best_partial_match_when_exact_bucket_missing(self):
+        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
+        strategy.set_simulated_now(datetime(2026, 4, 6, 13, 15, 0))
+        strategy._entry_ev_table = {
+            (
+                "bull_breakout_strategy",
+                "bull",
+                "09",
+                "A",
+            ): ExpectedValueEstimate(
+                strategy_name="bull_breakout_strategy",
+                regime_label="bull",
+                hour_bucket="09",
+                entry_grade="A",
+                entry_ev=210.0,
+                p_win=0.54,
+                confidence="medium",
+                closed_trades=5,
+            ),
+            (
+                "bull_breakout_strategy",
+                "bull",
+                "13",
+                "B",
+            ): ExpectedValueEstimate(
+                strategy_name="bull_breakout_strategy",
+                regime_label="bull",
+                hour_bucket="13",
+                entry_grade="B",
+                entry_ev=120.0,
+                p_win=0.52,
+                confidence="medium",
+                closed_trades=4,
+            ),
+        }
+
+        estimate = strategy._entry_ev_for_context(
+            strategy_name="intraday_conviction_long_strategy",
+            regime_label="bull",
+            entry_grade_math="A",
+        )
+
+        self.assertEqual(estimate.strategy_name, "intraday_conviction_long_strategy")
+        self.assertEqual(estimate.closed_trades, 5)
+        self.assertEqual(estimate.confidence, "medium")
+        self.assertEqual(estimate.entry_ev, 210.0)
+
+    def test_reconcile_pending_buy_from_account_keeps_live_entry_context(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
+        )
+        now = datetime(2026, 4, 22, 9, 7, 3)
+        strategy.set_simulated_now(now)
+        strategy._pending_entry_meta["100790"] = {
+            "strategy_name": "intraday_conviction_long_strategy",
+            "setup_name": "intraday_conviction",
+            "entry_reason": "intraday_conviction",
+            "regime_label": "bull",
+            "queue_source": "opening_hot_queue",
+            "execution_mode": "live",
+            "live_route": "intraday_conviction_long_strategy",
+            "size_multiplier": 0.825,
+        }
+        pending = OrderResult(
+            success=True,
+            symbol="100790",
+            side=OrderSide.BUY,
+            quantity=0,
+            price=0,
+            fill_mode="market_pending",
+            timestamp=now,
+        )
+        account_pos = SimpleNamespace(symbol="100790", quantity=10, avg_price=54100)
+
+        inferred = strategy.reconcile_pending_fills_from_account([pending], [account_pos])
+
+        self.assertEqual(len(inferred), 1)
+        self.assertEqual(inferred[0].quantity, 10)
+        self.assertEqual(inferred[0].price, 54100)
+        self.assertNotIn("100790", strategy._pending_entry_meta)
+        self.assertIn("100790", strategy.positions)
+        self.assertFalse(strategy.positions["100790"].is_restored)
+        self.assertEqual(strategy.positions["100790"].entry_strategy_name, "intraday_conviction_long_strategy")
+        self.assertEqual(strategy.positions["100790"].queue_source, "opening_hot_queue")
+
+    def test_account_sync_promotes_pending_buy_to_live_position_for_daily_target(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_profit_target=10_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 5, 4, 10, 22, 57)
+        strategy.set_simulated_now(now)
+        strategy._pending_entry_meta["006910"] = {
+            "strategy_name": "intraday_conviction_long_strategy",
+            "setup_name": "intraday_conviction",
+            "entry_reason": "intraday_conviction",
+            "regime_label": "bull",
+            "queue_source": "math_queue",
+            "execution_mode": "live",
+            "live_route": "intraday_conviction_long_strategy",
+        }
+        account_pos = SimpleNamespace(symbol="006910", quantity=20, avg_price=13150, eval_amount=263000)
+
+        strategy.sync_positions_from_account([account_pos])
+
+        self.assertNotIn("006910", strategy._pending_entry_meta)
+        self.assertIn("006910", strategy.positions)
+        self.assertFalse(strategy.positions["006910"].is_restored)
+        self.assertEqual(strategy.positions["006910"].entry_setup_name, "intraday_conviction")
+        self.assertEqual(strategy.positions["006910"].queue_source, "math_queue")
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                symbol="006910",
+                side=OrderSide.SELL,
+                quantity=10,
+                price=14650,
+                requested_reason="partial_take_profit",
+                timestamp=now + timedelta(minutes=1),
+            )
+        )
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 15000)
+        self.assertEqual(strategy._realized_net_pnl_for_daily_breaker(), 15000)
+        self.assertFalse(strategy.should_continue())
+
+    def test_account_restore_logs_existing_holding_to_order_log(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        strategy.set_simulated_now(datetime(2026, 7, 8, 9, 0, 10))
+
+        with self.assertLogs("kis_trader.orders", level="INFO") as captured:
+            strategy.sync_positions_from_account(
+                [SimpleNamespace(symbol="365660", quantity=3, avg_price=10_950, eval_amount=32_850)]
+            )
+
+        message = "\n".join(captured.output)
+        self.assertIn("기존보유 복원: 365660 3주 @ 평균단가 10,950원", message)
+        self.assertIn("실시간 매수주문 아님", message)
+        self.assertTrue(strategy.positions["365660"].is_restored)
+        self.assertEqual(strategy.positions["365660"].queue_source, "account_restore")
+
+    def test_account_sync_clears_stale_pending_buy_missing_from_account(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
+        )
+        created_at = datetime(2026, 6, 9, 9, 11, 27)
+        strategy.set_simulated_now(created_at + timedelta(minutes=5))
+        strategy._pending_entry_meta["457370"] = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "setup_name": "expected_value",
+            "queue_source": "opening_hot_queue",
+            "pending_order_quantity": 39,
+            "pending_order_reference_price": 14_360,
+            "pending_order_created_at": created_at.isoformat(timespec="seconds"),
+        }
+
+        strategy.sync_positions_from_account([])
+
+        self.assertNotIn("457370", strategy._pending_entry_meta)
+
+    def test_pending_buy_meta_survives_market_pending_restart_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str(Path(tmpdir) / "state.json")
+            now = datetime(2026, 5, 4, 9, 38, 27)
+            strategy = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(daily_state_path=state_path),
+            )
+            strategy.set_simulated_now(now)
+            strategy._pending_entry_meta["006910"] = {
+                "strategy_name": "intraday_conviction_long_strategy",
+                "setup_name": "intraday_conviction",
+                "queue_source": "math_queue",
+            }
+
+            strategy.on_order_filled(
+                OrderResult(
+                    success=True,
+                    symbol="006910",
+                    side=OrderSide.BUY,
+                    quantity=0,
+                    price=0,
+                    fill_mode="market_pending",
+                    timestamp=now,
+                )
+            )
+
+            restored = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(daily_state_path=state_path),
+            )
+            restored.set_simulated_now(now + timedelta(minutes=1))
+            restored.initialize()
+
+            self.assertIn("006910", restored._pending_entry_meta)
+            self.assertEqual(restored._pending_entry_meta["006910"]["queue_source"], "math_queue")
+
+    def test_market_pending_buy_creates_provisional_live_position(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str(Path(tmpdir) / "state.json")
+            now = datetime(2026, 6, 5, 15, 0, 16)
+            strategy = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(daily_state_path=state_path),
+            )
+            strategy.set_simulated_now(now)
+            strategy._pending_entry_meta["001820"] = {
+                "strategy_name": INTRADAY_STRATEGY,
+                "setup_name": "expected_value",
+                "entry_reason": "expected_value",
+                "queue_source": "math_queue",
+                "execution_mode": "live",
+                "live_route": INTRADAY_STRATEGY,
+                "pending_order_quantity": 7,
+                "pending_order_reference_price": 114_800,
+                "planned_target_net_pnl": 5_408,
+                "planned_stop_net_loss_abs": 3_500,
+                "planned_risk_net_loss_abs": 4_537,
+                "entry_expected_net_pnl": 4_053.3,
+            }
+
+            strategy.on_order_filled(
+                OrderResult(
+                    success=True,
+                    symbol="001820",
+                    side=OrderSide.BUY,
+                    quantity=0,
+                    price=0,
+                    reference_price=114_800,
+                    fill_mode="market_pending",
+                    timestamp=now,
+                )
+            )
+
+            self.assertNotIn("001820", strategy._pending_entry_meta)
+            self.assertIn("001820", strategy.positions)
+            position = strategy.positions["001820"]
+            self.assertEqual(position.quantity, 7)
+            self.assertEqual(position.buy_price, 114_800)
+            self.assertEqual(position.planned_target_net_pnl, 5_408)
+            self.assertEqual(position.planned_stop_net_loss_abs, 3_500)
+
+            restored = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(daily_state_path=state_path),
+            )
+            restored.set_simulated_now(now + timedelta(minutes=1))
+            restored.initialize()
+
+            self.assertIn("001820", restored.positions)
+            self.assertNotIn("001820", restored._pending_entry_meta)
+            self.assertEqual(restored.positions["001820"].quantity, 7)
+            self.assertIsNotNone(restored.positions["001820"].pending_entry_started_at)
+            self.assertEqual(restored.positions["001820"].pending_entry_reference_price, 114_800)
+
+    def test_account_sync_drops_unconfirmed_market_pending_position_after_grace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str(Path(tmpdir) / "state.json")
+            now = datetime(2026, 6, 10, 9, 4, 31)
+            strategy = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(daily_state_path=state_path),
+            )
+            strategy.set_simulated_now(now)
+            strategy._pending_entry_meta["396300"] = {
+                "strategy_name": OPENING_STRATEGY,
+                "setup_name": "expected_value",
+                "entry_reason": "expected_value",
+                "queue_source": "math_queue",
+                "execution_mode": "live",
+                "live_route": OPENING_STRATEGY,
+                "pending_order_quantity": 88,
+                "pending_order_reference_price": 5_600,
+                "planned_target_net_pnl": 10_000,
+                "planned_stop_net_loss_abs": 3_458,
+                "planned_risk_net_loss_abs": 4_989,
+                "entry_expected_net_pnl": 3_967.9,
+            }
+
+            strategy.on_order_filled(
+                OrderResult(
+                    success=True,
+                    symbol="396300",
+                    side=OrderSide.BUY,
+                    quantity=0,
+                    price=0,
+                    reference_price=5_600,
+                    fill_mode="market_pending",
+                    timestamp=now,
+                )
+            )
+            strategy.set_simulated_now(now + timedelta(minutes=2))
+
+            strategy.sync_positions_from_account([])
+
+            self.assertIn("396300", strategy.positions)
+            position = strategy.positions["396300"]
+            self.assertEqual(position.quantity, 88)
+            self.assertEqual(position.buy_price, 5_600)
+            self.assertEqual(position.pending_entry_fill_mode, "market_pending")
+            self.assertEqual(position.planned_risk_net_loss_abs, 4_989)
+
+            strategy.set_simulated_now(now + timedelta(minutes=4))
+            strategy.sync_positions_from_account([])
+
+            self.assertNotIn("396300", strategy.positions)
+            self.assertEqual(strategy.daily_pnl.realized_net_pnl, 0)
+            self.assertEqual(strategy.daily_pnl.trade_count, 0)
+
+    def test_account_sync_reprices_market_pending_ev_when_fill_slips_past_prediction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str(Path(tmpdir) / "state.json")
+            now = datetime(2026, 7, 7, 12, 47, 21)
+            strategy = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(daily_state_path=state_path),
+            )
+            strategy.set_simulated_now(now)
+            strategy._pending_entry_meta["365660"] = {
+                "strategy_name": INTRADAY_STRATEGY,
+                "setup_name": "expected_value",
+                "entry_reason": "expected_value",
+                "queue_source": "math_queue",
+                "execution_mode": "live",
+                "live_route": INTRADAY_STRATEGY,
+                "pending_order_quantity": 62,
+                "pending_order_reference_price": 11_980,
+                "entry_signal_price": 11_980,
+                "price_prediction_return_pct": 2.691,
+                "price_prediction_lower_pct": 0.043,
+                "price_prediction_upper_pct": 3.20,
+                "entry_prediction_win_probability": 0.464,
+                "planned_target_net_pnl": 10_000,
+                "planned_stop_net_loss_abs": 3_815,
+                "planned_risk_net_loss_abs": 4_959,
+                "entry_expected_net_pnl": 2_507.4,
+                "price_prediction_net_pnl": 22_542,
+                "price_prediction_lower_net_pnl": -3_504,
+            }
+
+            strategy.on_order_filled(
+                OrderResult(
+                    success=True,
+                    symbol="365660",
+                    side=OrderSide.BUY,
+                    quantity=0,
+                    price=0,
+                    reference_price=11_980,
+                    fill_mode="market_pending",
+                    timestamp=now,
+                )
+            )
+
+            strategy.set_simulated_now(now + timedelta(minutes=2))
+            strategy.sync_positions_from_account(
+                [SimpleNamespace(symbol="365660", quantity=8, avg_price=12_220, eval_amount=97_760)]
+            )
+
+            position = strategy.positions["365660"]
+            self.assertEqual(position.quantity, 8)
+            self.assertEqual(position.buy_price, 12_220)
+            self.assertEqual(position.entry_signal_price, 11_980)
+            self.assertEqual(position.entry_ev_confidence, "live_plan_repriced")
+            self.assertLess(position.entry_expected_net_pnl, 0)
+            self.assertEqual(position.planned_stop_net_loss_abs, 1)
+            self.assertEqual(position.planned_risk_net_loss_abs, 4_959)
+
+            exit_order = strategy._default_long_exit(
+                Quote("365660", "365660", 12_220, 0, 0.0, 11_980, 12_220, 11_980, 1_000_000, 12_220_000_000, now)
+            )
+
+            self.assertIsNotNone(exit_order)
+            self.assertEqual(exit_order.requested_reason, "ev_planned_stop_net")
+
+    def test_reprice_keeps_accepted_stop_when_favorable_fill_lower_bound_only_covers_cost(self):
+        now = datetime(2026, 7, 20, 9, 7, 41)
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
+        )
+        strategy.set_simulated_now(now)
+        position = PositionState(
+            symbol="005930",
+            buy_price=252_250,
+            quantity=3,
+            buy_time=now - timedelta(seconds=13),
+            entry_setup_name="expected_value",
+            entry_signal_price=252_500,
+            entry_prediction_return_pct=0.760,
+            entry_prediction_lower_pct=0.227,
+            entry_prediction_upper_pct=1.293,
+            entry_prediction_win_probability=0.782,
+            planned_target_net_pnl=2_492,
+            planned_stop_net_loss_abs=3_253,
+            planned_risk_net_loss_abs=3_768,
+        )
+
+        strategy._reprice_position_ev_after_confirmed_entry(position)
+        strategy.positions[position.symbol] = position
+        exit_order = strategy._default_long_exit(
+            Quote(
+                "005930",
+                "005930",
+                252_000,
+                0,
+                0.0,
+                252_500,
+                252_500,
+                252_000,
+                1_000_000,
+                252_000_000_000,
+                now,
+            )
+        )
+
+        self.assertEqual(position.planned_stop_net_loss_abs, 3_253)
+        self.assertEqual(position.planned_risk_net_loss_abs, 3_768)
+        self.assertIsNone(exit_order)
+
+    def test_reprice_preserves_full_downside_after_entry_slippage(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
+        )
+        position = PositionState(
+            symbol="049080",
+            buy_price=13_550,
+            quantity=7,
+            entry_setup_name="expected_value",
+            entry_signal_price=13_470,
+            entry_prediction_return_pct=2.302,
+            entry_prediction_lower_pct=-1.764,
+            entry_prediction_upper_pct=3.0,
+            entry_prediction_win_probability=0.632,
+            planned_target_net_pnl=1_768,
+            planned_stop_net_loss_abs=661,
+            planned_risk_net_loss_abs=2_125,
+        )
+
+        strategy._reprice_position_ev_after_confirmed_entry(position)
+
+        self.assertEqual(position.entry_prediction_lower_net_pnl, -2_530)
+        self.assertEqual(position.planned_stop_net_loss_abs, 1)
+        self.assertGreater(position.planned_risk_net_loss_abs, 2_530)
+        self.assertLess(position.entry_expected_net_pnl, 0.0)
+
+    def test_partial_buy_reconciles_to_account_total_before_ev_exit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = datetime(2026, 7, 15, 13, 39, 22)
+            strategy = MomentumScalpStrategy(
+                market_data=None,
+                config=MomentumScalpConfig(daily_state_path=str(Path(tmpdir) / "state.json")),
+            )
+            strategy.set_simulated_now(now)
+            strategy._pending_entry_meta["303360"] = {
+                "strategy_name": INTRADAY_STRATEGY,
+                "setup_name": "expected_value",
+                "entry_reason": "expected_value",
+                "queue_source": "math_queue",
+                "pending_order_quantity": 143,
+                "pending_order_reference_price": 5_140,
+                "entry_signal_price": 5_140,
+                "price_prediction_return_pct": 0.979,
+                "price_prediction_lower_pct": 0.147,
+                "price_prediction_upper_pct": 1.811,
+                "entry_prediction_win_probability": 0.725308,
+                "planned_target_net_pnl": 3_016,
+                "planned_stop_net_loss_abs": 4_121,
+                "planned_risk_net_loss_abs": 4_718,
+                "entry_expected_net_pnl": 890.8,
+                "price_prediction_net_pnl": 3_016,
+                "price_prediction_lower_net_pnl": -3_120,
+            }
+            partial = OrderResult(
+                success=True,
+                symbol="303360",
+                side=OrderSide.BUY,
+                quantity=2,
+                price=5_140,
+                reference_price=5_140,
+                fill_mode="partial_fill_pending",
+                requested_quantity=143,
+                timestamp=now,
+            )
+
+            strategy.on_order_filled(partial)
+
+            self.assertEqual(strategy.positions["303360"].quantity, 2)
+            self.assertIsNotNone(strategy.positions["303360"].pending_entry_started_at)
+            self.assertIn("303360", strategy._pending_entry_meta)
+            self.assertIsNone(strategy._default_long_exit(Quote(
+                "303360", "303360", 5_130, 0, 0.0, 4_000, 5_170, 4_000, 1_000_000, 5_130_000_000, now
+            )))
+
+            inferred = strategy.reconcile_pending_fills_from_account(
+                [partial],
+                [SimpleNamespace(symbol="303360", quantity=143, avg_price=5_140, eval_amount=735_020)],
+            )
+
+            position = strategy.positions["303360"]
+            self.assertEqual(len(inferred), 1)
+            self.assertEqual(position.quantity, 143)
+            self.assertIsNone(position.pending_entry_started_at)
+            self.assertNotIn("303360", strategy._pending_entry_meta)
+            self.assertGreater(position.planned_stop_net_loss_abs, 24)
+
+    def test_pending_market_buy_meta_counts_as_exposure_and_loss_room(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                seed_money=1_000_000,
+                capital_utilization_pct=1.0,
+                daily_profit_target=10_000,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        strategy._pending_entry_meta["425040"] = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "live_route": INTRADAY_STRATEGY,
+            "pending_order_quantity": 43,
+            "pending_order_reference_price": 20_250,
+            "planned_risk_net_loss_abs": 4_290,
+        }
+        pending_order = Order(
+            symbol="425040",
+            side=OrderSide.BUY,
+            quantity=43,
+            price=0,
+            reference_price=20_250,
+        )
+
+        self.assertEqual(strategy._pending_long_exposure_amount([]), 870_750)
+        self.assertEqual(strategy._pending_long_planned_loss_risk([]), 4_290)
+        self.assertEqual(strategy._remaining_long_seed_exposure_budget([]), 129_250)
+        self.assertEqual(strategy._daily_loss_room() - strategy._pending_long_planned_loss_risk([]), 710)
+        self.assertEqual(strategy._pending_long_exposure_amount([pending_order]), 870_750)
+
+    def test_network_pending_buy_without_account_position_keeps_entry_meta_during_grace(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(daily_state_path="/tmp/nonexistent-momentum-state.json"),
+        )
+        now = datetime(2026, 6, 9, 9, 11, 29)
+        strategy.set_simulated_now(now)
+        strategy._pending_entry_meta["457370"] = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "setup_name": "expected_value",
+            "queue_source": "opening_hot_queue",
+            "pending_order_quantity": 39,
+            "pending_order_reference_price": 14_360,
+        }
+        pending = OrderResult(
+            success=True,
+            symbol="457370",
+            side=OrderSide.BUY,
+            quantity=0,
+            price=0,
+            reference_price=14_360,
+            fill_mode="order_result_pending",
+            timestamp=now,
+        )
+
+        inferred = strategy.reconcile_pending_fills_from_account([pending], [])
+
+        self.assertEqual(inferred, [])
+        self.assertIn("457370", strategy._pending_entry_meta)
+
+    def test_stale_network_pending_buy_without_account_position_clears_entry_meta(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 6, 9, 9, 11, 29)
+        strategy.set_simulated_now(now)
+        stale_created_at = now - timedelta(seconds=181)
+        strategy._pending_entry_meta["457370"] = {
+            "strategy_name": INTRADAY_STRATEGY,
+            "setup_name": "expected_value",
+            "queue_source": "opening_hot_queue",
+            "pending_order_quantity": 39,
+            "pending_order_reference_price": 14_360,
+            "pending_order_created_at": stale_created_at.isoformat(timespec="seconds"),
+        }
+        pending = OrderResult(
+            success=True,
+            symbol="457370",
+            side=OrderSide.BUY,
+            quantity=0,
+            price=0,
+            reference_price=14_360,
+            fill_mode="order_result_pending",
+            timestamp=now,
+        )
+
+        inferred = strategy.reconcile_pending_fills_from_account([pending], [])
+
+        self.assertEqual(inferred, [])
+        self.assertNotIn("457370", strategy._pending_entry_meta)
+
+    def test_account_sync_records_delayed_pending_sell_quantity_drop(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 4, 22, 9, 31, 21)
+        strategy.set_simulated_now(now)
+        strategy.positions["007660"] = PositionState(
+            symbol="007660",
+            buy_price=144900,
+            quantity=3,
+            entry_strategy_name="intraday_conviction_long_strategy",
+            entry_setup_name="intraday_conviction",
+            queue_source="math_queue",
+        )
+        quote = Quote(
+            symbol="007660",
+            name="007660",
+            current_price=146600,
+            change=0,
+            change_rate=0.0,
+            open_price=140000,
+            high_price=146800,
+            low_price=140000,
+            volume=1_000_000,
+            trade_amount=146_600_000_000,
+            timestamp=now,
+        )
+        strategy._quotes_cache["007660"] = quote
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="pending-sell-1",
+                symbol="007660",
+                side=OrderSide.SELL,
+                quantity=0,
+                price=0,
+                reference_price=146600,
+                fill_mode="market_pending",
+                requested_reason="partial_take_profit",
+                timestamp=now,
+            )
+        )
+        account_pos = SimpleNamespace(symbol="007660", quantity=1, avg_price=144900, eval_amount=146600)
+
+        strategy.sync_positions_from_account([account_pos])
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 3400)
+        self.assertEqual(strategy.daily_pnl.trade_count, 0)
+        self.assertEqual(strategy.positions["007660"].quantity, 1)
+        self.assertTrue(strategy.positions["007660"].partial_exit_done)
+        self.assertEqual(strategy._sell_fill_ledger[-1]["order_no"], "pending-sell-1")
+
+        strategy.sync_positions_from_account([])
+
+        self.assertNotIn("007660", strategy.positions)
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 5100)
+        self.assertEqual(strategy.daily_pnl.trade_count, 1)
+
+    def test_filled_small_pending_sell_releases_unreserved_remainder(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 7, 15, 13, 40, 42)
+        strategy.set_simulated_now(now)
+        strategy.positions["303360"] = PositionState(
+            symbol="303360",
+            buy_price=5_140,
+            quantity=143,
+            buy_time=now,
+        )
+        strategy.on_order_filled(OrderResult(
+            success=True,
+            order_no="small-sell",
+            symbol="303360",
+            side=OrderSide.SELL,
+            quantity=0,
+            reference_price=5_130,
+            fill_mode="market_pending",
+            requested_quantity=2,
+            requested_reason="ev_planned_stop_net",
+            timestamp=now,
+        ))
+
+        reserved = strategy._make_sell_order(strategy.positions["303360"], 143, reason="liquidate_all")
+        self.assertIsNotNone(reserved)
+        self.assertEqual(reserved.quantity, 141)
+
+        strategy.on_order_filled(OrderResult(
+            success=True,
+            order_no="small-sell",
+            symbol="303360",
+            side=OrderSide.SELL,
+            quantity=2,
+            price=5_130,
+            reference_price=5_130,
+            fill_mode="account_reconciled_estimated",
+            requested_reason="ev_planned_stop_net",
+            timestamp=now + timedelta(seconds=2),
+        ))
+
+        position = strategy.positions["303360"]
+        self.assertEqual(position.quantity, 141)
+        self.assertEqual(position.pending_exit_quantity, 0)
+        self.assertIsNone(position.pending_exit_started_at)
+
+    def test_partial_then_full_exit_counts_cumulative_trade_pnl_once(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 4, 27, 9, 1, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["006340"] = PositionState(
+            symbol="006340",
+            buy_price=9_760,
+            quantity=71,
+            buy_time=now,
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="queue_value_scout",
+            trade_key="006340:test-trade",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="10001",
+                symbol="006340",
+                side=OrderSide.SELL,
+                quantity=36,
+                price=10_110,
+                requested_reason="partial_take_profit",
+                timestamp=now,
+            )
+        )
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="10002",
+                symbol="006340",
+                side=OrderSide.SELL,
+                quantity=35,
+                price=10_220,
+                requested_reason="take_profit",
+                timestamp=now + timedelta(seconds=20),
+            )
+        )
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 28_700)
+        self.assertEqual(strategy.daily_pnl.realized_gross_pnl, 28_700)
+        self.assertEqual(strategy.daily_pnl.trade_count, 1)
+        self.assertEqual(strategy.daily_pnl.win_count, 1)
+        self.assertEqual(strategy.daily_pnl.winning_net_pnl_sum, 28_700)
+        self.assertEqual(strategy.daily_pnl.largest_win_net, 28_700)
+        self.assertNotIn("006340", strategy.positions)
+
+    def test_confirm_reconciled_sell_fill_updates_state_and_trade_stats(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 4, 27, 9, 1, 0)
+        strategy.set_simulated_now(now)
+        strategy.positions["006340"] = PositionState(
+            symbol="006340",
+            buy_price=9_760,
+            quantity=35,
+            buy_time=now,
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="queue_value_scout",
+            trade_key="006340:test-trade",
+        )
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="20001",
+                symbol="006340",
+                side=OrderSide.SELL,
+                quantity=35,
+                price=10_110,
+                fill_mode="account_reconciled_estimated",
+                requested_reason="take_profit",
+                timestamp=now,
+            )
+        )
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 12_250)
+        self.assertEqual(strategy.daily_pnl.trade_count, 1)
+        self.assertEqual(strategy.daily_pnl.winning_net_pnl_sum, 12_250)
+
+        class DummyAccount:
+            @staticmethod
+            def _coerce_int(value):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            def get_order_history(self, *args, **kwargs):
+                return pd.DataFrame(
+                    [
+                        {
+                            "odno": "20001",
+                            "pdno": "006340",
+                            "tot_ccld_qty": "35",
+                            "avg_prvs": "10220",
+                            "tot_ccld_amt": "357700",
+                        }
+                    ]
+                )
+
+        corrected_results = [
+            OrderResult(
+                success=True,
+                order_no="20001",
+                symbol="006340",
+                side=OrderSide.SELL,
+                quantity=35,
+                price=10_110,
+                fill_mode="account_reconciled_estimated",
+                timestamp=now,
             )
         ]
 
-        strategy.sync_positions_from_account(account_positions)
+        corrections = strategy.confirm_reconciled_sell_fills(DummyAccount(), results=corrected_results)
 
-        self.assertIn("005930", strategy.positions)
-        pos = strategy.positions["005930"]
-        self.assertEqual(pos.quantity, 3)
-        self.assertEqual(pos.buy_price, 71234)
-        self.assertEqual(pos.invested_amount, 213702)
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["corrected_price"], 10_220)
+        self.assertEqual(corrected_results[0].price, 10_220)
+        self.assertEqual(corrected_results[0].fill_mode, "account_reconciled_confirmed")
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 16_100)
+        self.assertEqual(strategy.daily_pnl.winning_net_pnl_sum, 16_100)
 
-    def test_restored_position_uses_saved_buy_time_for_time_exit(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=False,
-            restored_position_grace_seconds=0,
-            max_position_holding_minutes=10,
-            take_profit_pct=5.0,
+    def test_estimated_sell_profit_waits_for_confirmation_before_target_halt(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_profit_target=10_000,
+                daily_profit_lock_buffer=0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
         )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        restored_buy_time = datetime.now() - timedelta(minutes=35)
-        strategy._loaded_position_meta = {
-            "005930": {
-                "buy_time": restored_buy_time.isoformat(timespec="seconds"),
-                "invested_amount": 10_000,
-                "high_since_buy": 10_000,
-            }
-        }
-
-        strategy.sync_positions_from_account(
-            [
-                Position(
-                    symbol="005930",
-                    name="삼성전자",
-                    quantity=1,
-                    avg_price=10_000.0,
-                    current_price=10_050,
-                    eval_amount=0,
-                    profit_loss=0,
-                    profit_rate=0.0,
-                )
-            ]
-        )
-
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_050,
-            change=50,
-            change_rate=0.5,
-            open_price=10_000,
-            high_price=10_100,
-            low_price=9_980,
-            volume=500_000,
-            trade_amount=5_025_000_000,
-        )
-
-        orders = strategy.on_batch_tick([quote])
-
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0].symbol, "005930")
-        self.assertEqual(orders[0].side, OrderSide.SELL)
-
-    def test_restored_position_keeps_grace_before_time_exit(self):
-        cfg = MomentumScalpConfig(
-            enable_regime_adaptive=False,
-            restored_position_grace_seconds=300,
-            max_position_holding_minutes=10,
-            take_profit_pct=5.0,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        restored_buy_time = datetime.now() - timedelta(minutes=35)
-        strategy._loaded_position_meta = {
-            "005930": {
-                "buy_time": restored_buy_time.isoformat(timespec="seconds"),
-                "invested_amount": 10_000,
-                "high_since_buy": 10_000,
-            }
-        }
-
-        strategy.sync_positions_from_account(
-            [
-                Position(
-                    symbol="005930",
-                    name="삼성전자",
-                    quantity=1,
-                    avg_price=10_000.0,
-                    current_price=10_050,
-                    eval_amount=0,
-                    profit_loss=0,
-                    profit_rate=0.0,
-                )
-            ]
-        )
-
-        quote = Quote(
-            symbol="005930",
-            name="삼성전자",
-            current_price=10_050,
-            change=50,
-            change_rate=0.5,
-            open_price=10_000,
-            high_price=10_100,
-            low_price=9_980,
-            volume=500_000,
-            trade_amount=5_025_000_000,
-        )
-
-        orders = strategy.on_batch_tick([quote])
-
-        self.assertEqual(orders, [])
-        self.assertTrue(strategy.positions["005930"].is_restored)
-
-    def test_inverse_buy_blocked_by_strategy_cooldown(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=True,
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            inverse_min_change_rate=1.0,
-            inverse_min_momentum=0.0,
-            inverse_min_bear_score=2,
-            bearish_threshold=2,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 2
-        strategy._strategy_cooldown_until["soft_bear_inverse_strategy"] = datetime.now() + timedelta(minutes=5)
-
-        quote = Quote(
-            symbol="252670",
-            name="KODEX 200선물인버스2X",
-            current_price=2_000,
-            change=40,
-            change_rate=2.0,
-            open_price=1_980,
-            high_price=2_010,
-            low_price=1_970,
-            volume=500_000,
-            trade_amount=1_000_000_000,
-        )
-
-        order = strategy._evaluate_inverse_buy(quote)
-        self.assertIsNone(order)
-
-    def test_symbol_cooldown_blocks_only_same_symbol(self):
-        cfg = MomentumScalpConfig(
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 1
-        now = datetime(2026, 3, 16, 10, 0)
+        now = datetime(2026, 5, 27, 13, 40, 0)
         strategy.set_simulated_now(now)
-        strategy._symbol_cooldown_until["AAA"] = now + timedelta(minutes=5)
-
-        aaa_quote = Quote("AAA", "A", 10_200, 200, 2.0, 10_000, 10_220, 9_950, 30_000, 300_000_000)
-        bbb_quote = Quote("BBB", "B", 10_200, 200, 2.0, 10_000, 10_220, 9_950, 30_000, 300_000_000)
-
-        self.assertFalse(strategy._can_open_new_long(aaa_quote, score=3.0))
-        self.assertTrue(strategy._can_open_new_long(bbb_quote, score=3.0))
-
-    def test_neutral_strategy_cooldown_does_not_block_soft_bear_inverse(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=True,
-            inverse_etfs=["252670"],
-            enable_volume_spike_filter=False,
-            enable_expected_net_filter=False,
-            enable_pool_persistence_gate=False,
-            soft_bear_inverse_min_change_rate=0.0,
-            soft_bear_inverse_min_momentum=0.0,
-            enable_math_shadow_layer=False,
-            enable_math_live_layer=False,
+        strategy.positions["274090"] = PositionState(
+            symbol="274090",
+            buy_price=38_350,
+            quantity=26,
+            buy_time=now - timedelta(minutes=1),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+            trade_key="274090:test-trade",
         )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        now = datetime(2026, 3, 16, 10, 0)
+
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="20002",
+                symbol="274090",
+                side=OrderSide.SELL,
+                quantity=26,
+                price=38_750,
+                fill_mode="account_reconciled_estimated",
+                requested_reason="ev_planned_target_net",
+                timestamp=now,
+            )
+        )
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 10_400)
+        self.assertTrue(strategy.should_continue())
+
+        class DummyAccount:
+            @staticmethod
+            def _coerce_int(value):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            def get_order_history(self, *args, **kwargs):
+                return pd.DataFrame(
+                    [
+                        {
+                            "odno": "20002",
+                            "pdno": "274090",
+                            "tot_ccld_qty": "26",
+                            "avg_prvs": "38750",
+                            "tot_ccld_amt": str(38_750 * 26),
+                        }
+                    ]
+                )
+
+        strategy.confirm_reconciled_sell_fills(DummyAccount())
+
+        self.assertFalse(strategy.should_continue())
+
+    def test_estimated_target_halt_is_not_kept_after_correction_below_target(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_profit_target=10_000,
+                daily_profit_lock_buffer=0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 5, 27, 13, 40, 0)
         strategy.set_simulated_now(now)
-        strategy._strategy_cooldown_until["neutral_pullback_strategy"] = now + timedelta(minutes=10)
-        strategy._bear_score = 2
-
-        history = [
-            Quote("252670", "KODEX 인버스", 2_000, 0, 0.0, 2_000, 2_000, 1_995, 10_000, 20_000_000),
-            Quote("252670", "KODEX 인버스", 2_030, 30, 1.5, 2_000, 2_030, 1_995, 20_000, 40_000_000),
-            Quote("252670", "KODEX 인버스", 2_020, 20, 1.0, 2_000, 2_030, 1_995, 30_000, 60_000_000),
-            Quote("252670", "KODEX 인버스", 2_032, 32, 1.6, 2_000, 2_032, 1_995, 40_000, 80_000_000),
-        ]
-        for quote in history:
-            strategy._record_recent_quote(quote)
-
-        order = strategy._evaluate_inverse_buy(history[-1])
-        self.assertIsNotNone(order)
-
-    def test_inverse_volume_spike_gate_relaxes_only_for_inverse(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=True,
-            inverse_etfs=["252670"],
+        strategy.positions["274090"] = PositionState(
+            symbol="274090",
+            buy_price=38_350,
+            quantity=26,
+            buy_time=now - timedelta(minutes=1),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+            trade_key="274090:test-trade",
         )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 3
-
-        inverse_quote = Quote(
-            symbol="252670",
-            name="KODEX 200선물인버스2X",
-            current_price=2_000,
-            change=40,
-            change_rate=2.0,
-            open_price=1_980,
-            high_price=2_010,
-            low_price=1_970,
-            volume=500_000,
-            trade_amount=1_000_000_000,
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="20003",
+                symbol="274090",
+                side=OrderSide.SELL,
+                quantity=26,
+                price=38_750,
+                fill_mode="account_reconciled_estimated",
+                requested_reason="ev_planned_target_net",
+                timestamp=now,
+            )
         )
-        regular_quote = Quote(
+
+        class DummyAccount:
+            @staticmethod
+            def _coerce_int(value):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            def get_order_history(self, *args, **kwargs):
+                return pd.DataFrame(
+                    [
+                        {
+                            "odno": "20003",
+                            "pdno": "274090",
+                            "tot_ccld_qty": "26",
+                            "avg_prvs": "38700",
+                            "tot_ccld_amt": str(38_700 * 26),
+                        }
+                    ]
+                )
+
+        strategy.confirm_reconciled_sell_fills(DummyAccount())
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, 9_100)
+        self.assertTrue(strategy.should_continue())
+
+    def test_estimated_loss_halt_is_not_kept_after_correction_above_loss_limit(self):
+        strategy = MomentumScalpStrategy(
+            market_data=None,
+            config=MomentumScalpConfig(
+                commission_rate=0.0,
+                tax_slippage_rate=0.0,
+                daily_loss_limit=-5_000,
+                daily_total_loss_limit=-5_000,
+                daily_loss_near_stop_buffer=0,
+                daily_state_path="/tmp/nonexistent-momentum-state.json",
+            ),
+        )
+        now = datetime(2026, 7, 20, 9, 8, 36)
+        strategy.set_simulated_now(now)
+        strategy.positions["005930"] = PositionState(
             symbol="005930",
-            name="삼성전자",
-            current_price=60_000,
-            change=1_200,
-            change_rate=2.0,
-            open_price=59_400,
-            high_price=60_300,
-            low_price=59_100,
-            volume=500_000,
-            trade_amount=30_000_000_000,
-        )
-        strategy._bear_score = 3
-
-        for symbol in ("252670", "005930"):
-            strategy._latest_tick_volumes[symbol] = 10_500
-            strategy._recent_tick_volumes[symbol] = deque([10_000, 10_000, 10_500], maxlen=12)
-
-        self.assertTrue(strategy._is_volume_spike(inverse_quote, score=2.5))
-        self.assertFalse(strategy._is_volume_spike(regular_quote, score=2.5))
-
-    def test_inverse_buy_can_pass_relaxed_volume_spike_gate(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=True,
-            inverse_etfs=["252670"],
-            enable_expected_net_filter=False,
-            inverse_min_change_rate=1.0,
-            inverse_min_momentum=0.0,
-            inverse_min_bear_score=2,
-            bearish_threshold=2,
-            enable_math_shadow_layer=False,
-            enable_math_live_layer=False,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 3
-
-        quote = Quote(
-            symbol="252670",
-            name="KODEX 200선물인버스2X",
-            current_price=2_000,
-            change=40,
-            change_rate=2.0,
-            open_price=1_980,
-            high_price=2_010,
-            low_price=1_970,
-            volume=500_000,
-            trade_amount=1_000_000_000,
-        )
-        strategy._latest_tick_volumes["252670"] = 15_500
-        strategy._recent_tick_volumes["252670"] = deque([10_000, 10_000, 15_500], maxlen=12)
-
-        order = strategy._evaluate_inverse_buy(quote)
-
-        self.assertIsNotNone(order)
-        self.assertEqual(order.side, OrderSide.BUY)
-
-    def test_inverse_trailing_stop_requires_activation_gain(self):
-        cfg = MomentumScalpConfig(
-            inverse_enabled=True,
-            enable_regime_adaptive=False,
-            inverse_take_profit_pct=5.0,
-            inverse_stop_loss_pct=-2.0,
-            inverse_trailing_stop_pct=-0.3,
-            inverse_trailing_stop_activation_gain_pct=0.45,
-            bearish_threshold=2,
-        )
-        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 2  # 시장반등 청산 우회
-        strategy.positions["252670"] = PositionState(
-            symbol="252670",
             buy_price=10_000,
             quantity=1,
-            invested_amount=10_000,
+            buy_time=now - timedelta(minutes=2),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+            trade_key="005930:test-trade",
+        )
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="72000",
+                symbol="005930",
+                side=OrderSide.SELL,
+                quantity=1,
+                price=7_000,
+                fill_mode="account_reconciled_confirmed",
+                requested_reason="ev_planned_stop_net",
+                timestamp=now - timedelta(minutes=1),
+            )
+        )
+        strategy.positions["067310"] = PositionState(
+            symbol="067310",
+            buy_price=40_100,
+            quantity=13,
+            buy_time=now - timedelta(seconds=13),
+            entry_strategy_name=INTRADAY_STRATEGY,
+            entry_setup_name="expected_value",
+            trade_key="067310:test-trade",
+        )
+        strategy.on_order_filled(
+            OrderResult(
+                success=True,
+                order_no="72001",
+                symbol="067310",
+                side=OrderSide.SELL,
+                quantity=13,
+                price=39_900,
+                fill_mode="account_reconciled_estimated",
+                requested_reason="ev_planned_stop_net",
+                timestamp=now,
+            )
         )
 
-        pos = strategy.positions["252670"]
+        self.assertLessEqual(strategy.daily_pnl.realized_net_pnl, -5_000)
+        self.assertFalse(strategy.should_continue())
 
-        # 고점 이익이 0.45% 미만이면 추적손절 조건 미발동
-        pos.high_since_buy = 10_020  # +0.2%
-        no_trigger_quote = Quote(
-            symbol="252670",
-            name="KODEX 200선물인버스2X",
-            current_price=9_985,
-            change=0,
-            change_rate=0.0,
+        class DummyAccount:
+            @staticmethod
+            def _coerce_int(value):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            def get_order_history(self, *args, **kwargs):
+                return pd.DataFrame(
+                    [
+                        {
+                            "odno": "72001",
+                            "pdno": "067310",
+                            "tot_ccld_qty": "13",
+                            "avg_prvs": "40100",
+                            "tot_ccld_amt": str(40_100 * 13),
+                        }
+                    ]
+                )
+
+        strategy.confirm_reconciled_sell_fills(DummyAccount())
+
+        self.assertEqual(strategy.daily_pnl.realized_net_pnl, -3_000)
+        self.assertTrue(strategy.should_continue())
+
+    def test_leader_signal_cache_miss_uses_conservative_non_leader_fallback(self):
+        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
+        now = datetime(2026, 4, 3, 10, 0, 0)
+        quote = Quote(
+            symbol="AAA",
+            name="AAA",
+            current_price=10_200,
+            change=200,
+            change_rate=2.0,
             open_price=10_000,
-            high_price=10_030,
-            low_price=9_960,
-            volume=100_000,
-            trade_amount=200_000_000,
+            high_price=10_250,
+            low_price=9_980,
+            volume=80_000,
+            trade_amount=816_000_000,
+            timestamp=now,
         )
-        self.assertIsNone(strategy._evaluate_inverse_sell(no_trigger_quote))
+        strategy._quotes_cache["AAA"] = quote
+        strategy._recent_quotes["AAA"] = deque([quote], maxlen=8)
 
-        # 고점 이익이 충분하고 고점 대비 하락률이 임계 이하면 추적손절 발동
-        pos.high_since_buy = 10_080  # +0.8%
-        trigger_quote = Quote(
-            symbol="252670",
-            name="KODEX 200선물인버스2X",
-            current_price=10_040,  # 고점 대비 약 -0.40%
-            change=0,
-            change_rate=0.0,
+        signal = strategy._leader_signal_for_quote(quote)
+
+        self.assertEqual(signal.leader_score, 0.0)
+        self.assertEqual(signal.effective_leader_score, 0.0)
+        self.assertEqual(signal.leader_percentile, 0.0)
+        self.assertEqual(signal.entry_grade, "C")
+        self.assertEqual(signal.change_rate, quote.change_rate)
+
+    def test_refresh_runtime_math_candidate_queue_prunes_stale_intraday_sources(self):
+        cfg = MomentumScalpConfig()
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 4, 3, 10, 5, 0)
+
+        stale = "100001"
+        hot = "100002"
+        fresh = Quote(
+            symbol="100003",
+            name="100003",
+            current_price=10_400,
+            change=400,
+            change_rate=4.0,
             open_price=10_000,
-            high_price=10_080,
-            low_price=10_000,
-            volume=120_000,
-            trade_amount=250_000_000,
+            high_price=10_450,
+            low_price=9_980,
+            volume=150_000,
+            trade_amount=1_560_000_000,
+            timestamp=now,
         )
-        order = strategy._evaluate_inverse_sell(trigger_quote)
+        strategy._latest_math_queue_symbols = [hot, stale]
+        strategy._latest_math_backfill_symbols = [stale]
+        strategy._latest_math_queue_source = {
+            hot: "opening_hot_queue",
+            stale: "math_backfill",
+        }
+        strategy._recent_quotes[fresh.symbol] = deque([fresh], maxlen=8)
+
+        strategy._refresh_runtime_math_candidate_queue([fresh])
+
+        self.assertNotIn(stale, strategy._latest_math_queue_source)
+        self.assertNotIn(hot, strategy._latest_math_queue_source)
+        self.assertIn(fresh.symbol, strategy._latest_math_queue_source)
+
+    def test_refresh_runtime_math_candidate_queue_excludes_unsupported_long_symbols(self):
+        cfg = MomentumScalpConfig()
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 6, 11, 10, 10, 28)
+        supported = Quote(
+            symbol="100004",
+            name="100004",
+            current_price=10_400,
+            change=400,
+            change_rate=4.0,
+            open_price=10_000,
+            high_price=10_450,
+            low_price=9_980,
+            volume=150_000,
+            trade_amount=1_560_000_000,
+            timestamp=now,
+        )
+        derivative_like = Quote(
+            symbol="0195S0",
+            name="0195S0",
+            current_price=20_130,
+            change=2_750,
+            change_rate=15.82,
+            open_price=17_380,
+            high_price=20_350,
+            low_price=17_300,
+            volume=300_000,
+            trade_amount=6_039_000_000,
+            timestamp=now,
+        )
+        vendor_like = Quote(
+            symbol="Q520101",
+            name="Q520101",
+            current_price=9_800,
+            change=900,
+            change_rate=10.11,
+            open_price=8_900,
+            high_price=9_820,
+            low_price=8_880,
+            volume=250_000,
+            trade_amount=2_450_000_000,
+            timestamp=now,
+        )
+
+        strategy._refresh_runtime_math_candidate_queue([derivative_like, vendor_like, supported])
+
+        queued_symbols = set(strategy._latest_math_queue_symbols) | set(strategy._latest_math_backfill_symbols)
+        self.assertIn("100004", queued_symbols)
+        self.assertNotIn("0195S0", queued_symbols)
+        self.assertNotIn("Q520101", queued_symbols)
+        self.assertNotIn("0195S0", strategy._latest_math_queue_source)
+        self.assertNotIn("Q520101", strategy._latest_math_queue_source)
+
+    def test_adaptive_market_thresholds_relax_hot_tape_and_tighten_caution_tape(self):
+        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
+        strategy._adaptive_market_state = {
+            "quote_count": 26.0,
+            "tape_heat": 0.86,
+            "tape_caution": 0.10,
+            "overheat": 0.35,
+            "vs_open_p90": 17.8,
+        }
+
+        hot = strategy._adaptive_market_entry_thresholds()
+        hot_queue_floor = strategy._adaptive_math_queue_percentile_floor(0.80)
+
+        self.assertLess(hot["leader_percentile_delta"], 0.0)
+        self.assertLess(hot["effective_score_delta"], 0.0)
+        self.assertGreater(hot["vs_open_ceiling_delta"], 0.0)
+        self.assertGreater(hot["negative_ev_floor_scale"], 1.0)
+        self.assertLess(hot_queue_floor, 0.80)
+
+        strategy._adaptive_market_state = {
+            "quote_count": 26.0,
+            "tape_heat": 0.12,
+            "tape_caution": 0.82,
+            "overheat": 0.78,
+            "vs_open_p90": 6.0,
+        }
+
+        caution = strategy._adaptive_market_entry_thresholds()
+        caution_queue_floor = strategy._adaptive_math_queue_percentile_floor(0.80)
+
+        self.assertGreater(caution["leader_percentile_delta"], 0.0)
+        self.assertGreater(caution["effective_score_delta"], 0.0)
+        self.assertLess(caution["vs_open_ceiling_delta"], 0.0)
+        self.assertLess(caution["negative_ev_floor_scale"], 1.0)
+        self.assertGreater(caution_queue_floor, 0.80)
+
+    def test_symbol_micro_edge_scores_fast_launch_higher_than_reversal(self):
+        strategy = MomentumScalpStrategy(market_data=None, config=MomentumScalpConfig())
+        now = datetime(2026, 5, 13, 10, 30, 0)
+        strategy.set_simulated_now(now)
+        launch_quotes = [
+            Quote("AAA", "AAA", 10_000, 0, 0.0, 10_000, 10_520, 9_980, 100_000, 1_000_000_000, now),
+            Quote("AAA", "AAA", 10_060, 60, 0.6, 10_000, 10_520, 9_980, 130_000, 1_301_800_000, now),
+            Quote("AAA", "AAA", 10_150, 150, 1.5, 10_000, 10_520, 9_980, 180_000, 1_809_500_000, now),
+            Quote("AAA", "AAA", 10_300, 300, 3.0, 10_000, 10_520, 9_980, 260_000, 2_633_500_000, now),
+            Quote("AAA", "AAA", 10_480, 480, 4.8, 10_000, 10_520, 9_980, 380_000, 3_891_100_000, now),
+        ]
+        strategy._recent_quotes["AAA"] = deque(launch_quotes, maxlen=8)
+        launch_leader = LeaderSignal(
+            symbol="AAA",
+            leader_score=1.0,
+            leader_percentile=0.98,
+            entry_grade="A",
+            change_rate=4.8,
+            trade_amount=3_891_100_000,
+            vs_open_pct=4.8,
+            high_proximity=0.93,
+            volume_vs_avg=1.4,
+            reclaim_speed_ticks=1,
+            recent_acceleration_pct=0.5,
+            effective_leader_score=1.1,
+        )
+
+        launch = symbol_micro_edge_metrics(strategy, launch_quotes[-1], leader=launch_leader)
+
+        reversal_quotes = [
+            Quote("BBB", "BBB", 10_000, 0, 0.0, 10_000, 10_900, 9_980, 100_000, 1_000_000_000, now),
+            Quote("BBB", "BBB", 10_850, 850, 8.5, 10_000, 10_900, 9_980, 170_000, 1_759_500_000, now),
+            Quote("BBB", "BBB", 10_780, 780, 7.8, 10_000, 10_900, 9_980, 220_000, 2_298_500_000, now),
+            Quote("BBB", "BBB", 10_560, 560, 5.6, 10_000, 10_900, 9_980, 245_000, 2_562_500_000, now),
+            Quote("BBB", "BBB", 10_360, 360, 3.6, 10_000, 10_900, 9_980, 255_000, 2_666_100_000, now),
+        ]
+        strategy._recent_quotes["BBB"] = deque(reversal_quotes, maxlen=8)
+        reversal_leader = LeaderSignal(
+            symbol="BBB",
+            leader_score=1.0,
+            leader_percentile=0.98,
+            entry_grade="A",
+            change_rate=3.6,
+            trade_amount=2_666_100_000,
+            vs_open_pct=11.0,
+            high_proximity=0.99,
+            volume_vs_avg=1.1,
+            reclaim_speed_ticks=99,
+            recent_acceleration_pct=-0.4,
+            effective_leader_score=1.0,
+        )
+
+        reversal = symbol_micro_edge_metrics(strategy, reversal_quotes[-1], leader=reversal_leader)
+
+        self.assertTrue(launch["micro_ready"])
+        self.assertGreater(launch["micro_launch_score"], launch["micro_downside_score"])
+        self.assertGreater(launch["micro_net_score"], 0.0)
+        self.assertTrue(bool(launch["micro_fast_launch"]))
+        self.assertGreater(reversal["micro_downside_score"], reversal["micro_launch_score"])
+        self.assertLess(reversal["micro_net_score"], 0.0)
+
+
+
+
+    def test_protective_stop_exits_immediately(self):
+        cfg = MomentumScalpConfig(
+            commission_rate=0.0,
+            tax_slippage_rate=0.0,
+            long_stop_loss_cap_amount=2_200,
+            long_stop_loss_notional_pct=0.007,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg)
+        now = datetime(2026, 5, 13, 10, 35, 0)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 5, 13, 9, 0, 0)
+        strategy.positions["AAA"] = PositionState(
+            symbol="AAA",
+            buy_price=10_000,
+            quantity=30,
+            invested_amount=300_000,
+            buy_time=now - timedelta(minutes=3),
+            high_since_buy=10_080,
+        )
+        rebound_quotes = [
+            Quote("AAA", "AAA", 10_000, 0, 0.0, 10_000, 10_080, 9_850, 100_000, 1_000_000_000, now),
+            Quote("AAA", "AAA", 9_900, -100, -1.0, 10_000, 10_080, 9_850, 150_000, 1_495_000_000, now),
+            Quote("AAA", "AAA", 9_860, -140, -1.4, 10_000, 10_080, 9_850, 210_000, 2_086_600_000, now),
+            Quote("AAA", "AAA", 9_895, -105, -1.05, 10_000, 10_080, 9_850, 300_000, 2_977_150_000, now),
+            Quote("AAA", "AAA", 9_930, -70, -0.7, 10_000, 10_080, 9_850, 430_000, 4_268_050_000, now),
+        ]
+        strategy._recent_quotes["AAA"] = deque(rebound_quotes, maxlen=8)
+        strategy._latest_math_leader_signals["AAA"] = LeaderSignal(
+            symbol="AAA",
+            leader_score=0.8,
+            leader_percentile=0.90,
+            entry_grade="A",
+            change_rate=-0.7,
+            trade_amount=4_268_050_000,
+            vs_open_pct=-0.7,
+            high_proximity=0.65,
+            volume_vs_avg=1.4,
+            reclaim_speed_ticks=2,
+            recent_acceleration_pct=0.20,
+            effective_leader_score=0.8,
+        )
+
+        order = strategy._default_long_exit(rebound_quotes[-1])
+
         self.assertIsNotNone(order)
-        self.assertEqual(order.side, OrderSide.SELL)
+        self.assertEqual(order.requested_reason, "protective_stop_net")
 
-    def test_entry_window_blocked_when_dynamic_mode_disabled(self):
+
+
+
+    def test_update_market_state_populates_adaptive_market_snapshot(self):
         cfg = MomentumScalpConfig(
-            block_new_entry_windows=["11:00-12:00"],
-            enable_dynamic_entry_block_windows=False,
+            enable_expected_net_filter=False,
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 3
+        now = datetime(2026, 5, 13, 10, 5, 0)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 5, 13, 9, 0, 0)
+        quotes = []
+        for idx in range(10):
+            symbol = f"100{idx:03d}"
+            open_price = 10_000 + idx * 100
+            current_price = int(open_price * (1.02 + idx * 0.002))
+            quote = Quote(
+                symbol=symbol,
+                name=symbol,
+                current_price=current_price,
+                change=current_price - open_price,
+                change_rate=((current_price - open_price) / open_price) * 100,
+                open_price=open_price,
+                high_price=current_price + 40,
+                low_price=open_price - 40,
+                volume=120_000 + idx * 10_000,
+                trade_amount=current_price * (120_000 + idx * 10_000),
+                timestamp=now,
+            )
+            strategy._quotes_cache[symbol] = quote
+            strategy._recent_quotes[symbol] = deque([quote], maxlen=8)
+            quotes.append(quote)
 
-        blocked = strategy._is_new_entry_window_blocked(datetime(2026, 3, 9, 11, 30, 0))
-        self.assertTrue(blocked)
+        strategy._update_market_state(quotes)
 
-    def test_entry_window_dynamic_unblock_in_bear_market(self):
+        self.assertEqual(strategy._adaptive_market_state["quote_count"], 10.0)
+        self.assertGreater(strategy._adaptive_market_state["avg_change"], 2.0)
+        self.assertLess(strategy._adaptive_market_state["decliner_ratio"], 0.01)
+        self.assertGreater(strategy._adaptive_market_state["tape_heat"], strategy._adaptive_market_state["tape_caution"])
+
+    def test_update_market_state_uses_fresh_cached_quotes_beyond_current_batch(self):
         cfg = MomentumScalpConfig(
-            block_new_entry_windows=["11:00-12:00"],
-            enable_dynamic_entry_block_windows=True,
-            dynamic_entry_block_disable_bear_score=2,
+            enable_expected_net_filter=False,
+        )
+        strategy = MomentumScalpStrategy(market_data=None, config=cfg, pool_override=["100001", "100002"])
+        now = datetime(2026, 4, 3, 10, 5, 0)
+        strategy.set_simulated_now(now)
+        strategy._session_start_at = datetime(2026, 4, 3, 9, 0, 0)
+        quote_a = Quote(
+            symbol="100001",
+            name="100001",
+            current_price=10_100,
+            change=100,
+            change_rate=1.0,
+            open_price=10_000,
+            high_price=10_120,
+            low_price=9_980,
+            volume=120_000,
+            trade_amount=1_212_000_000,
+            timestamp=now,
+        )
+        quote_b = Quote(
+            symbol="100002",
+            name="100002",
+            current_price=10_400,
+            change=400,
+            change_rate=4.0,
+            open_price=10_000,
+            high_price=10_450,
+            low_price=9_980,
+            volume=150_000,
+            trade_amount=1_560_000_000,
+            timestamp=now,
+        )
+        strategy._quotes_cache["100001"] = quote_a
+        strategy._quotes_cache["100002"] = quote_b
+        strategy._recent_quotes["100001"] = deque([quote_a], maxlen=8)
+        strategy._recent_quotes["100002"] = deque([quote_b], maxlen=8)
+
+        strategy._update_market_state([quote_a])
+
+        self.assertIn("100001", strategy._latest_math_leader_signals)
+        self.assertIn("100002", strategy._latest_math_leader_signals)
+
+    def test_update_runtime_pool_changes_watchlist_front(self):
+        cfg = MomentumScalpConfig(
+            dynamic_pool_size=4,
+            inverse_etfs=["252670"],
         )
         strategy = MomentumScalpStrategy(market_data=None, config=cfg)
-        strategy._bear_score = 3
 
-        blocked = strategy._is_new_entry_window_blocked(datetime(2026, 3, 9, 11, 30, 0))
-        self.assertFalse(blocked)
+        strategy.update_runtime_pool(["009150", "000660", "005930", "035420"])
+        watchlist = strategy.get_watchlist()
+
+        self.assertEqual(watchlist[:4], ["009150", "000660", "005930", "035420"])
+        self.assertIn("252670", watchlist)
+
 
 
 if __name__ == "__main__":

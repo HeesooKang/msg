@@ -35,13 +35,26 @@ def create_components(config: Config):
     return client, market_data, trading, account
 
 
+def _resolve_runtime_config(strategy: BaseStrategy, config: Config = None) -> Config:
+    if config is not None:
+        return config
+    strategy_config = getattr(strategy, "_runtime_config", None)
+    if strategy_config is not None:
+        return strategy_config
+    market_data = getattr(strategy, "market_data", None)
+    client = getattr(market_data, "client", None)
+    shared_config = getattr(client, "config", None)
+    if shared_config is not None:
+        return shared_config
+    return Config.load()
+
+
 def run(strategy: BaseStrategy, config: Config = None):
     """트레이딩 봇의 메인 루프를 실행한다."""
     global _shutdown
     _shutdown = False
 
-    if config is None:
-        config = Config.load()
+    config = _resolve_runtime_config(strategy, config)
 
     setup_logger(config.log_level)
     signal.signal(signal.SIGINT, _signal_handler)
@@ -51,11 +64,21 @@ def run(strategy: BaseStrategy, config: Config = None):
     logger.info("KIS 자동매매 봇 시작 [%s 모드]", config.trading_mode.upper())
     logger.info("=" * 50)
 
-    client, market_data, trading, account = create_components(config)
+    market_data = getattr(strategy, "market_data", None)
+    client = getattr(market_data, "client", None)
+    if client is None or market_data is None:
+        client, market_data, trading, account = create_components(config)
+        if hasattr(strategy, "market_data"):
+            strategy.market_data = market_data
+    else:
+        trading = TradingAPI(client)
+        account = AccountAPI(client)
     risk = RiskManager()
     executor = OrderExecutor(trading, risk)
 
     # 전략 초기화
+    if hasattr(strategy, "set_simulated_now"):
+        strategy.set_simulated_now(None)
     strategy.initialize()
     watchlist = strategy.get_watchlist()
     logger.info("감시 종목: %s", watchlist)
@@ -113,8 +136,7 @@ def run_scheduled(strategy: BaseStrategy, config: Config = None, tick_interval: 
     """스케줄러를 통해 장 시간에 맞춰 자동 실행한다."""
     from src.scheduler import TradingScheduler
 
-    if config is None:
-        config = Config.load()
+    config = _resolve_runtime_config(strategy, config)
 
     scheduler = TradingScheduler(strategy, config)
 

@@ -25,6 +25,8 @@ class LeaderSignal:
     high_proximity: float
     volume_vs_avg: float
     reclaim_speed_ticks: int
+    recent_acceleration_pct: float = 0.0
+    effective_leader_score: float = 0.0
 
 
 @dataclass
@@ -57,6 +59,21 @@ class ExpectedValueEstimate:
     closed_trades: int
 
 
+@dataclass
+class MarketShockSignal:
+    shock_score: float
+    shock_percentile: float
+    shock_confidence: float
+    crash_open_window_active: bool
+    index_gap_open_pct: float
+    index_gap_ma5_pct: float
+    index_gap_ma20_pct: float
+    avg_change: float
+    decliner_ratio: float
+    falling_speed_pct: float
+    inverse_leader_count: int
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -73,6 +90,11 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 def _clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def _sigmoid(value: float) -> float:
+    clipped = _clip(value, -12.0, 12.0)
+    return 1.0 / (1.0 + exp(-clipped))
 
 
 def _robust_z_scores(values: Sequence[float]) -> List[float]:
@@ -115,11 +137,32 @@ def _recent_reclaim_speed_ticks(recent_quotes: Sequence[Quote]) -> int:
     return reclaim_ticks
 
 
+def _recent_acceleration_pct(recent_quotes: Sequence[Quote]) -> float:
+    prices = [int(item.current_price) for item in recent_quotes if int(item.current_price) > 0]
+    if len(prices) < 3:
+        return 0.0
+
+    def _window_return(window: int) -> float:
+        if len(prices) <= window:
+            start = prices[0]
+        else:
+            start = prices[-window - 1]
+        end = prices[-1]
+        if start <= 0:
+            return 0.0
+        return ((end - start) / start) * 100
+
+    short_move = _window_return(5)
+    long_move = _window_return(10)
+    return round(0.65 * short_move + 0.35 * long_move, 6)
+
+
 def build_leader_signals(
     quotes: Sequence[Quote],
     *,
     avg_volumes: Optional[Dict[str, int]] = None,
     recent_quotes_by_symbol: Optional[Dict[str, Sequence[Quote]]] = None,
+    regime_score: int = 0,
 ) -> Dict[str, LeaderSignal]:
     regular_quotes = [quote for quote in quotes if int(getattr(quote, "current_price", 0) or 0) > 0]
     if not regular_quotes:
@@ -143,6 +186,7 @@ def build_leader_signals(
         avg_volume = int(avg_volumes.get(quote.symbol, 0) or 0)
         volume_vs_avg = (int(quote.volume or 0) / avg_volume) if avg_volume > 0 else 1.0
         reclaim_speed_ticks = _recent_reclaim_speed_ticks(recent_quotes_by_symbol.get(quote.symbol, []))
+        recent_acceleration_pct = _recent_acceleration_pct(recent_quotes_by_symbol.get(quote.symbol, []))
         features.append(
             {
                 "symbol": quote.symbol,
@@ -155,6 +199,7 @@ def build_leader_signals(
                 "volume_vs_avg": volume_vs_avg,
                 "reclaim_speed_feature": float(-reclaim_speed_ticks),
                 "reclaim_speed_ticks": reclaim_speed_ticks,
+                "recent_acceleration_pct": recent_acceleration_pct,
             }
         )
 
@@ -164,10 +209,12 @@ def build_leader_signals(
     z_high = _robust_z_scores([item["high_proximity"] for item in features])
     z_volume = _robust_z_scores([item["volume_vs_avg"] for item in features])
     z_reclaim = _robust_z_scores([item["reclaim_speed_feature"] for item in features])
+    z_accel = _robust_z_scores([item["recent_acceleration_pct"] for item in features])
 
-    raw_scores: List[Tuple[str, float]] = []
+    base_raw_scores: List[Tuple[str, float]] = []
+    effective_raw_scores: List[Tuple[str, float]] = []
     for idx, item in enumerate(features):
-        score = (
+        base_score = (
             0.25 * z_change[idx]
             + 0.25 * z_trade[idx]
             + 0.15 * z_vs_open[idx]
@@ -175,15 +222,29 @@ def build_leader_signals(
             + 0.15 * z_volume[idx]
             + 0.10 * z_reclaim[idx]
         )
-        raw_scores.append((item["symbol"], score))
+        if int(regime_score) >= 2:
+            effective_score = (
+                0.28 * z_change[idx]
+                + 0.10 * z_trade[idx]
+                + 0.20 * z_vs_open[idx]
+                + 0.10 * z_high[idx]
+                + 0.12 * z_volume[idx]
+                + 0.08 * z_reclaim[idx]
+                + 0.12 * z_accel[idx]
+            )
+        else:
+            effective_score = base_score
+        base_raw_scores.append((item["symbol"], base_score))
+        effective_raw_scores.append((item["symbol"], effective_score))
 
-    ranked_scores = sorted(raw_scores, key=lambda item: (item[1], item[0]), reverse=True)
+    ranked_scores = sorted(effective_raw_scores, key=lambda item: (item[1], item[0]), reverse=True)
     total = len(ranked_scores)
     percentiles = {
         symbol: (1.0 if total <= 1 else (total - rank) / (total - 1))
         for rank, (symbol, _) in enumerate(ranked_scores, start=1)
     }
-    score_map = {symbol: score for symbol, score in raw_scores}
+    base_score_map = {symbol: score for symbol, score in base_raw_scores}
+    effective_score_map = {symbol: score for symbol, score in effective_raw_scores}
 
     signals: Dict[str, LeaderSignal] = {}
     for item in features:
@@ -197,7 +258,7 @@ def build_leader_signals(
             entry_grade = "C"
         signals[symbol] = LeaderSignal(
             symbol=symbol,
-            leader_score=round(score_map.get(symbol, 0.0), 6),
+            leader_score=round(base_score_map.get(symbol, 0.0), 6),
             leader_percentile=round(percentile, 6),
             entry_grade=entry_grade,
             change_rate=round(item["change_rate"], 6),
@@ -206,8 +267,68 @@ def build_leader_signals(
             high_proximity=round(item["high_proximity"], 6),
             volume_vs_avg=round(item["volume_vs_avg"], 6),
             reclaim_speed_ticks=int(item["reclaim_speed_ticks"]),
+            recent_acceleration_pct=round(item["recent_acceleration_pct"], 6),
+            effective_leader_score=round(effective_score_map.get(symbol, 0.0), 6),
         )
     return signals
+
+
+def compute_market_shock_signal(
+    *,
+    minutes_since_open: int,
+    crash_window_minutes: int,
+    index_gap_open_pct: float,
+    index_gap_ma5_pct: float,
+    index_gap_ma20_pct: float,
+    avg_change: float,
+    decliner_ratio: float,
+    falling_speed_pct: float,
+    inverse_leader_count: int,
+) -> MarketShockSignal:
+    down_open_norm = _clip((-index_gap_open_pct) / 2.5, 0.0, 2.5)
+    down_ma5_norm = _clip((-index_gap_ma5_pct) / 2.0, 0.0, 2.5)
+    down_ma20_norm = _clip((-index_gap_ma20_pct) / 3.0, 0.0, 2.5)
+    avg_down_norm = _clip((-avg_change) / 2.0, 0.0, 2.5)
+    decliner_norm = _clip((decliner_ratio - 0.5) / 0.2, 0.0, 2.5)
+    falling_speed_norm = _clip(falling_speed_pct / 1.5, 0.0, 2.5)
+    inverse_leader_norm = _clip(inverse_leader_count / 2.0, 0.0, 2.5)
+
+    shock_score = (
+        0.20 * down_open_norm
+        + 0.16 * down_ma5_norm
+        + 0.10 * down_ma20_norm
+        + 0.18 * avg_down_norm
+        + 0.18 * decliner_norm
+        + 0.12 * falling_speed_norm
+        + 0.06 * inverse_leader_norm
+    )
+    shock_percentile = _clip(shock_score / 2.2, 0.0, 1.0)
+    confidence_logit = (
+        0.8 * down_open_norm
+        + 0.7 * avg_down_norm
+        + 0.9 * decliner_norm
+        + 0.7 * falling_speed_norm
+        + 0.3 * inverse_leader_norm
+        - 1.4
+    )
+    shock_confidence = _sigmoid(confidence_logit)
+    crash_open_window_active = (
+        0 <= int(minutes_since_open) <= max(1, int(crash_window_minutes))
+        and shock_confidence >= 0.35
+    )
+    return MarketShockSignal(
+        shock_score=round(shock_score, 6),
+        shock_percentile=round(shock_percentile, 6),
+        shock_confidence=round(shock_confidence, 6),
+        crash_open_window_active=bool(crash_open_window_active),
+        index_gap_open_pct=round(index_gap_open_pct, 6),
+        index_gap_ma5_pct=round(index_gap_ma5_pct, 6),
+        index_gap_ma20_pct=round(index_gap_ma20_pct, 6),
+        avg_change=round(avg_change, 6),
+        decliner_ratio=round(decliner_ratio, 6),
+        falling_speed_pct=round(falling_speed_pct, 6),
+        inverse_leader_count=max(0, int(inverse_leader_count)),
+    )
 
 
 def compute_regime_probabilities(

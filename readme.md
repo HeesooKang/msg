@@ -163,6 +163,16 @@ KAKAO_MESSAGE_MOBILE_WEB_URL=...
 
 카카오 알림은 `나에게 보내기` API를 사용합니다.
 
+브라우저 인증부터 `.env`의 `KAKAO_REFRESH_TOKEN` 갱신까지 한 번에 처리:
+
+```bash
+./dev py scripts/kakao_oauth_helper.py setup --env-file .env
+```
+
+만약 브라우저가 자동으로 열리지 않으면 터미널에 출력된 URL을 직접 열면 됩니다. 인증이 끝나면 로컬 콜백(`KAKAO_REDIRECT_URI`)으로 인가 코드를 받아 토큰을 교환하고 `.env`를 갱신합니다.
+
+수동으로 처리해야 할 때만 아래 명령을 사용합니다.
+
 1회 토큰 발급용 URL 생성:
 
 ```bash

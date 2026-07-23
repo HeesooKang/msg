@@ -1,25 +1,14 @@
-"""모멘텀 스캘핑 전략.
+from __future__ import annotations
 
-매수: 모멘텀 점수(시가대비 상승, 등락률, 고가근접도, 거래량폭발) 기반
-      + 시장 레짐 필터(KOSPI MA20)
-매도: 익절(+2.5%) / 개별 손절(금액 기준 -2,000원) / 추적손절(고점 -0.7%) /
-     고점 이익 0.8% 이상에서만 추적손절 / 장마감 청산
-관리: 일일 목표 도달(순실현손익 ≥ +12,000원) → 전량 청산 후 거래 중지
-      일일 최대손실(순실현손익 ≤ -3,500원) → 전량 청산 후 거래 중지
-      미실현 추정 손실 컷은 기본 비활성화. 필요 시 설정으로 별도 활성화
-인버스: 약세 점수 ≥ 2일 때 인버스 ETF 매수 (공매도 효과)
-"""
-
-import logging
 import json
-from pathlib import Path
+import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, timedelta
-from statistics import median
+from math import ceil
+from pathlib import Path
+from statistics import mean
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-import pandas as pd
 
 from src.analytics.math_signals import (
     ExpectedValueEstimate,
@@ -27,2355 +16,817 @@ from src.analytics.math_signals import (
     RegimeProbabilities,
     build_entry_ev_table,
     build_leader_signals,
+    compute_market_shock_signal,
     compute_regime_probabilities,
-    estimate_entry_ev,
     load_recent_scorecards,
 )
-from src.analytics.quote_tape import QuoteTapeRecorder
-from src.market_data import MarketDataAPI
+from src.analytics.forecast_outcomes import ForecastOutcomeLedger
+from src.analytics.price_prediction import ShortHorizonPrediction, predict_short_horizon_return
 from src.models import Order, OrderResult, OrderSide, OrderType, Position, Quote
-from src.notifications import AlertManager
 from src.strategy import BaseStrategy
+from src.strategies.momentum_scalp_types import (
+    DEFAULT_INVERSE_ETFS,
+    DEFAULT_STATIC_WATCHLIST,
+    DailyPnL,
+    INTRADAY_STRATEGY,
+    INTRADAY_BASE_QUEUE_SOURCES,
+    LIVE_LONG_QUEUE_SOURCES,
+    MomentumScalpConfig,
+    OPENING_STRATEGY,
+    OPENING_LONG_QUEUE_SOURCES,
+    PositionState,
+)
+from src.strategies.momentum_scalp_exit_plans import long_exit_hold_profile
+from src.strategies.momentum_scalp_exit import (
+    LongExitSnapshot,
+    decide_long_exit,
+)
+from src.strategies.momentum_scalp_fills import handle_order_filled
+from src.strategies.momentum_scalp_micro import symbol_micro_edge_metrics
+from src.strategies.momentum_scalp_pnl import (
+    calculate_trade_pnl_from_prices,
+    estimate_trade_net_pnl_from_prices,
+    estimate_trade_net_pnl_unrounded,
+)
+from src.strategies.momentum_scalp_state import (
+    DAILY_PNL_SNAPSHOT_FIELDS,
+    empty_daily_pnl_snapshot,
+    rebuild_daily_pnl_snapshot_from_ledgers,
+)
 from src.strategies.regime_router import RegimeStrategyRouter
 
-logger = logging.getLogger("kis_trader.strategy.momentum")
 
-# 시가총액 상위 30종목 + 한국시장 추종 ETF (하드코딩)
-DEFAULT_STATIC_WATCHLIST = [
-    "005930",  # 삼성전자
-    "000660",  # SK하이닉스
-    "373220",  # LG에너지솔루션
-    "207940",  # 삼성바이오로직스
-    "005490",  # POSCO홀딩스
-    "006400",  # 삼성SDI
-    "051910",  # LG화학
-    "035420",  # NAVER
-    "000270",  # 기아
-    "005380",  # 현대차
-    "035720",  # 카카오
-    "105560",  # KB금융
-    "055550",  # 신한지주
-    "012330",  # 현대모비스
-    "066570",  # LG전자
-    "003670",  # 포스코퓨처엠
-    "028260",  # 삼성물산
-    "032830",  # 삼성생명
-    "003550",  # LG
-    "086790",  # 하나금융지주
-    "034730",  # SK
-    "015760",  # 한국전력
-    "017670",  # SK텔레콤
-    "009150",  # 삼성전기
-    "010130",  # 고려아연
-    "033780",  # KT&G
-    "018260",  # 삼성에스디에스
-    "011200",  # HMM
-    "138930",  # BNK금융지주
-    "024110",  # 기업은행
-    "152100",  # PLUS 200 (KOSPI 200 추종)
-    "292190",  # KODEX KRX300 (코스피·코스닥 전반 추종)
-]
+logger = logging.getLogger("kis_trader.strategy.momentum_scalp")
+order_logger = logging.getLogger("kis_trader.orders")
 
-# 인버스 ETF 유니버스
-DEFAULT_INVERSE_ETFS = [
-    "114800",  # KODEX 인버스 (KOSPI 200 역방향)
-    "123310",  # TIGER 인버스 (KOSPI 200 역방향)
-    "251340",  # KODEX 코스닥150 인버스
-    "464930",  # TIGER 2차전지TOP10 인버스
-]
+LEGACY_LONG_STRATEGY = "bull_breakout_strategy"
+
+
+@dataclass(frozen=True)
+class ExpectedValueTradePlan:
+    allowed: bool
+    reject_reason: str = ""
+    quantity: int = 0
+    budget: int = 0
+    expected_net: float = 0.0
+    predicted_net: int = 0
+    lower_net: int = 0
+    upper_net: int = 0
+    win_probability: float = 0.0
+    break_even_probability: float = 1.0
+    planned_target_net: int = 0
+    planned_stop_net_loss_abs: int = 0
+    planned_risk_net_loss_abs: int = 0
+    planned_take_profit_pct: float = 0.0
+    planned_stop_loss_pct: float = 0.0
+    prediction: Optional[ShortHorizonPrediction] = None
+    reject_detail: str = ""
 
 
 @dataclass
-class MomentumScalpConfig:
-    """모멘텀 스캘핑 전략 설정."""
-
-    seed_money: int = 1_000_000
-    max_position_count: int = 0  # 0이면 seed_money/per_stock_amount 기준으로 자동 계산
-    bull_max_position_count: Optional[int] = None
-    neutral_max_position_count: Optional[int] = None
-    soft_bear_max_position_count: Optional[int] = None
-    bear_max_position_count: Optional[int] = None
-    per_stock_amount: int = 180_000      # 종목당 기본 할당액
-    max_per_stock_amount: int = 500_000  # 종목당 최대 노출 (피라미딩 상한)
-    capital_utilization_pct: float = 1.0  # 총 노출 한도 비율 (기준자본 대비)
-    bull_capital_utilization_pct: Optional[float] = None
-    neutral_capital_utilization_pct: Optional[float] = None
-    soft_bear_capital_utilization_pct: Optional[float] = None
-    bear_capital_utilization_pct: Optional[float] = None
-    max_single_position_pct: float = 1.0  # 단일 종목 최대 노출 비율 (기준자본 대비)
-    bull_max_single_position_pct: Optional[float] = None
-    neutral_max_single_position_pct: Optional[float] = None
-    soft_bear_max_single_position_pct: Optional[float] = None
-    bear_max_single_position_pct: Optional[float] = None
-    enable_pyramiding: bool = True
-    scale_in_min_profit_pct: float = 0.3
-    scale_in_score_bonus: float = 0.8
-
-    # 일일 서킷 브레이커 (순실현손익 기준)
-    daily_profit_target: int = 10_000    # 일일 목표 +1만원
-    daily_loss_limit: int = -3_500       # 일일 최대손실 -3.5천원
-    enable_unrealized_loss_guard: bool = False  # 미실현 포함 보조 손실컷(기본 비활성화)
-    daily_total_loss_limit: Optional[int] = None  # None이면 daily_loss_limit 사용
-
-    # 개별 포지션 손절 (금액 기준)
-    per_position_stop_loss: int = -1_800  # 포지션당 -1,800원 즉시 청산
-
-    # 익절 / 추적손절 (비율 기준)
-    take_profit_pct: float = 2.5         # 익절 +2.5%
-    trailing_stop_pct: float = -1.1      # 고점 대비 추적손절
-    trailing_stop_activation_gain_pct: float = 1.0  # 추적손절은 이익이 최소 1.0% 발생 후 동작
-    max_position_holding_minutes: int = 50  # 시간 기반 보수적 청산 제한
-
-    # 재시작 복구: 보유 종목이 한도에 걸린 상태에서의 초기 재진입 억제를 위한 설정
-    startup_full_position_recheck_ticks: int = 2
-    startup_market_data_ready_ticks: int = 2
-    startup_market_data_min_valid_quote_count: int = 8
-    startup_market_data_wait_log_interval_seconds: int = 60
-
-    # 시장 레짐 필터 (KOSPI + 실시간 후보군 조합)
-    bear_market_mode: str = 'A'          # 'A'=약세 필터 보완 적용, 'B'=완전 차단
-    min_bear_score_for_new_long: int = 2  # A 모드에서 이 점수 이상이면 신규 롱 차단
-    bear_market_entry_score: float = 3.8   # 약세장 예외로 허용할 최소 모멘텀 점수
-
-    # 디버그/실험 모드: 당일 하드스탑 상태를 재시작 시 무시할지 여부
-    # 실거래에서는 기본적으로 False(보수적)로 운영 권장
-    allow_hard_stop_bypass_for_day: bool = False
-
-    # 거래 비용
-    commission_rate: float = 0.00015     # 0.015% 수수료
-    tax_slippage_rate: float = 0.002     # 0.20% 세금+슬리피지 (매도 시)
-    entry_market_slippage_rate: float = 0.001   # 매수 시 시장가 비딩 손실(과도한 급등 구간 완화용)
-    exit_market_slippage_rate: float = 0.001    # 매도 시 시장가 비딩 손실(슬리피지 가정치)
-
-    # 레짐 적응형 가중치/필터 적용
-    enable_regime_adaptive: bool = True
-
-    # 종목 풀
-    static_watchlist: List[str] = field(default_factory=lambda: DEFAULT_STATIC_WATCHLIST)
-    dynamic_pool_size: int = 15
-    dynamic_pool_ranking_fetch_count: int = 30
-    dynamic_pool_turnover_slots: int = 6
-    dynamic_pool_quote_trade_amount_slots: int = 4
-    dynamic_pool_direct_rank_slots: int = 4
-    dynamic_pool_direct_turnover_slots: int = 3
-    dynamic_pool_direct_quote_leader_slots: int = 2
-    dynamic_pool_quote_min_change_rate: float = 0.8
-    opening_market_relief_minutes: int = 45
-    opening_dynamic_pool_min_change_rate: float = 0.2
-    opening_dynamic_pool_min_volume: int = 30_000
-    opening_dynamic_pool_direct_rank_slots: int = 5
-    opening_dynamic_pool_direct_turnover_slots: int = 5
-    opening_dynamic_pool_direct_quote_leader_slots: int = 4
-    dynamic_pool_log_symbol_count: int = 6
-    pool_refresh_interval: int = 300     # 초
-
-    # 필터
-    min_change_rate: float = 1.0
-    max_change_rate: float = 10.0
-    min_volume: int = 180_000
-    min_price: int = 2_000
-
-    enable_volume_spike_filter: bool = True
-    volume_spike_min_history: int = 2
-    volume_spike_ratio: float = 1.8
-    volume_spike_abs_min: int = 4_000
-    volume_spike_ratio_min: float = 1.2
-    bullish_min_change_rate: float = 0.5
-    bullish_min_momentum_score: float = 2.6
-    bullish_min_momentum_score_floor: float = 3.4
-    bullish_volume_spike_ratio_adjustment: float = 0.30
-    bullish_volume_spike_abs_min_ratio: float = 0.6
-    bull_bias_avg_change_rate_threshold: float = 0.8
-    bull_bias_max_decliner_ratio: float = 0.45
-    index_support_bull_bias_index_gap_pct: float = 1.0
-    index_support_bull_bias_avg_change_rate_threshold: float = 1.0
-    index_support_bull_bias_max_decliner_ratio: float = 0.55
-    index_support_bull_bias_min_quote_count: int = 8
-    strong_bull_override_index_gap_pct: float = 1.5
-    strong_bull_override_avg_change_rate_threshold: float = 2.0
-    strong_bull_override_max_decliner_ratio: float = 0.25
-    strong_bull_override_min_quote_count: int = 8
-    strong_leader_min_change_rate: float = 2.5
-    strong_leader_min_trade_amount: int = 1_000_000_000
-    strong_leader_top_rank: int = 6
-    leader_support_bull_bias_min_count: int = 1
-    leader_support_bull_bias_min_change_rate: float = 4.0
-    leader_support_bull_bias_min_trade_amount: int = 2_000_000_000
-    leader_support_bull_bias_max_decliner_ratio: float = 0.7
-    opening_leader_bull_bias_min_count: int = 2
-    opening_leader_bull_bias_change_rate: float = 2.5
-    opening_leader_bull_bias_min_trade_amount: int = 1_000_000_000
-    bull_leader_top_n: int = 5
-    bull_leader_relative_strength_pp: float = 0.4
-    bull_partial_exit_ratio: float = 0.5
-    bull_priority_turnover_rank_max: int = 2
-    bull_priority_per_stock_amount_multiplier: float = 3.0
-    bull_priority_max_per_stock_amount_multiplier: float = 3.0
-    bull_priority_max_single_position_pct: float = 0.65
-    bull_priority_effective_slots: int = 1
-    bull_priority_initial_entry_scale: float = 0.85
-    bull_breakout_late_entry_start_minutes_after_open: int = 255
-    bull_breakout_late_entry_score_bonus: float = 0.35
-    bull_breakout_late_entry_change_rate_bonus: float = 0.2
-    bull_breakout_initial_entry_scale: float = 0.65
-    bull_post_loss_score_bonus: float = 0.30
-    bull_post_loss_change_rate_bonus: float = 0.20
-    bull_post_loss_breakout_buffer_bonus_pct: float = 0.05
-    allow_expensive_single_share_override: bool = True
-    expensive_single_share_min_price: int = 50_000
-    expensive_single_share_cap_multiplier: float = 1.5
-
-    min_momentum_score: float = 3.5
-    enable_expected_net_filter: bool = True
-    expected_move_pct: float = 2.4
-    min_expected_net_profit: int = 1_200
-    min_expected_rr_ratio: float = 0.85
-    enable_cost_aware_profit_exit: bool = True
-    min_profit_exit_net_pnl: int = 1
-    enable_setup_logging: bool = True
-    enable_shadow_blocked_candidate_tracking: bool = True
-    shadow_blocked_candidate_window_minutes: int = 20
-    setup_recent_quote_window: int = 8
-    bull_breakout_hold_ticks: int = 2
-    bull_breakout_buffer_pct: float = 0.03
-    neutral_pullback_min_drop_pct: float = 0.25
-    neutral_pullback_max_drop_pct: float = 1.2
-    neutral_pullback_min_ticks: int = 2
-    neutral_min_runup_from_open_pct: float = 0.8
-    neutral_reclaim_buffer_pct: float = 0.05
-    neutral_chase_block_proximity_pct: float = 0.10
-    neutral_entry_start_minutes_after_open: int = 35
-    neutral_entry_confirmation_ticks: int = 3
-    neutral_max_losses_per_day: int = 1
-    neutral_post_loss_cooldown_minutes: int = 30
-    neutral_post_loss_reentry_limit: int = 1
-    neutral_post_loss_min_drop_bonus_pct: float = 0.30
-    neutral_post_loss_min_runup_bonus_pct: float = 0.50
-    neutral_post_loss_reclaim_buffer_bonus_pct: float = 0.05
-    neutral_post_loss_score_bonus: float = 0.35
-    neutral_post_loss_change_rate_bonus: float = 0.15
-    neutral_post_loss_extra_pullback_ticks: int = 1
-    enable_neutral_leader_filter: bool = True
-    neutral_leader_top_n: int = 8
-    neutral_leader_relative_strength_pp: float = 0.5
-    neutral_leader_max_reclaim_ticks: int = 6
-    neutral_first_entry_score_bonus: float = 0.35
-    neutral_first_entry_change_rate_bonus: float = 0.15
-    neutral_first_entry_min_drop_bonus_pct: float = 0.15
-    neutral_first_entry_min_runup_bonus_pct: float = 0.30
-    neutral_first_entry_reclaim_buffer_bonus_pct: float = 0.02
-    neutral_first_entry_max_turnover_rank: int = 4
-    neutral_first_entry_max_reclaim_ticks: int = 3
-    neutral_strategy_cooldown_minutes: int = 10
-    soft_bear_inverse_pullback_min_drop_pct: float = 0.12
-    soft_bear_inverse_pullback_max_drop_pct: float = 0.8
-    soft_bear_inverse_min_runup_from_open_pct: float = 0.4
-    soft_bear_inverse_reclaim_buffer_pct: float = 0.03
-    soft_bear_inverse_min_change_rate: float = 0.9
-    soft_bear_inverse_min_momentum: float = 2.2
-    soft_bear_inverse_min_runup_pct: float = 0.6
-    soft_bear_inverse_min_drop_pct: float = 0.15
-    soft_bear_inverse_max_drop_pct: float = 0.8
-    soft_bear_strategy_cooldown_minutes: int = 8
-    enable_soft_bear_strong_leader_longs: bool = True
-    soft_bear_strong_leader_max_positions: int = 1
-    soft_bear_strong_leader_min_change_rate: float = 3.2
-    soft_bear_strong_leader_min_momentum: float = 2.5
-    soft_bear_strong_leader_min_trade_amount: int = 1_500_000_000
-    stage1_neutral_score_bonus: float = 0.55
-    stage1_neutral_change_rate_bonus: float = 0.20
-    stage1_neutral_min_drop_bonus_pct: float = 0.10
-    stage1_neutral_min_runup_bonus_pct: float = 0.20
-    stage1_neutral_reclaim_buffer_bonus_pct: float = 0.02
-    stage1_neutral_max_turnover_rank: int = 4
-    stage1_neutral_max_reclaim_ticks: int = 3
-    strategy_gate_window_days: int = 5
-    strategy_gate_min_closed_trades: int = 4
-    strategy_gate_path: str = "reports/strategy-gates.json"
-    enable_math_shadow_layer: bool = True
-    quote_tape_enabled: bool = True
-    quote_tape_root: str = "data/intraday_tape"
-    quote_tape_flush_seconds: int = 0
-    ev_window_days: int = 5
-    ev_min_samples: int = 4
-    enable_math_live_layer: bool = True
-    math_live_pool_top_n: int = 3
-    math_live_pool_percentile_floor: float = 0.75
-    math_live_bull_leader_percentile: float = 0.80
-    math_live_neutral_leader_percentile: float = 0.72
-    math_live_bull_prob_threshold: float = 0.55
-    math_live_soft_bear_bull_prob_threshold: float = 0.42
-    math_live_regime_margin: float = 0.08
-    math_live_negative_ev_gate: bool = True
-    math_live_ev_min_trades: int = 4
-    math_live_negative_ev_threshold: float = 0.0
-    math_queue_top_n: int = 12
-    math_queue_percentile_floor: float = 0.80
-    math_queue_backfill_slots: int = 6
-    math_gate_regime_margin: float = 0.08
-    math_gate_min_leader_percentile: float = 0.80
-    math_gate_positive_ev_required: bool = True
-    math_size_min_multiplier: float = 0.70
-    math_size_max_multiplier: float = 1.50
-    math_size_bull_a_max_multiplier: float = 1.65
-    math_ev_scale_krw: float = 2500.0
-    enable_backtest_score_entry_fallback: bool = False
-    stage1_loss_threshold: int = -3_000
-    profit_protect_threshold: int = 8_000
-    loss_stage_exposure_scale: float = 0.5
-    profit_protect_exposure_scale: float = 0.6
-    long_stop_loss_notional_pct: float = 0.007
-    long_stop_loss_cap_amount: int = 2_500
-    inverse_stop_loss_notional_pct: float = 0.006
-    inverse_stop_loss_cap_amount: int = 1_800
-    stage1_inverse_score_bonus: float = 0.6
-    stage1_inverse_change_bonus: float = 0.2
-    # 진입 보강
-    enable_entry_confirmation: bool = True          # 1차 후보 후 재확인 대기
-    entry_confirmation_ticks: int = 2               # 신규 진입 최소 확인 틱 수
-    scale_in_confirmation_ticks: int = 1            # 스케일인 최소 확인 틱 수
-    bullish_fast_entry_score_bonus: float = 0.9
-    bullish_fast_entry_change_rate_bonus: float = 0.6
-    entry_confirmation_window_seconds: int = 240     # 확인 후보 유효 시간(초)
-    entry_confirmation_min_score_tolerance: float = 0.4
-    entry_confirmation_max_pullback_pct: float = -0.6
-    # 눌림목(리테스트) 진입: 급등 종목은 고점 추격 대신 조정 구간에서만 신규 진입
-    enable_pullback_entry_filter: bool = True
-    pullback_activation_change_rate: float = 1.8
-    pullback_required_min_drop_pct: float = 0.2
-    pullback_allowed_max_drop_pct: float = 1.4
-    pullback_min_vs_open_pct: float = 0.25
-    overheated_jump_change_pct: float = 3.5
-    overheated_retrace_ratio: float = 0.9
-    enable_pool_persistence_gate: bool = True
-    momentum_pool_persistence_window: int = 3
-    momentum_pool_min_appearances: int = 2
-
-    # 재매수 쿨다운
-    cooldown_seconds: int = 900          # 15분
-    loss_trade_cooldown_seconds: int = 420  # 손실 체결 후 전역 진입 일시 중지 시간
-
-    # === 인버스 ETF 설정 ===
-    inverse_enabled: bool = False
-    inverse_etfs: List[str] = field(default_factory=lambda: DEFAULT_INVERSE_ETFS)
-    inverse_max_positions: int = 2           # 인버스 최대 보유 수
-    soft_bear_inverse_max_positions: Optional[int] = None
-    inverse_take_profit_pct: float = 1.0     # 인버스 익절 +1.0% (일반보다 빠르게)
-    inverse_stop_loss_pct: float = -0.5      # 인버스 손절 -0.5% (타이트)
-    inverse_trailing_stop_pct: float = -0.3  # 인버스 추적손절 (고점 -0.3%)
-    inverse_trailing_stop_activation_gain_pct: float = 0.45  # 추적손절은 이익이 최소 0.45% 발생 후 동작
-    inverse_max_hold_minutes: int = 120      # 최대 2시간 보유 (음의 복리 방지)
-    bearish_threshold: int = 2               # 이 점수 이상일 때 인버스 진입
-    inverse_min_momentum: float = 2.0        # 인버스 매수 최소 모멘텀 점수
-    inverse_min_change_rate: float = 1.4     # 인버스 매수 최소 등락률
-    inverse_min_bear_score: int = 3          # 인버스 매수 최소 약세 점수
-    inverse_volume_spike_ratio_offset: float = 0.45  # 인버스는 거래량 스파이크 비율 임계를 완화
-    inverse_volume_spike_abs_min_ratio: float = 0.7  # 인버스는 최소 1틱 거래량 임계를 완화
-
-    # 초반 구간 과도한 진입 억제
-    enable_early_session_guard: bool = True
-    early_session_guard_minutes: int = 12
-    early_session_min_change_rate_boost: float = 0.20
-    early_session_min_score_boost: float = 0.55
-    early_session_entry_confirmation_ticks: int = 2
-    bullish_trailing_stop_activation_gain_pct_floor: float = 1.1
-    restored_position_grace_seconds: int = 30
-    block_new_entry_windows: List[str] = field(default_factory=list)  # 예: ["11:00-12:00", "15:00-15:21"]
-    enable_dynamic_entry_block_windows: bool = True
-    dynamic_entry_block_disable_bear_score: int = 2  # 약세 점수가 이 값 이상이면 차단 시간대 자동 해제
-    # 재시작 시 복구된 누적 실현손익을 당일 브레이커 기준에 포함할지 여부.
-    # False면 재시작 이후 발생한 손익만으로 일일 목표/손실 브레이커를 판단한다.
-    use_restored_pnl_for_daily_breaker: bool = False
-    daily_state_path: str = "state/momentum_scalp_daily_state.json"
-
-
-@dataclass
-class PositionState:
-    """보유 포지션 상태."""
-    symbol: str
-    buy_price: int
-    quantity: int
-    invested_amount: int = 0
-    buy_time: datetime = field(default_factory=datetime.now)
-    high_since_buy: int = 0
-    is_restored: bool = False
-    restored_at: Optional[datetime] = None
-    entry_strategy_name: str = ""
-    entry_setup_name: str = ""
-    entry_reason: str = ""
-    regime_label: str = ""
-    bear_score: int = 0
-    planned_risk_stage: str = ""
-    entry_grade: str = ""
-    leader_score: float = 0.0
-    leader_percentile: float = 0.0
-    entry_grade_math: str = ""
-    entry_ev: float = 0.0
-    entry_ev_confidence: str = ""
-    bull_prob: float = 0.0
-    neutral_prob: float = 0.0
-    soft_bear_prob: float = 0.0
-    bear_prob: float = 0.0
-    partial_exit_done: bool = False
-
-    def __post_init__(self):
-        if self.invested_amount <= 0:
-            self.invested_amount = self.buy_price * self.quantity
-        if self.high_since_buy == 0:
-            self.high_since_buy = self.buy_price
-
-
-@dataclass
-class ShadowBlockedCandidate:
-    """실제 진입은 하지 않지만 결과를 추적할 차단 후보."""
-
-    symbol: str
-    blocked_at: datetime
-    reject_reason: str
-    regime_label: str
+class ExpectedValueCandidate:
+    quote: Quote
     strategy_name: str
-    entry_price: int
-    hypothetical_quantity: int
-    notional: int
-    target_pct: float
-    stop_loss_pct: float
-    max_price: int
-    min_price: int
-    last_price: int
-    first_hit_outcome: str = ""
-    first_hit_at: Optional[datetime] = None
-
-
-@dataclass
-class MomentumEntrySignal:
-    """진입 재확인 후보 상태."""
-
-    streak: int
-    first_price: int
-    best_score: float
-    started_at: datetime
-    last_seen_at: datetime
-
-
-@dataclass
-class DailyPnL:
-    """일일 손익 추적."""
-    realized_gross_pnl: int = 0
-    realized_net_pnl: int = 0
-    fees_paid: int = 0
-    taxes_paid: int = 0
-    trade_count: int = 0
-    win_count: int = 0
-    loss_count: int = 0
-    breakeven_count: int = 0
-    winning_net_pnl_sum: int = 0
-    losing_net_pnl_sum: int = 0
-    largest_win_net: int = 0
-    largest_loss_net: int = 0
-
-    @property
-    def realized_pnl(self) -> int:
-        """하위 호환용 alias: 순실현손익."""
-        return self.realized_net_pnl
-
-    @property
-    def total_pnl(self) -> int:
-        return self.realized_net_pnl
+    metadata: Dict[str, Any]
+    plan: ExpectedValueTradePlan
 
 
 class MomentumScalpStrategy(BaseStrategy):
-    """모멘텀 스캘핑 전략."""
+    """기댓값 기반 롱 진입 경로만 남긴 모멘텀 스캘프 전략.
+
+    실전 경로:
+    - opening_conviction_long_strategy
+    - intraday_conviction_long_strategy
+
+    인버스 ETF도 별도 라우트 없이 위 롱 경로에서 동일하게 예측/EV로 평가한다.
+    """
+
+    @staticmethod
+    def _is_supported_long_symbol(symbol: str) -> bool:
+        normalized = str(symbol or "").strip()
+        return len(normalized) == 6 and normalized.isdigit()
 
     def __init__(
         self,
-        market_data: MarketDataAPI,
-        config: MomentumScalpConfig = None,
-        pool_override: List[str] = None,
+        market_data,
+        config: MomentumScalpConfig,
+        pool_override: Optional[List[str]] = None,
     ):
         self.market_data = market_data
-        self.cfg = config or MomentumScalpConfig()
-        self._pool_override = pool_override
+        self.config = config
+        self.cfg = config
+        self.pool_override = list(pool_override or [])
 
         self.positions: Dict[str, PositionState] = {}
         self.daily_pnl = DailyPnL()
-        self._pool: List[str] = []
-        self._last_pool_refresh: Optional[datetime] = None
-        self._pool_build_epoch = 0
-        self._pool_appearance: Dict[str, deque] = {}
-        self._entry_signals: Dict[str, MomentumEntrySignal] = {}
-        self._last_cumulative_volumes: Dict[str, int] = {}
-        self._recent_tick_volumes: Dict[str, deque] = {}
-        self._latest_tick_volumes: Dict[str, int] = {}
+        self._breaker_excluded_realized_net_pnl = 0
         self._halted = False
-        self._avg_volumes: Dict[str, int] = {}
-        self._quotes_cache: Dict[str, Quote] = {}
-        self._recent_quotes: Dict[str, deque] = {}
-        self._sell_cooldown: Dict[str, datetime] = {}
-        self._symbol_cooldown_until: Dict[str, datetime] = {}
-        self._strategy_cooldown_until: Dict[str, datetime] = {}
-        self._bull_loss_count_today: int = 0
-        self._bull_last_loss_at: Optional[datetime] = None
-        self._startup_rebalance_ticks: int = 0
-        self._startup_rebalance_active: bool = False
-        self._market_data_ready_for_entries: bool = market_data is None
-        self._market_data_ready_streak: int = 0
-        self._market_data_readiness_reason: str = ""
-        self._last_market_data_wait_log_at: Optional[datetime] = None
-        self._bear_score: int = 0
-        self._bear_market = False
-        self._inverse_symbols: set = set(self.cfg.inverse_etfs)
-        self._halt_date: Optional[date] = None
-        self._current_day: Optional[date] = None
-        self._alerts = AlertManager()
-        self._last_regime_check_at: Optional[datetime] = None
-        self._last_index_regime_check_at: Optional[datetime] = None
-        self._cached_index_regime_score: int = 0
-        self._cached_index_regime_info: Optional[tuple[float, float, float]] = None
-        self._cached_index_regime_error: Optional[Exception] = None
-        self._opening_leader_bull_bias_active: bool = False
-        self._leader_support_bull_bias_active: bool = False
-        self._index_support_bull_bias_active: bool = False
-        self._strong_bull_override_active: bool = False
-        self._regime_profile_name: str = "neutral"
-        self._session_start_at: Optional[datetime] = None
-        self._state_path = Path(self.cfg.daily_state_path) if self.cfg.daily_state_path else None
-        # 백테스트/오프라인 실행에서는 로컬 상태파일 복구를 비활성화해 손익 오염을 방지한다.
-        if self.market_data is None:
-            self._state_path = None
-        self._hard_stop_bypass_for_day: bool = False
-        self._entry_block_windows = self._parse_entry_block_windows(self.cfg.block_new_entry_windows)
-        self._last_entry_block_log_key: Optional[str] = None
-        self._last_entry_block_bypass_log_key: Optional[str] = None
-        self._entry_filter_log_cache: Dict[str, str] = {}
-        self._state_loaded_for_today: bool = False
-        self._daily_breaker_pnl_offset: int = 0
-        self._loaded_position_meta: Dict[str, dict] = {}
+        self._halt_reason = ""
+        self._sell_fill_ledger: List[Dict[str, Any]] = []
+        self._closed_trade_ledger: Dict[str, Dict[str, Any]] = {}
+        self._ledger_seed_snapshot: Dict[str, int] = self._empty_daily_pnl_snapshot()
+
         self._simulated_now: Optional[datetime] = None
-        self._risk_stage_label: str = "normal"
-        self._pending_entry_meta: Dict[str, dict] = {}
-        self._neutral_loss_count_today: int = 0
-        self._neutral_last_loss_at: Optional[datetime] = None
-        self._neutral_post_loss_reentries_today: int = 0
-        self._shadow_blocked_candidates: Dict[str, ShadowBlockedCandidate] = {}
-        self._latest_direct_dynamic_symbols: set[str] = set()
-        self._latest_strong_leader_symbols: set[str] = set()
-        self._latest_strong_leader_snapshot: Dict[str, dict] = {}
+        self._session_start_at: Optional[datetime] = None
+        self._active_day: Optional[str] = None
+
+        self._pool: List[str] = list(self.pool_override or self.config.static_watchlist)
+        self._quotes_cache: Dict[str, Quote] = {}
+        self._recent_quotes: Dict[str, deque[Quote]] = {}
+        self._avg_volumes: Dict[str, int] = {}
+        self._pending_entry_meta: Dict[str, Dict[str, Any]] = {}
+        self._forecast_outcomes = ForecastOutcomeLedger(
+            Path(self.config.forecast_outcome_root)
+        )
+
+        self._inverse_symbols = set(self.config.inverse_etfs or [])
         self._latest_math_leader_signals: Dict[str, LeaderSignal] = {}
         self._latest_math_queue_symbols: List[str] = []
         self._latest_math_backfill_symbols: List[str] = []
-        self._latest_legacy_backfill_symbols: List[str] = []
         self._latest_math_queue_source: Dict[str, str] = {}
+        self._latest_opening_fast_symbols: set[str] = set()
+        self._latest_opening_hot_symbols: set[str] = set()
+
         self._latest_regime_probabilities = RegimeProbabilities(
             bull_prob=0.25,
             neutral_prob=0.25,
             soft_bear_prob=0.25,
             bear_prob=0.25,
         )
-        self._entry_ev_table: Dict[Tuple[str, str, str, str], ExpectedValueEstimate] = {}
-        self._quote_tape = QuoteTapeRecorder(
-            self.cfg.quote_tape_root,
-            enabled=bool(self.cfg.quote_tape_enabled and self.market_data is not None),
+        self._adaptive_market_state: Dict[str, float] = {
+            "quote_count": 0.0,
+            "avg_change": 0.0,
+            "decliner_ratio": 0.5,
+            "advancer_ratio": 0.5,
+            "bull_prob": 0.25,
+            "bear_prob": 0.25,
+            "leader_density": 0.0,
+            "elite_leader_density": 0.0,
+            "vs_open_p90": 0.0,
+            "accel_p70": 0.0,
+            "tape_heat": 0.0,
+            "tape_caution": 0.5,
+            "overheat": 0.0,
+        }
+        self._latest_market_shock_signal = compute_market_shock_signal(
+            minutes_since_open=0,
+            crash_window_minutes=self.config.market_shock_window_minutes_after_open,
+            index_gap_open_pct=0.0,
+            index_gap_ma5_pct=0.0,
+            index_gap_ma20_pct=0.0,
+            avg_change=0.0,
+            decliner_ratio=0.5,
+            falling_speed_pct=0.0,
+            inverse_leader_count=0,
         )
-        self._regime_router = RegimeStrategyRouter()
-        self._strategy_gate_state: Dict[str, dict] = {}
+        self._entry_ev_table: Dict[Tuple[str, str, str, str], ExpectedValueEstimate] = {}
+        self._entry_ev_history_records: List[Dict[str, Any]] = []
+        self._symbol_entry_cooldown_until: Dict[str, datetime] = {}
+        self._symbol_order_unavailable: Dict[str, Dict[str, Any]] = {}
+        self._restore_ignore_until: Dict[str, datetime] = {}
+        self._last_long_shortlist_symbols: List[str] = []
+        self._state_restored_today = False
+        self._last_daily_state_save_at: Optional[datetime] = None
 
+        self._bear_score = 0
+        self._bull_market_context = "broad_bull"
+        self._strong_bull_override_active = False
+        self._bull_loss_count_today = 0
+
+        self._regime_router = RegimeStrategyRouter()
+
+    # ------------------------------------------------------------------
+    # 기본 수명주기 / 운영 상태
+    # ------------------------------------------------------------------
     def set_simulated_now(self, now: Optional[datetime]):
-        """백테스트에서 사용할 시뮬레이션 시각을 주입한다."""
         self._simulated_now = now
 
     def _now(self) -> datetime:
         return self._simulated_now or datetime.now()
 
-    def _today(self) -> date:
-        return self._now().date()
-
-    def _record_recent_quote(self, quote: Quote):
-        window = max(4, int(self.cfg.setup_recent_quote_window))
-        history = self._recent_quotes.setdefault(quote.symbol, deque(maxlen=window))
-        history.append(quote)
-
-    def _get_recent_quotes(self, symbol: str) -> List[Quote]:
-        return list(self._recent_quotes.get(symbol, ()))
-
-    def _math_report_root(self) -> Path:
-        gate_path_raw = str(getattr(self.cfg, "strategy_gate_path", "") or "").strip()
-        if gate_path_raw:
-            return Path(gate_path_raw).parent
-        return Path("reports")
-
-    def _load_math_shadow_inputs(self) -> None:
-        if not self.cfg.enable_math_shadow_layer:
-            self._entry_ev_table = {}
-            return
-        try:
-            scorecards = load_recent_scorecards(
-                self._math_report_root(),
-                window_days=max(1, int(self.cfg.ev_window_days)),
-            )
-            self._entry_ev_table = build_entry_ev_table(
-                scorecards,
-                window_days=max(1, int(self.cfg.ev_window_days)),
-                min_samples=max(1, int(self.cfg.ev_min_samples)),
-            )
-        except Exception as exc:
-            logger.warning("math shadow 입력 로드 실패(무시): %s", exc)
-            self._entry_ev_table = {}
-
-    def _refresh_math_leader_signals(self, quotes: Optional[List[Quote]] = None) -> None:
-        if not self.cfg.enable_math_shadow_layer:
-            self._latest_math_leader_signals = {}
-            return
-        source_quotes = [
-            q for q in (quotes or self._active_pool_quotes(include_inverse=False))
-            if q.symbol not in self._inverse_symbols and q.current_price > 0
-        ]
-        if not source_quotes:
-            self._latest_math_leader_signals = {}
-            return
-        self._latest_math_leader_signals = build_leader_signals(
-            source_quotes,
-            avg_volumes=self._avg_volumes,
-            recent_quotes_by_symbol=self._recent_quotes,
-        )
-
-    def _leader_signal_for_quote(self, quote: Quote) -> LeaderSignal:
-        signal = self._latest_math_leader_signals.get(quote.symbol)
-        if signal is not None:
-            return signal
-        signals = build_leader_signals(
-            [quote],
-            avg_volumes=self._avg_volumes,
-            recent_quotes_by_symbol={quote.symbol: self._get_recent_quotes(quote.symbol)},
-        )
-        return signals.get(
-            quote.symbol,
-            LeaderSignal(
-                symbol=quote.symbol,
-                leader_score=0.0,
-                leader_percentile=0.0,
-                entry_grade="C",
-                change_rate=float(quote.change_rate or 0.0),
-                trade_amount=self._quote_trade_amount(quote),
-                vs_open_pct=self._pct_move(quote.open_price, quote.current_price),
-                high_proximity=0.0,
-                volume_vs_avg=1.0,
-                reclaim_speed_ticks=99,
-            ),
-        )
-
-    def _entry_ev_for_context(
-        self,
-        *,
-        strategy_name: str,
-        regime_label: str,
-        entry_grade_math: str,
-    ) -> ExpectedValueEstimate:
-        return estimate_entry_ev(
-            self._entry_ev_table,
-            strategy_name=strategy_name or "unknown_strategy",
-            regime_label=regime_label or "unknown",
-            hour_bucket=self._now().strftime("%H"),
-            entry_grade=entry_grade_math or "unknown",
-        )
-
-    def _math_live_layer_enabled(self) -> bool:
-        return bool(self.cfg.enable_math_shadow_layer and self.cfg.enable_math_live_layer)
-
-    def _math_top_leader_symbols(self, limit: Optional[int] = None) -> set[str]:
-        if not self._math_live_layer_enabled() or not self._latest_math_leader_signals:
-            return set()
-        percentile_floor = float(self.cfg.math_live_pool_percentile_floor)
-        ranked = sorted(
-            self._latest_math_leader_signals.values(),
-            key=lambda signal: (
-                signal.leader_score,
-                signal.leader_percentile,
-                signal.trade_amount,
-                signal.symbol,
-            ),
-            reverse=True,
-        )
-        selected = [
-            signal.symbol
-            for signal in ranked
-            if signal.leader_percentile >= percentile_floor
-        ]
-        top_n = max(0, int(limit if limit is not None else self.cfg.math_live_pool_top_n))
-        if top_n > 0:
-            selected = selected[:top_n]
-        return set(selected)
-
-    def _math_queue_ranked_signals(
-        self,
-        quotes: Optional[Sequence[Quote]] = None,
-    ) -> List[LeaderSignal]:
-        if not self.cfg.enable_math_shadow_layer:
-            return []
-        source_quotes = [
-            quote
-            for quote in (quotes or self._active_pool_quotes(include_inverse=False))
-            if quote.symbol not in self._inverse_symbols and int(quote.current_price or 0) > 0
-        ]
-        if not source_quotes:
-            return []
-        signals = build_leader_signals(
-            source_quotes,
-            avg_volumes=self._avg_volumes,
-            recent_quotes_by_symbol=self._recent_quotes,
-        )
-        ranked = sorted(
-            signals.values(),
-            key=lambda item: (
-                item.leader_score,
-                item.leader_percentile,
-                item.trade_amount,
-                item.symbol,
-            ),
-            reverse=True,
-        )
-        return ranked
-
-    def _math_queue_source_for_symbol(self, symbol: str) -> str:
-        return self._latest_math_queue_source.get(symbol, "")
-
-    def _is_math_queue_symbol(self, symbol: str) -> bool:
-        return symbol in self._latest_math_queue_source
-
-    def _math_regime_ranked(self) -> List[tuple[str, float]]:
-        ranked = [
-            ("bull", float(self._latest_regime_probabilities.bull_prob)),
-            ("neutral", float(self._latest_regime_probabilities.neutral_prob)),
-            ("soft_bear", float(self._latest_regime_probabilities.soft_bear_prob)),
-            ("bear", float(self._latest_regime_probabilities.bear_prob)),
-        ]
-        ranked.sort(key=lambda item: (item[1], item[0]), reverse=True)
-        return ranked
-
-    def _math_regime_choice(self) -> tuple[str, float, float]:
-        ranked = self._math_regime_ranked()
-        if not ranked:
-            return "neutral", 0.0, 0.0
-        top_name, top_prob = ranked[0]
-        runner_prob = ranked[1][1] if len(ranked) > 1 else 0.0
-        return top_name, float(top_prob), float(runner_prob)
-
-    def _math_regime_supports_strategy(self, strategy_name: str, entry_meta: dict, *, is_inverse: bool) -> bool:
-        if not self._math_live_layer_enabled():
-            return True
-        dominant_profile, dominant_prob, runner_prob = self._math_regime_choice()
-        margin = float(self.cfg.math_gate_regime_margin)
-        if dominant_prob < runner_prob + margin:
-            return False
-        if is_inverse:
-            return dominant_profile in {"soft_bear", "bear"}
-        if strategy_name == "bull_breakout_strategy":
-            return dominant_profile == "bull"
-        if strategy_name == "neutral_pullback_strategy":
-            return dominant_profile in {"neutral", "bull"}
-        return dominant_profile in {"bull", "neutral"}
-
-    def _math_candidate_admission(
-        self,
-        quote: Quote,
-        *,
-        strategy_name: str,
-        regime_label: str,
-        is_inverse: bool,
-    ) -> tuple[bool, dict, str]:
-        entry_meta = self._build_math_shadow_metadata(
-            quote,
-            strategy_name=strategy_name,
-            regime_label=regime_label,
-        )
-        gate_ok, gate_reason = self._passes_math_live_entry_gate(
-            quote,
-            strategy_name=strategy_name,
-            entry_meta=entry_meta,
-            is_inverse=is_inverse,
-        )
-        return gate_ok, entry_meta, gate_reason
-
-    def _math_soft_override_allowed(
-        self,
-        quote: Quote,
-        *,
-        strategy_name: str,
-        regime_label: str,
-        reject_reason: str,
-        is_inverse: bool = False,
-    ) -> tuple[bool, dict]:
-        if not self._math_live_layer_enabled():
-            return False, {}
-        allowed, entry_meta, gate_reason = self._math_candidate_admission(
-            quote,
-            strategy_name=strategy_name,
-            regime_label=regime_label,
-            is_inverse=is_inverse,
-        )
-        if not allowed:
-            return False, entry_meta
-        entry_meta = dict(entry_meta)
-        entry_meta["math_soft_override_reason"] = reject_reason
-        entry_meta["math_shadow_gate"] = "soft_override"
-        entry_meta["math_shadow_reason"] = reject_reason if not gate_reason else gate_reason
-        return True, entry_meta
-
-    def _math_size_multiplier(
-        self,
-        *,
-        strategy_name: str,
-        entry_meta: dict,
-        is_inverse: bool,
-    ) -> float:
-        if not self._math_live_layer_enabled():
-            return 1.0
-        leader_percentile = float(entry_meta.get("leader_percentile", 0.0) or 0.0)
-        entry_ev = float(entry_meta.get("entry_ev", 0.0) or 0.0)
-        closed_trades = int(entry_meta.get("entry_ev_closed_trades", 0) or 0)
-
-        leader_component = max(0.0, min(1.0, (leader_percentile - 0.50) / 0.50))
-        ev_scale = max(1.0, float(self.cfg.math_ev_scale_krw))
-        ev_component = max(-1.0, min(1.0, entry_ev / ev_scale))
-        if closed_trades >= 8:
-            confidence_component = 1.0
-        elif closed_trades >= 4:
-            confidence_component = 0.6
-        else:
-            confidence_component = 0.3
-
-        raw_multiplier = 0.70 + 0.45 * leader_component + 0.35 * ev_component * confidence_component
-        min_multiplier = float(self.cfg.math_size_min_multiplier)
-        if strategy_name == "bull_breakout_strategy" and str(entry_meta.get("entry_grade", "")).upper() == "A":
-            max_multiplier = float(self.cfg.math_size_bull_a_max_multiplier)
-        elif is_inverse or strategy_name == "neutral_pullback_strategy":
-            max_multiplier = min(1.10, float(self.cfg.math_size_max_multiplier))
-        else:
-            max_multiplier = float(self.cfg.math_size_max_multiplier)
-        return max(min_multiplier, min(max_multiplier, raw_multiplier))
-
-    def _build_math_shadow_metadata(
-        self,
-        quote: Quote,
-        *,
-        strategy_name: str,
-        regime_label: str,
-        reject_reason: str = "",
-    ) -> dict:
-        if not self.cfg.enable_math_shadow_layer:
-            return {}
-        leader_signal = self._leader_signal_for_quote(quote)
-        ev_estimate = self._entry_ev_for_context(
-            strategy_name=strategy_name,
-            regime_label=regime_label,
-            entry_grade_math=leader_signal.entry_grade,
-        )
-        math_shadow_gate = ""
-        math_shadow_reason = ""
-        if ev_estimate.closed_trades >= max(1, int(self.cfg.ev_min_samples)) and ev_estimate.entry_ev < 0:
-            math_shadow_gate = "ev_negative"
-            math_shadow_reason = "negative_entry_ev"
-        elif reject_reason and leader_signal.leader_percentile >= 0.95:
-            math_shadow_gate = "top_leader_rejected"
-            math_shadow_reason = reject_reason
-        dominant_profile, dominant_prob, runner_prob = self._math_regime_choice()
-        return {
-            "leader_score": round(leader_signal.leader_score, 6),
-            "leader_percentile": round(leader_signal.leader_percentile, 6),
-            "entry_grade_math": leader_signal.entry_grade,
-            "entry_ev": round(ev_estimate.entry_ev, 2),
-            "entry_ev_confidence": ev_estimate.confidence,
-            "entry_ev_closed_trades": int(ev_estimate.closed_trades),
-            "bull_prob": round(self._latest_regime_probabilities.bull_prob, 6),
-            "neutral_prob": round(self._latest_regime_probabilities.neutral_prob, 6),
-            "soft_bear_prob": round(self._latest_regime_probabilities.soft_bear_prob, 6),
-            "bear_prob": round(self._latest_regime_probabilities.bear_prob, 6),
-            "math_queue_source": self._math_queue_source_for_symbol(quote.symbol),
-            "math_dominant_profile": dominant_profile,
-            "math_dominant_prob": round(dominant_prob, 6),
-            "math_regime_margin": round(max(0.0, dominant_prob - runner_prob), 6),
-            "math_shadow_gate": math_shadow_gate,
-            "math_shadow_reason": math_shadow_reason,
-        }
-
-    def _passes_math_live_entry_gate(
-        self,
-        quote: Quote,
-        *,
-        strategy_name: str,
-        entry_meta: dict,
-        is_inverse: bool,
-    ) -> tuple[bool, str]:
-        if not self._math_live_layer_enabled():
-            return True, ""
-
-        leader_percentile = float(entry_meta.get("leader_percentile", 0.0) or 0.0)
-        entry_ev = float(entry_meta.get("entry_ev", 0.0) or 0.0)
-        entry_ev_trades = int(entry_meta.get("entry_ev_closed_trades", 0) or 0)
-        if leader_percentile < float(self.cfg.math_gate_min_leader_percentile):
-            return False, "math_leader_percentile"
-
-        if (
-            bool(self.cfg.math_gate_positive_ev_required)
-            and self.cfg.math_live_negative_ev_gate
-            and entry_ev_trades >= max(1, int(self.cfg.math_live_ev_min_trades))
-            and entry_ev < max(0.0, float(self.cfg.math_live_negative_ev_threshold))
-        ):
-            return False, "math_negative_ev"
-
-        if not self._math_regime_supports_strategy(strategy_name, entry_meta, is_inverse=is_inverse):
-            return False, "math_regime_mismatch"
-
-        return True, ""
-
-    def _can_math_live_override_strategy_gate(
-        self,
-        quote: Quote,
-        *,
-        strategy_name: str,
-        regime_label: str,
-        is_inverse: bool,
-    ) -> tuple[bool, dict]:
-        if not self._math_live_layer_enabled():
-            return False, {}
-
-        entry_meta = self._build_math_shadow_metadata(
-            quote,
-            strategy_name=strategy_name,
-            regime_label=regime_label,
-        )
-        gate_ok, _ = self._passes_math_live_entry_gate(
-            quote,
-            strategy_name=strategy_name,
-            entry_meta=entry_meta,
-            is_inverse=is_inverse,
-        )
-        if not gate_ok:
-            return False, entry_meta
-
-        return True, entry_meta
-
-    def _append_math_shadow_context(self, payload: str, metadata: dict) -> str:
-        base = str(payload or "").strip()
-        if not metadata:
-            return base
-        extras = []
-        if "leader_score" in metadata:
-            extras.append(f"leader_score={float(metadata.get('leader_score', 0.0)):.4f}")
-        if "leader_percentile" in metadata:
-            extras.append(f"leader_pct={float(metadata.get('leader_percentile', 0.0)):.4f}")
-        if metadata.get("entry_grade_math"):
-            extras.append(f"entry_grade_math={metadata.get('entry_grade_math')}")
-        if "bull_prob" in metadata:
-            extras.append(f"bull_prob={float(metadata.get('bull_prob', 0.0)):.4f}")
-            extras.append(f"neutral_prob={float(metadata.get('neutral_prob', 0.0)):.4f}")
-            extras.append(f"soft_bear_prob={float(metadata.get('soft_bear_prob', 0.0)):.4f}")
-            extras.append(f"bear_prob={float(metadata.get('bear_prob', 0.0)):.4f}")
-        if "entry_ev" in metadata:
-            extras.append(f"entry_ev={float(metadata.get('entry_ev', 0.0)):.2f}")
-        if metadata.get("entry_ev_confidence"):
-            extras.append(f"entry_ev_conf={metadata.get('entry_ev_confidence')}")
-        if "entry_ev_closed_trades" in metadata:
-            extras.append(f"entry_ev_trades={int(metadata.get('entry_ev_closed_trades', 0))}")
-        if metadata.get("math_shadow_gate"):
-            extras.append(f"math_shadow_gate={metadata.get('math_shadow_gate')}")
-        if metadata.get("math_shadow_reason"):
-            extras.append(f"math_shadow_reason={metadata.get('math_shadow_reason')}")
-        if metadata.get("math_queue_source"):
-            extras.append(f"math_queue_source={metadata.get('math_queue_source')}")
-        if metadata.get("math_dominant_profile"):
-            extras.append(f"math_dominant_profile={metadata.get('math_dominant_profile')}")
-        if "math_regime_margin" in metadata:
-            extras.append(f"math_regime_margin={float(metadata.get('math_regime_margin', 0.0)):.4f}")
-        if "size_multiplier" in metadata:
-            extras.append(f"size_multiplier={float(metadata.get('size_multiplier', 1.0)):.4f}")
-        extra = " ".join(extras).strip()
-        if not extra:
-            return base
-        return f"{base} {extra}".strip()
-
-    def _record_quote_tape(self, quotes: List[Quote], *, market_data_ready: bool) -> None:
-        if not self.cfg.enable_math_shadow_layer or not self.cfg.quote_tape_enabled:
-            return
-        try:
-            self._quote_tape.record_quotes(
-                self._now(),
-                quotes,
-                regime_label=self._resolve_regime_profile_name(),
-                bear_score=int(self._bear_score),
-                market_data_ready=market_data_ready,
-            )
-        except Exception as exc:
-            logger.warning("quote tape 기록 실패(무시): %s", exc)
-
-    def _record_leader_tape(self, event: str, rows: List[dict]) -> None:
-        if not self.cfg.enable_math_shadow_layer or not self.cfg.quote_tape_enabled or not rows:
-            return
-        try:
-            self._quote_tape.record_leaders(self._now(), event=event, rows=rows)
-        except Exception as exc:
-            logger.warning("leader tape 기록 실패(무시): %s", exc)
-
-    def _current_total_net_pnl(self) -> int:
-        realized_net = self._effective_realized_net_for_breaker()
-        unrealized_net = self._estimate_unrealized_net_pnl()
-        return int(realized_net + unrealized_net)
-
-    def _is_loss_stage_active(self, total_net: Optional[int] = None) -> bool:
-        if total_net is None:
-            total_net = self._current_total_net_pnl()
-        return total_net <= int(self.cfg.stage1_loss_threshold)
-
-    def _is_profit_protect_active(self, total_net: Optional[int] = None) -> bool:
-        if total_net is None:
-            total_net = self._current_total_net_pnl()
-        return total_net >= int(self.cfg.profit_protect_threshold)
-
-    def _current_risk_stage(self, total_net: Optional[int] = None) -> str:
-        if total_net is None:
-            total_net = self._current_total_net_pnl()
-        if total_net <= int(self.cfg.daily_total_loss_limit or self.cfg.daily_loss_limit):
-            return "hard_stop"
-        if total_net >= int(self.cfg.daily_profit_target):
-            return "profit_target"
-        if self._is_loss_stage_active(total_net):
-            return "loss_stage1"
-        if self._is_profit_protect_active(total_net):
-            return "profit_protect"
-        return "normal"
-
-    def _risk_exposure_scale(self, total_net: Optional[int] = None) -> float:
-        scale = 1.0
-        if self._is_loss_stage_active(total_net):
-            scale = min(scale, float(self.cfg.loss_stage_exposure_scale))
-        if self._is_profit_protect_active(total_net):
-            scale = min(scale, float(self.cfg.profit_protect_exposure_scale))
-        return max(0.1, scale)
-
-    def _current_daily_total_loss_limit(self) -> int:
-        return int(
-            self._get_regime_value(
-                "daily_total_loss_limit",
-                self.cfg.daily_total_loss_limit
-                if self.cfg.daily_total_loss_limit is not None
-                else self.cfg.daily_loss_limit,
-            )
-        )
-
-    def _current_daily_profit_target(self) -> int:
-        return int(self._get_regime_value("daily_profit_target", self.cfg.daily_profit_target))
-
-    def _trigger_daily_hard_stop(
-        self,
-        realized_net: int,
-        unrealized_net: int,
-        total_net: int,
-        *,
-        liquidate: bool,
-    ) -> List[Order]:
-        logger.warning(
-            "일일 총손익 하드스탑 도달! (순실현: %s원, 미실현추정: %s원, 합계: %s원) → 전량 청산 후 거래 중지",
-            f"{realized_net:,}",
-            f"{unrealized_net:,}",
-            f"{total_net:,}",
-        )
-        self._alerts.send(
-            event_key="daily_total_loss_limit_hit",
-            title="일일 총손익 하드스탑",
-            message=(
-                f"순실현 {realized_net:,}원, 미실현추정 {unrealized_net:,}원, "
-                f"합계 {total_net:,}원으로 하드스탑에 도달했습니다."
-            ),
-            level="error",
-            cooldown_seconds=1800,
-        )
-        self._halted = True
-        self._halt_date = self._today()
-        if liquidate:
-            return self._liquidate_all()
-        return []
-
-    def _trigger_daily_profit_target(
-        self,
-        total_net: int,
-        *,
-        liquidate: bool,
-    ) -> List[Order]:
-        logger.info(
-            "일일 총손익 목표 달성! (총손익: %s원) → 전량 청산 후 거래 중지",
-            f"{total_net:,}",
-        )
-        self._alerts.send(
-            event_key="daily_profit_target_hit",
-            title="일일 목표 달성",
-            message=f"총손익 {total_net:,}원으로 목표를 달성했습니다. 전량 청산 후 거래를 중지합니다.",
-            level="info",
-            cooldown_seconds=1800,
-        )
-        self._halted = True
-        self._halt_date = self._today()
-        if liquidate:
-            return self._liquidate_all()
-        return []
-
-    def _evaluate_daily_breakers(self, *, liquidate: bool) -> Optional[List[Order]]:
-        if self._hard_stop_bypass_for_day:
-            return None
-
-        realized_net = self._effective_realized_net_for_breaker()
-        unrealized_net = self._estimate_unrealized_net_pnl()
-        total_net = realized_net + unrealized_net
-
-        if total_net <= self._current_daily_total_loss_limit():
-            return self._trigger_daily_hard_stop(
-                realized_net,
-                unrealized_net,
-                total_net,
-                liquidate=liquidate,
-            )
-        if total_net >= self._current_daily_profit_target():
-            return self._trigger_daily_profit_target(total_net, liquidate=liquidate)
-        return None
-
-    def _log_setup_reject(
-        self,
-        quote: Quote,
-        reject_reason: str,
-        message: str,
-        *args,
-        strategy_name: str = "",
-    ):
-        if not self.cfg.enable_setup_logging:
-            return
-        is_inverse = quote.symbol in self._inverse_symbols
-        resolved_strategy_name = strategy_name or self._current_profile_entry_strategy_name(is_inverse=is_inverse)
-        math_meta = self._build_math_shadow_metadata(
-            quote,
-            strategy_name=resolved_strategy_name or "unknown_strategy",
-            regime_label=self._resolve_regime_profile_name(),
-            reject_reason=reject_reason,
-        )
-        formatted = self._append_math_shadow_context(
-            f"진입 거부[{reject_reason}] reject_reason={reject_reason}: " + message,
-            math_meta,
-        )
-        self._log_entry_filter_once_per_minute(
-            quote.symbol,
-            reject_reason,
-            formatted,
-            *args,
-        )
-
-    def _track_shadow_blocked_candidate(self, quote: Quote, reject_reason: str) -> None:
-        if not self.cfg.enable_shadow_blocked_candidate_tracking:
-            return
-        if reject_reason != "neutral_loss_limit_block":
-            return
-        if quote.current_price <= 0:
-            return
-        if quote.symbol in self._shadow_blocked_candidates:
-            return
-
-        allocation = self._compute_buy_allocation(
-            symbol=quote.symbol,
-            current_price=quote.current_price,
-        )
-        quantity = allocation // quote.current_price
-        if quantity <= 0:
-            quantity = 1
-        notional = max(quote.current_price, quantity * quote.current_price)
-        target_pct = float(self._build_regime_profile("neutral")["take_profit_pct"])
-        stop_loss_pct = abs(self._long_stop_loss_amount_for_notional(notional)) / max(1, notional) * 100
-
-        self._shadow_blocked_candidates[quote.symbol] = ShadowBlockedCandidate(
-            symbol=quote.symbol,
-            blocked_at=self._now(),
-            reject_reason=reject_reason,
-            regime_label=self._resolve_regime_profile_name(),
-            strategy_name=self._current_profile_entry_strategy_name(is_inverse=False),
-            entry_price=quote.current_price,
-            hypothetical_quantity=quantity,
-            notional=notional,
-            target_pct=target_pct,
-            stop_loss_pct=stop_loss_pct,
-            max_price=quote.current_price,
-            min_price=quote.current_price,
-            last_price=quote.current_price,
-        )
-        logger.info(
-            "그림자 후보 추적 시작: %s shadow_reason=%s regime_label=%s strategy_name=%s entry=%s원 qty=%d "
-            "target=%.2f%% stop=%.2f%% window=%d분",
-            quote.symbol,
-            reject_reason,
-            self._resolve_regime_profile_name(),
-            self._current_profile_entry_strategy_name(is_inverse=False),
-            f"{quote.current_price:,}",
-            quantity,
-            target_pct,
-            stop_loss_pct,
-            max(1, int(self.cfg.shadow_blocked_candidate_window_minutes)),
-        )
-
-    def _finalize_shadow_blocked_candidate(self, candidate: ShadowBlockedCandidate) -> None:
-        mfe_pct = self._pct_move(candidate.entry_price, candidate.max_price)
-        mae_pct = self._pct_move(candidate.entry_price, candidate.min_price)
-        close_return_pct = self._pct_move(candidate.entry_price, candidate.last_price)
-
-        if candidate.first_hit_outcome:
-            outcome = candidate.first_hit_outcome
-        elif close_return_pct > 0:
-            outcome = "close_up"
-        elif close_return_pct < 0:
-            outcome = "close_down"
-        else:
-            outcome = "flat"
-
-        logger.info(
-            "그림자 후보 종료: %s shadow_reason=%s regime_label=%s strategy_name=%s entry=%s원 last=%s원 max=%s원 "
-            "min=%s원 MFE=%.2f%% MAE=%.2f%% close=%.2f%% outcome=%s",
-            candidate.symbol,
-            candidate.reject_reason,
-            candidate.regime_label,
-            candidate.strategy_name,
-            f"{candidate.entry_price:,}",
-            f"{candidate.last_price:,}",
-            f"{candidate.max_price:,}",
-            f"{candidate.min_price:,}",
-            mfe_pct,
-            mae_pct,
-            close_return_pct,
-            outcome,
-        )
-
-    def _update_shadow_blocked_candidates(
-        self,
-        quotes: List[Quote],
-        now: Optional[datetime] = None,
-    ) -> None:
-        if not self.cfg.enable_shadow_blocked_candidate_tracking:
-            return
-        if not self._shadow_blocked_candidates:
-            return
-        if now is None:
-            now = self._now()
-
-        quote_map = {quote.symbol: quote for quote in quotes}
-        expiry = timedelta(minutes=max(1, int(self.cfg.shadow_blocked_candidate_window_minutes)))
-        finalize_symbols: List[str] = []
-
-        for symbol, candidate in self._shadow_blocked_candidates.items():
-            quote = quote_map.get(symbol) or self._quotes_cache.get(symbol)
-            if quote and quote.current_price > 0:
-                candidate.last_price = quote.current_price
-                candidate.max_price = max(candidate.max_price, quote.current_price)
-                candidate.min_price = min(candidate.min_price, quote.current_price)
-                move_pct = self._pct_move(candidate.entry_price, quote.current_price)
-                if not candidate.first_hit_outcome:
-                    if move_pct >= candidate.target_pct:
-                        candidate.first_hit_outcome = "take_profit_first"
-                        candidate.first_hit_at = now
-                    elif move_pct <= -candidate.stop_loss_pct:
-                        candidate.first_hit_outcome = "stop_loss_first"
-                        candidate.first_hit_at = now
-
-            if now >= candidate.blocked_at + expiry or (now.hour > 15 or (now.hour == 15 and now.minute >= 15)):
-                self._finalize_shadow_blocked_candidate(candidate)
-                finalize_symbols.append(symbol)
-
-        for symbol in finalize_symbols:
-            self._shadow_blocked_candidates.pop(symbol, None)
-
-    def _log_risk_stage_change(self, stage_label: str, total_net: int):
-        if stage_label == self._risk_stage_label:
-            return
-        self._risk_stage_label = stage_label
-        logger.info("리스크 단계 전환: %s (총손익 %s원)", stage_label, f"{total_net:,}")
-
-    @staticmethod
-    def _pct_move(base_price: int, price: int) -> float:
-        if base_price <= 0:
-            return 0.0
-        return (price - base_price) / base_price * 100
-
-    @staticmethod
-    def _loss_pct(peak_price: int, trough_price: int) -> float:
-        if peak_price <= 0:
-            return 0.0
-        return (peak_price - trough_price) / peak_price * 100
-
-    @staticmethod
-    def _extract_context_token(payload: str, key: str, default: str = "") -> str:
-        marker = f"{key}="
-        for chunk in str(payload or "").split():
-            if chunk.startswith(marker):
-                return chunk[len(marker):]
-        return default
-
-    def _extract_context_int(self, payload: str, key: str, default: int = 0) -> int:
-        raw = MomentumScalpStrategy._extract_context_token(payload, key, "")
-        if not raw:
-            return default
-        try:
-            return int(float(raw))
-        except (TypeError, ValueError):
-            return default
-
-    def _build_entry_metadata(
-        self,
-        symbol: str,
-        setup_name: str,
-        payload: str,
-        strategy_name: str = "",
-        quote: Optional[Quote] = None,
-    ) -> dict:
-        current_stage = self._current_risk_stage()
-        metadata = {
-            "strategy_name": strategy_name or self._extract_context_token(payload, "strategy_name", "unknown"),
-            "setup_name": setup_name or self._extract_context_token(payload, "setup_name", "unknown"),
-            "entry_reason": self._extract_context_token(payload, "entry_reason", setup_name or "unknown"),
-            "regime_label": self._resolve_regime_profile_name(),
-            "bear_score": int(self._bear_score),
-            "planned_risk_stage": current_stage,
-            "is_inverse": symbol in self._inverse_symbols,
-            "entry_grade": self._extract_context_token(payload, "entry_grade", ""),
-            "turnover_rank": self._extract_context_int(payload, "turnover_rank", 0),
-        }
-        if quote is not None:
-            metadata.update(
-                self._build_math_shadow_metadata(
-                    quote,
-                    strategy_name=metadata["strategy_name"],
-                    regime_label=metadata["regime_label"],
-                )
-            )
-        return metadata
-
-    def _append_entry_context(self, payload: str, metadata: dict) -> str:
-        base = str(payload or "").strip()
-        extra = (
-            f"strategy_name={metadata.get('strategy_name', '')} "
-            f"regime_label={metadata.get('regime_label', '')} "
-            f"bear_score={int(metadata.get('bear_score', 0))} "
-            f"planned_risk_stage={metadata.get('planned_risk_stage', '')}"
-        )
-        if metadata.get("entry_grade"):
-            extra += f" entry_grade={metadata.get('entry_grade', '')}"
-        if metadata.get("turnover_rank"):
-            extra += f" turnover_rank={int(metadata.get('turnover_rank', 0))}"
-        return self._append_math_shadow_context(f"{base} {extra}".strip(), metadata)
-
-    def _current_profile_entry_strategy_name(self, is_inverse: bool) -> str:
-        profile_name = self._resolve_regime_profile_name()
-        if not is_inverse and profile_name == "neutral" and self._is_bull_bias_market():
-            return "bull_breakout_strategy"
-        if not is_inverse and profile_name == "soft_bear" and self._soft_bear_strong_leader_lane_active():
-            return "bull_breakout_strategy"
-        strategy_name = self._regime_router.strategy_for_profile(profile_name).name
-        if is_inverse:
-            return strategy_name
-        if profile_name in {"soft_bear", "bear"}:
-            return ""
-        return strategy_name
-
-    def _load_strategy_gates(self) -> None:
-        self._strategy_gate_state = {}
-        if self.market_data is None:
-            return
-        gate_path_raw = str(getattr(self.cfg, "strategy_gate_path", "") or "").strip()
-        if not gate_path_raw:
-            return
-        gate_path = Path(gate_path_raw)
-        if not gate_path.exists():
-            return
-        try:
-            payload = json.loads(gate_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning("전략 자동 게이트 로드 실패(무시): %s", exc)
-            return
-
-        strategies = payload.get("strategies")
-        if not isinstance(strategies, dict):
-            return
-        self._strategy_gate_state = {
-            str(name): dict(meta)
-            for name, meta in strategies.items()
-            if isinstance(meta, dict)
-        }
-        disabled = [
-            f"{name}(exp={float(meta.get('expectancy', 0.0)):.2f}, trades={int(meta.get('closed_trades', 0) or 0)})"
-            for name, meta in sorted(self._strategy_gate_state.items())
-            if not bool(meta.get("enabled", True))
-        ]
-        if disabled:
-            logger.info("전략 자동 게이트 비활성화 적용: %s", ", ".join(disabled))
-
-    def _is_strategy_gate_enabled(self, strategy_name: str) -> bool:
-        if not strategy_name:
-            return True
-        gate = self._strategy_gate_state.get(strategy_name)
-        if not gate:
-            return True
-        return bool(gate.get("enabled", True))
-
-    def _symbol_cooldown_remaining(self, symbol: str, now: Optional[datetime] = None) -> Optional[datetime]:
-        if now is None:
-            now = self._now()
-        cooldown_until = self._symbol_cooldown_until.get(symbol)
-        if cooldown_until and now < cooldown_until:
-            return cooldown_until
-        if cooldown_until and now >= cooldown_until:
-            self._symbol_cooldown_until.pop(symbol, None)
-        return None
-
-    def _strategy_cooldown_remaining(self, strategy_name: str, now: Optional[datetime] = None) -> Optional[datetime]:
-        if now is None:
-            now = self._now()
-        if not strategy_name:
-            return None
-        cooldown_until = self._strategy_cooldown_until.get(strategy_name)
-        if cooldown_until and now < cooldown_until:
-            return cooldown_until
-        if cooldown_until and now >= cooldown_until:
-            self._strategy_cooldown_until.pop(strategy_name, None)
-        return None
-
-    def _apply_loss_cooldowns(self, symbol: str, strategy_name: str) -> None:
+    def _today(self) -> str:
+        return self._now().strftime("%Y%m%d")
+
+    def _ensure_recent_quote_window(self, symbol: str) -> deque[Quote]:
+        window = self._recent_quotes.get(symbol)
+        if window is None:
+            window = deque(maxlen=max(4, int(self.config.setup_recent_quote_window)))
+            self._recent_quotes[symbol] = window
+        return window
+
+    def _reset_for_new_day(self):
+        self.daily_pnl = DailyPnL()
+        self._breaker_excluded_realized_net_pnl = 0
+        self._halted = False
+        self._halt_reason = ""
+        self._sell_fill_ledger = []
+        self._closed_trade_ledger = {}
+        self._ledger_seed_snapshot = self._empty_daily_pnl_snapshot()
+        self._bull_loss_count_today = 0
+        self._symbol_entry_cooldown_until = {}
+        self._symbol_order_unavailable = {}
+        self._pending_entry_meta = {}
+        self._last_daily_state_save_at = None
+        self._active_day = self._today()
         now = self._now()
-        self._symbol_cooldown_until[symbol] = now + timedelta(
-            seconds=max(10, self._regime_loss_cooldown_seconds())
-        )
-        if strategy_name == "neutral_pullback_strategy":
-            minutes = max(1, int(self.cfg.neutral_strategy_cooldown_minutes))
-            if self._neutral_loss_count_today >= 2:
-                minutes *= 2
-            self._strategy_cooldown_until[strategy_name] = now + timedelta(minutes=minutes)
-        elif strategy_name == "soft_bear_inverse_strategy":
-            minutes = max(1, int(self.cfg.soft_bear_strategy_cooldown_minutes))
-            self._strategy_cooldown_until[strategy_name] = now + timedelta(minutes=minutes)
-        elif strategy_name == "bull_breakout_strategy":
-            minutes = max(1, int(round(self._regime_loss_cooldown_seconds() / 60)))
-            self._strategy_cooldown_until[strategy_name] = now + timedelta(minutes=minutes)
-
-    def _minutes_since_market_open(self, now: Optional[datetime] = None) -> int:
-        if now is None:
-            now = self._now()
-        return (now.hour * 60 + now.minute) - (9 * 60)
-
-    def _is_neutral_entry_window_open(self, now: Optional[datetime] = None) -> bool:
-        return self._minutes_since_market_open(now) >= int(
-            self.cfg.neutral_entry_start_minutes_after_open
-        )
-
-    def _is_bull_late_entry_window(self, now: Optional[datetime] = None) -> bool:
-        return self._minutes_since_market_open(now) >= int(
-            self.cfg.bull_breakout_late_entry_start_minutes_after_open
-        )
-
-    def _position_notional(self, pos: PositionState) -> int:
-        return max(0, int(pos.invested_amount or (pos.buy_price * pos.quantity)))
-
-    def _neutral_loss_limit(self) -> int:
-        return max(1, int(self.cfg.neutral_max_losses_per_day))
-
-    def _neutral_post_loss_cooldown_until(self) -> Optional[datetime]:
-        if self._neutral_last_loss_at is None:
-            return None
-        return self._neutral_last_loss_at + timedelta(
-            minutes=max(0, int(self.cfg.neutral_post_loss_cooldown_minutes))
-        )
-
-    def _is_neutral_post_loss_retry_available(self, now: Optional[datetime] = None) -> bool:
-        if now is None:
-            now = self._now()
-        if self._neutral_loss_count_today != self._neutral_loss_limit():
-            return False
-        if int(self.cfg.neutral_post_loss_reentry_limit) <= 0:
-            return False
-        if self._neutral_post_loss_reentries_today >= int(self.cfg.neutral_post_loss_reentry_limit):
-            return False
-        cooldown_until = self._neutral_post_loss_cooldown_until()
-        if cooldown_until is None:
-            return False
-        return now >= cooldown_until
-
-    def _neutral_retry_thresholds(self) -> dict:
-        return {
-            "min_drop_pct": self.cfg.neutral_pullback_min_drop_pct + self.cfg.neutral_post_loss_min_drop_bonus_pct,
-            "min_runup_pct": (
-                self.cfg.neutral_min_runup_from_open_pct + self.cfg.neutral_post_loss_min_runup_bonus_pct
-            ),
-            "reclaim_buffer_pct": (
-                self.cfg.neutral_reclaim_buffer_pct + self.cfg.neutral_post_loss_reclaim_buffer_bonus_pct
-            ),
-            "min_score": self._regime_min_momentum_score() + self.cfg.neutral_post_loss_score_bonus,
-            "min_change_rate": self._regime_min_change_rate() + self.cfg.neutral_post_loss_change_rate_bonus,
-            "min_pullback_ticks": max(
-                1,
-                int(self.cfg.neutral_pullback_min_ticks) + int(self.cfg.neutral_post_loss_extra_pullback_ticks),
-            ),
-        }
-
-    def _is_neutral_first_entry_attempt(self) -> bool:
-        if self.daily_pnl.trade_count > 0:
-            return False
-        return not any(not pos.is_inverse for pos in self.positions.values())
-
-    def _long_stop_loss_amount_for_notional(self, notional: int) -> int:
-        dynamic_stop = int(round(max(0, notional) * self.cfg.long_stop_loss_notional_pct))
-        stop_amount = min(max(1, dynamic_stop), max(1, int(self.cfg.long_stop_loss_cap_amount)))
-        return -stop_amount
-
-    def _inverse_stop_loss_amount_for_notional(self, notional: int) -> int:
-        dynamic_stop = int(round(max(0, notional) * self.cfg.inverse_stop_loss_notional_pct))
-        stop_amount = min(max(1, dynamic_stop), max(1, int(self.cfg.inverse_stop_loss_cap_amount)))
-        return -stop_amount
-
-    def _long_stop_loss_amount(self, pos: PositionState) -> int:
-        return self._long_stop_loss_amount_for_notional(self._position_notional(pos))
-
-    def _inverse_stop_loss_amount(self, pos: PositionState) -> int:
-        return self._inverse_stop_loss_amount_for_notional(self._position_notional(pos))
-
-    def _entry_stop_risk_amount(self, symbol: str, quantity: int, entry_price: int) -> int:
-        notional = max(0, int(quantity) * int(entry_price))
-        if symbol in self._inverse_symbols:
-            return abs(self._inverse_stop_loss_amount_for_notional(notional))
-        return abs(self._long_stop_loss_amount_for_notional(notional))
-
-    def _recent_price_path(self, symbol: str) -> List[int]:
-        return [q.current_price for q in self._get_recent_quotes(symbol) if q.current_price > 0]
-
-    def _recent_local_high(self, symbol: str) -> tuple[int, int]:
-        prices = self._recent_price_path(symbol)
-        if not prices:
-            return 0, -1
-        high_price = max(prices)
-        high_idx = max(idx for idx, price in enumerate(prices) if price == high_price)
-        return high_price, high_idx
-
-    def _recent_local_low_after_index(self, symbol: str, start_idx: int) -> int:
-        prices = self._recent_price_path(symbol)
-        if not prices:
-            return 0
-        tail = prices[start_idx:] if start_idx < len(prices) else prices[-1:]
-        if not tail:
-            return prices[-1]
-        return min(tail)
-
-    def _active_pool_quotes(self, include_inverse: bool = False) -> List[Quote]:
-        candidates: List[Quote] = []
-        seen: set[str] = set()
-        if self._pool:
-            pool_symbols: List[str] = []
-            pool_symbols.extend(self._latest_math_queue_symbols)
-            pool_symbols.extend(self._latest_math_backfill_symbols)
-            pool_symbols.extend(self._latest_legacy_backfill_symbols)
-            pool_symbols.extend(list(self._pool))
-        else:
-            pool_symbols = list(self._quotes_cache.keys())
-        for symbol in pool_symbols:
-            quote = self._quotes_cache.get(symbol)
-            if quote is None or quote.current_price <= 0:
-                continue
-            if not include_inverse and symbol in self._inverse_symbols:
-                continue
-            if symbol in seen:
-                continue
-            seen.add(symbol)
-            candidates.append(quote)
-        return candidates
-
-    @staticmethod
-    def _ranking_trade_amount(item) -> int:
-        return max(0, int(item.current_price)) * max(0, int(item.volume))
-
-    @staticmethod
-    def _quote_trade_amount(quote: Quote) -> int:
-        raw = int(getattr(quote, "trade_amount", 0) or 0)
-        if raw > 0:
-            return raw
-        return max(0, int(quote.current_price)) * max(0, int(quote.volume))
-
-    def _format_symbol_sample(self, symbols) -> str:
-        sample = sorted(str(symbol) for symbol in symbols if symbol)
-        if not sample:
-            return "-"
-        limit = max(1, int(self.cfg.dynamic_pool_log_symbol_count))
-        clipped = sample[:limit]
-        if len(sample) > limit:
-            clipped.append("...")
-        return ", ".join(clipped)
-
-    def _is_dynamic_strong_leader_candidate(
-        self,
-        *,
-        symbol: str,
-        current_price: int,
-        change_rate: float,
-        trade_amount: int,
-        rank: Optional[int],
-    ) -> bool:
-        if not symbol or symbol in self._inverse_symbols:
-            return False
-        if current_price < self.cfg.min_price:
-            return False
-        if change_rate < float(self.cfg.strong_leader_min_change_rate):
-            return False
-        has_top_rank = rank is not None and int(rank) <= max(1, int(self.cfg.strong_leader_top_rank))
-        has_turnover = trade_amount >= int(self.cfg.strong_leader_min_trade_amount)
-        return has_top_rank or has_turnover
-
-    def _soft_bear_strong_leader_lane_active(self) -> bool:
-        return (
-            self.cfg.enable_soft_bear_strong_leader_longs
-            and self._resolve_regime_profile_name() == "soft_bear"
-            and bool(self._latest_strong_leader_symbols)
-        )
-
-    def _is_soft_bear_strong_leader_long_candidate(
-        self,
-        quote: Quote,
-        *,
-        score: Optional[float] = None,
-    ) -> bool:
-        if not self.cfg.enable_soft_bear_strong_leader_longs:
-            return False
-        if self._resolve_regime_profile_name() != "soft_bear":
-            return False
-        if quote.symbol in self._inverse_symbols:
-            return False
-        if quote.current_price <= 0 or quote.open_price <= 0:
-            return False
-        if quote.current_price <= quote.open_price:
-            return False
-        if quote.symbol not in self._latest_strong_leader_symbols:
-            return False
-        if quote.change_rate < float(self.cfg.soft_bear_strong_leader_min_change_rate):
-            return False
-        if self._quote_trade_amount(quote) < int(self.cfg.soft_bear_strong_leader_min_trade_amount):
-            return False
-        if score is not None and score < float(self.cfg.soft_bear_strong_leader_min_momentum):
-            return False
-        leader_ok, _, _ = self._passes_bull_leader_filter(quote)
-        return leader_ok
-
-    def _passes_neutral_leader_filter(
-        self,
-        quote: Quote,
-        reclaim_speed_ticks: int,
-        *,
-        max_turnover_rank: Optional[int] = None,
-        max_reclaim_ticks: Optional[int] = None,
-        relative_strength_bonus_pp: float = 0.0,
-    ) -> tuple[bool, str]:
-        active_quotes = self._active_pool_quotes(include_inverse=False)
-        active_quotes_by_symbol = {item.symbol: item for item in active_quotes}
-        active_quotes_by_symbol[quote.symbol] = quote
-        active_quotes = list(active_quotes_by_symbol.values())
-
-        if quote.current_price <= quote.open_price:
-            return False, "neutral_non_leader"
-
-        if not active_quotes:
-            return False, "neutral_non_leader"
-
-        traded_values = sorted(
-            (
-                item.symbol,
-                max(0, int(item.current_price)) * max(0, int(item.volume)),
-            )
-            for item in active_quotes
-        )
-        ranked_turnover = sorted(traded_values, key=lambda item: (item[1], item[0]), reverse=True)
-        turnover_rank = next(
-            (idx for idx, (symbol, _) in enumerate(ranked_turnover, start=1) if symbol == quote.symbol),
-            len(ranked_turnover) + 1,
-        )
-        turnover_rank_limit = max_turnover_rank
-        if turnover_rank_limit is None:
-            turnover_rank_limit = int(self.cfg.neutral_leader_top_n)
-        leader_signal = self._leader_signal_for_quote(quote)
-        math_override = (
-            self._math_live_layer_enabled()
-            and (
-                self._is_math_queue_symbol(quote.symbol)
-                or leader_signal.leader_percentile >= float(self.cfg.math_gate_min_leader_percentile)
-            )
-        )
-        if turnover_rank > max(1, int(turnover_rank_limit)) and not math_override:
-            return False, "neutral_low_turnover_rank"
-
-        if len(active_quotes) > 1:
-            median_change_rate = float(median(item.change_rate for item in active_quotes))
-            min_strength = (
-                median_change_rate
-                + float(self.cfg.neutral_leader_relative_strength_pp)
-                + float(relative_strength_bonus_pp)
-            )
-            if quote.change_rate < min_strength and not math_override:
-                return False, "neutral_weak_relative_strength"
-
-        reclaim_tick_limit = max_reclaim_ticks
-        if reclaim_tick_limit is None:
-            reclaim_tick_limit = int(self.cfg.neutral_leader_max_reclaim_ticks)
-        if reclaim_speed_ticks > max(1, int(reclaim_tick_limit)) and not math_override:
-            return False, "neutral_slow_reclaim"
-
-        return True, ""
-
-    def _passes_bull_leader_filter(self, quote: Quote) -> tuple[bool, str, str]:
-        active_quotes = self._active_pool_quotes(include_inverse=False)
-        active_quotes_by_symbol = {item.symbol: item for item in active_quotes}
-        active_quotes_by_symbol[quote.symbol] = quote
-        active_quotes = list(active_quotes_by_symbol.values())
-
-        if quote.current_price <= quote.open_price:
-            return False, "bull_non_leader", ""
-        if not active_quotes:
-            return False, "bull_non_leader", ""
-
-        traded_values = sorted(
-            (
-                item.symbol,
-                max(0, int(item.current_price)) * max(0, int(item.volume)),
-            )
-            for item in active_quotes
-        )
-        ranked_turnover = sorted(traded_values, key=lambda item: (item[1], item[0]), reverse=True)
-        turnover_rank = next(
-            (idx for idx, (symbol, _) in enumerate(ranked_turnover, start=1) if symbol == quote.symbol),
-            len(ranked_turnover) + 1,
-        )
-        leader_signal = self._leader_signal_for_quote(quote)
-        math_override = (
-            self._math_live_layer_enabled()
-            and (
-                self._is_math_queue_symbol(quote.symbol)
-                or leader_signal.leader_percentile >= float(self.cfg.math_gate_min_leader_percentile)
-            )
-        )
-        if turnover_rank > max(1, int(self.cfg.bull_leader_top_n)) and not math_override:
-            return False, "bull_low_turnover_rank", ""
-
-        median_change_rate = float(median(item.change_rate for item in active_quotes))
-        min_strength = median_change_rate + float(self.cfg.bull_leader_relative_strength_pp)
-        if quote.change_rate < min_strength and not math_override:
-            return False, "bull_weak_relative_strength", ""
-
-        payload = (
-            f"entry_grade=A turnover_rank={turnover_rank} "
-            f"relative_strength_floor={min_strength:.2f} "
-            f"math_leader_pct={leader_signal.leader_percentile:.4f}"
-        )
-        return True, "", payload
-
-    def _passes_bull_breakout_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
-        soft_bear_leader_lane = self._is_soft_bear_strong_leader_long_candidate(quote, score=score)
-        if not self._is_bullish_regime() and not soft_bear_leader_lane:
-            return False, "", "bull_only"
-        history = self._get_recent_quotes(quote.symbol)
-        hold_ticks = max(2, int(self.cfg.bull_breakout_hold_ticks))
-        if len(history) < hold_ticks + 1:
-            return False, "", "bull_breakout_wait"
-        required_change_rate = self._regime_bullish_min_change_rate()
-        required_score = self._regime_bullish_min_momentum_score()
-        if soft_bear_leader_lane:
-            required_change_rate = float(self.cfg.soft_bear_strong_leader_min_change_rate)
-            required_score = float(self.cfg.soft_bear_strong_leader_min_momentum)
-        if quote.change_rate < required_change_rate:
-            return False, "", "bull_change_rate"
-        if score < required_score:
-            return False, "", "bull_score"
-        if not self._is_volume_spike(quote, score=score):
-            soft_override, soft_meta = self._math_soft_override_allowed(
-                quote,
-                strategy_name="bull_breakout_strategy",
-                regime_label=self._resolve_regime_profile_name(),
-                reject_reason="bull_volume",
-            )
-            if not soft_override:
-                return False, "", "bull_volume"
-            soft_override_payload = f" math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'bull_volume')}"
-        else:
-            soft_override_payload = ""
-        leader_ok, leader_reject, leader_payload = self._passes_bull_leader_filter(quote)
-        if not leader_ok:
-            return False, "", leader_reject
-        if self._is_bull_late_entry_window():
-            late_day_min_score = self._regime_bullish_min_momentum_score() + float(
-                self.cfg.bull_breakout_late_entry_score_bonus
-            )
-            if score < late_day_min_score:
-                return False, "", "bull_late_day_score"
-            late_day_min_change = self._regime_bullish_min_change_rate() + float(
-                self.cfg.bull_breakout_late_entry_change_rate_bonus
-            )
-            if quote.change_rate < late_day_min_change:
-                return False, "", "bull_late_day_change"
-        if self._bull_loss_count_today > 0:
-            post_loss_min_score = self._regime_bullish_min_momentum_score() + float(
-                self.cfg.bull_post_loss_score_bonus
-            )
-            if score < post_loss_min_score:
-                return False, "", "bull_post_loss_score"
-            post_loss_min_change = self._regime_bullish_min_change_rate() + float(
-                self.cfg.bull_post_loss_change_rate_bonus
-            )
-            if quote.change_rate < post_loss_min_change:
-                return False, "", "bull_post_loss_change"
-
-        prices = [item.current_price for item in history]
-        prior_prices = prices[:-hold_ticks] if len(prices) > hold_ticks else prices[:-1]
-        if not prior_prices:
-            return False, "", "bull_breakout_wait"
-        prior_high = max(prior_prices)
-        breakout_buffer_pct = float(self.cfg.bull_breakout_buffer_pct)
-        if self._bull_loss_count_today > 0:
-            breakout_buffer_pct += float(self.cfg.bull_post_loss_breakout_buffer_bonus_pct)
-        breakout_level = prior_high * (1 + (breakout_buffer_pct / 100))
-        if quote.current_price < breakout_level:
-            return False, "", "bull_breakout_wait"
-
-        recent_hold = history[-hold_ticks:]
-        if any(item.current_price < breakout_level for item in recent_hold):
-            return False, "", "bull_breakout_wait"
-
-        reason = (
-            f"setup_name=bull_breakout entry_reason=local_high_breakout "
-            f"prior_high={prior_high} hold_ticks={hold_ticks} "
-            f"leader_lane={'soft_bear' if soft_bear_leader_lane else 'bull'} {leader_payload}{soft_override_payload}"
-        )
-        return True, "bull_breakout", reason
-
-    def _passes_neutral_pullback_reclaim_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
-        if self._resolve_regime_profile_name() != "neutral":
-            return False, "", "neutral_only"
-        if not self._is_neutral_entry_window_open():
-            return False, "", "neutral_too_early"
-        history = self._get_recent_quotes(quote.symbol)
-        if len(history) < 4:
-            return False, "", "pullback_missing"
-        if quote.current_price <= 0 or quote.open_price <= 0:
-            return False, "", "pullback_missing"
-
-        prices = [item.current_price for item in history[:-1]]
-        if not prices:
-            return False, "", "pullback_missing"
-
-        local_high = max(prices)
-        local_high_idx = max(idx for idx, price in enumerate(prices) if price == local_high)
-        pullback_window = prices[local_high_idx + 1:]
-        runup_from_open = self._pct_move(quote.open_price, local_high)
-        proximity_to_day_high = self._loss_pct(max(quote.high_price, quote.current_price), quote.current_price)
-        min_pullback_ticks = max(1, int(self.cfg.neutral_pullback_min_ticks))
-        min_pullback_drop_pct = self.cfg.neutral_pullback_min_drop_pct
-        min_runup_from_open_pct = self.cfg.neutral_min_runup_from_open_pct
-        reclaim_buffer_pct = self.cfg.neutral_reclaim_buffer_pct
-        min_score = self._regime_min_momentum_score()
-        min_change_rate = self._regime_min_change_rate()
-        leader_turnover_rank_limit: Optional[int] = None
-        leader_reclaim_tick_limit: Optional[int] = None
-        leader_relative_strength_bonus_pp = 0.0
-
-        if self._is_neutral_first_entry_attempt():
-            min_pullback_drop_pct += float(self.cfg.neutral_first_entry_min_drop_bonus_pct)
-            min_runup_from_open_pct += float(self.cfg.neutral_first_entry_min_runup_bonus_pct)
-            reclaim_buffer_pct += float(self.cfg.neutral_first_entry_reclaim_buffer_bonus_pct)
-            min_score += float(self.cfg.neutral_first_entry_score_bonus)
-            min_change_rate += float(self.cfg.neutral_first_entry_change_rate_bonus)
-            leader_turnover_rank_limit = int(self.cfg.neutral_first_entry_max_turnover_rank)
-            leader_reclaim_tick_limit = int(self.cfg.neutral_first_entry_max_reclaim_ticks)
-            leader_relative_strength_bonus_pp += 0.15
-
-        if self._is_neutral_post_loss_retry_available():
-            retry_thresholds = self._neutral_retry_thresholds()
-            min_pullback_ticks = retry_thresholds["min_pullback_ticks"]
-            min_pullback_drop_pct = retry_thresholds["min_drop_pct"]
-            min_runup_from_open_pct = retry_thresholds["min_runup_pct"]
-            reclaim_buffer_pct = retry_thresholds["reclaim_buffer_pct"]
-            min_score = retry_thresholds["min_score"]
-            min_change_rate = retry_thresholds["min_change_rate"]
-
-        if self._is_loss_stage_active() and not self._is_neutral_post_loss_retry_available():
-            min_pullback_drop_pct += float(self.cfg.stage1_neutral_min_drop_bonus_pct)
-            min_runup_from_open_pct += float(self.cfg.stage1_neutral_min_runup_bonus_pct)
-            reclaim_buffer_pct += float(self.cfg.stage1_neutral_reclaim_buffer_bonus_pct)
-            min_score += float(self.cfg.stage1_neutral_score_bonus)
-            min_change_rate += float(self.cfg.stage1_neutral_change_rate_bonus)
-            leader_turnover_rank_limit = min(
-                int(leader_turnover_rank_limit or self.cfg.neutral_leader_top_n),
-                int(self.cfg.stage1_neutral_max_turnover_rank),
-            )
-            leader_reclaim_tick_limit = min(
-                int(leader_reclaim_tick_limit or self.cfg.neutral_leader_max_reclaim_ticks),
-                int(self.cfg.stage1_neutral_max_reclaim_ticks),
-            )
-            leader_relative_strength_bonus_pp += 0.10
-
-        if runup_from_open < min_runup_from_open_pct:
-            return False, "", "pullback_missing"
-        if not pullback_window:
-            if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
-                return False, "", "neutral_chase_block"
-            return False, "", "pullback_missing"
-        if len(pullback_window) < min_pullback_ticks:
-            if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
-                return False, "", "neutral_chase_block"
-            return False, "", "pullback_missing"
-
-        pullback_low = min(pullback_window)
-        pullback_drop = self._loss_pct(local_high, pullback_low)
-        if pullback_drop < min_pullback_drop_pct:
-            if proximity_to_day_high <= self.cfg.neutral_chase_block_proximity_pct:
-                return False, "", "neutral_chase_block"
-            return False, "", "pullback_missing"
-        if pullback_drop > self.cfg.neutral_pullback_max_drop_pct:
-            return False, "", "pullback_broken"
-        if self._pct_move(quote.open_price, quote.current_price) <= 0:
-            soft_override, soft_meta = self._math_soft_override_allowed(
-                quote,
-                strategy_name="neutral_pullback_strategy",
-                regime_label="neutral",
-                reject_reason="neutral_non_leader",
-            )
-            if not soft_override:
-                return False, "", "neutral_non_leader"
-            soft_override_payload = f" math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'neutral_non_leader')}"
-        else:
-            soft_override_payload = ""
-
-        pullback_low_idx = local_high_idx + 1 + min(
-            range(len(pullback_window)),
-            key=lambda idx: pullback_window[idx],
-        )
-        reclaim_speed_ticks = max(1, (len(history) - 1) - pullback_low_idx)
-        if self.cfg.enable_neutral_leader_filter:
-            leader_ok, leader_reject = self._passes_neutral_leader_filter(
-                quote,
-                reclaim_speed_ticks=reclaim_speed_ticks,
-                max_turnover_rank=leader_turnover_rank_limit,
-                max_reclaim_ticks=leader_reclaim_tick_limit,
-                relative_strength_bonus_pp=leader_relative_strength_bonus_pp,
-            )
-            if not leader_ok:
-                return False, "", leader_reject
-
-        reclaim_level = int(round(local_high * (1 + reclaim_buffer_pct / 100)))
-        if quote.current_price < reclaim_level:
-            return False, "", "reclaim_failed"
-        if score < min_score:
-            return False, "", "neutral_score"
-        if quote.change_rate < min_change_rate:
-            return False, "", "neutral_change_rate"
-        if not self._is_volume_spike(quote, score=score):
-            soft_override, soft_meta = self._math_soft_override_allowed(
-                quote,
-                strategy_name="neutral_pullback_strategy",
-                regime_label="neutral",
-                reject_reason="neutral_volume",
-            )
-            if not soft_override:
-                return False, "", "neutral_volume"
-            soft_override_payload = f"{soft_override_payload} math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'neutral_volume')}".strip()
-
-        reason = (
-            f"setup_name=neutral_pullback_reclaim entry_reason=pullback_reclaim "
-            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f} "
-            f"reclaim_speed_ticks={reclaim_speed_ticks}{(' ' + soft_override_payload.strip()) if soft_override_payload.strip() else ''}"
-        )
-        return True, "neutral_pullback_reclaim", reason
-
-    def _passes_soft_bear_inverse_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
-        if self._resolve_regime_profile_name() != "soft_bear":
-            return False, "", "soft_bear_only"
-        if quote.symbol not in self._inverse_symbols:
-            return False, "", "soft_bear_inverse_only"
-        history = self._get_recent_quotes(quote.symbol)
-        if len(history) < 4:
-            return False, "", "soft_bear_pullback_missing"
-        if quote.current_price <= 0 or quote.open_price <= 0:
-            return False, "", "soft_bear_pullback_missing"
-
-        prices = [item.current_price for item in history[:-1]]
-        if not prices:
-            return False, "", "soft_bear_pullback_missing"
-
-        local_high = max(prices)
-        local_high_idx = max(idx for idx, price in enumerate(prices) if price == local_high)
-        pullback_window = prices[local_high_idx + 1:]
-        if not pullback_window:
-            return False, "", "soft_bear_pullback_missing"
-
-        runup_from_open = self._pct_move(quote.open_price, local_high)
-        if runup_from_open < self.cfg.soft_bear_inverse_min_runup_pct:
-            return False, "", "soft_bear_runup_missing"
-
-        pullback_low = min(pullback_window)
-        pullback_drop = self._loss_pct(local_high, pullback_low)
-        if pullback_drop < self.cfg.soft_bear_inverse_min_drop_pct:
-            return False, "", "soft_bear_pullback_missing"
-        if pullback_drop > self.cfg.soft_bear_inverse_max_drop_pct:
-            return False, "", "soft_bear_pullback_missing"
-
-        reclaim_level = int(round(local_high * (1 + self.cfg.soft_bear_inverse_reclaim_buffer_pct / 100)))
-        if quote.current_price < reclaim_level:
-            return False, "", "soft_bear_reclaim_failed"
-        if quote.change_rate < self.cfg.soft_bear_inverse_min_change_rate:
-            return False, "", "soft_bear_runup_missing"
-        if score < self.cfg.soft_bear_inverse_min_momentum:
-            return False, "", "soft_bear_runup_missing"
-        if not self._is_volume_spike(quote, score=score):
-            soft_override, soft_meta = self._math_soft_override_allowed(
-                quote,
-                strategy_name="soft_bear_inverse_strategy",
-                regime_label="soft_bear",
-                reject_reason="soft_bear_volume_failed",
-                is_inverse=True,
-            )
-            if not soft_override:
-                return False, "", "soft_bear_volume_failed"
-            soft_override_payload = f" math_soft_override_reason={soft_meta.get('math_soft_override_reason', 'soft_bear_volume_failed')}"
-        else:
-            soft_override_payload = ""
-
-        reason = (
-            f"setup_name=soft_bear_inverse_breakdown entry_reason=weak_rebound_failure "
-            f"local_high={local_high} reclaim_level={reclaim_level} drop_pct={pullback_drop:.2f}{soft_override_payload}"
-        )
-        return True, "soft_bear_inverse_breakdown", reason
-
-    def _passes_hard_bear_inverse_setup(self, quote: Quote, score: float) -> tuple[bool, str, str]:
-        if self._resolve_regime_profile_name() != "bear":
-            return False, "", "bear_only"
-        min_change_rate = self._regime_inverse_min_change_rate()
-        min_momentum = self._regime_inverse_min_momentum()
-        if self._is_loss_stage_active():
-            min_change_rate += self.cfg.stage1_inverse_change_bonus
-            min_momentum += self.cfg.stage1_inverse_score_bonus
-        if quote.change_rate < min_change_rate:
-            return False, "", "bear_inverse_change_rate"
-        if score < min_momentum:
-            return False, "", "bear_inverse_score"
-        if not self._is_volume_spike(quote, score=score):
-            return False, "", "bear_inverse_volume"
-
-        payload = (
-            "setup_name=hard_bear_inverse_momentum "
-            f"entry_reason=bear_momentum score={score:.2f}"
-        )
-        return True, "hard_bear_inverse_momentum", payload
+        self._session_start_at = now.replace(hour=9, minute=0, second=0, microsecond=0)
 
     def initialize(self):
-        today = self._today()
-        self._state_loaded_for_today = False
-        self._daily_breaker_pnl_offset = 0
+        if self._active_day != self._today():
+            self._reset_for_new_day()
+        elif self._session_start_at is None:
+            now = self._now()
+            self._session_start_at = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        self._load_entry_ev_data()
         self._load_daily_state()
-        self._load_strategy_gates()
-        self._load_math_shadow_inputs()
-        if self._halted and self._halt_date == today and self.cfg.allow_hard_stop_bypass_for_day:
-            logger.warning(
-                "당일 하드스탑 플래그 복구 무시(임시 모드): 오늘 전일 누적손실이 있어도 재개합니다."
-            )
-            self._halted = False
-            self._halt_date = None
-            self._hard_stop_bypass_for_day = True
-        if self._current_day != today:
-            self.daily_pnl = DailyPnL()
-            self._halted = False
-            self._halt_date = None
-            self._sell_cooldown = {}
-            self._symbol_cooldown_until = {}
-            self._strategy_cooldown_until = {}
-            self._startup_rebalance_active = False
-            self._startup_rebalance_ticks = 0
-            self._market_data_ready_for_entries = self.market_data is None
-            self._market_data_ready_streak = 0
-            self._market_data_readiness_reason = ""
-            self._last_market_data_wait_log_at = None
-            self._leader_support_bull_bias_active = False
-            self._last_cumulative_volumes = {}
-            self._entry_filter_log_cache = {}
-            self._daily_breaker_pnl_offset = 0
-            self._loaded_position_meta = {}
-            self._recent_quotes = {}
-            self._risk_stage_label = "normal"
-            self._pending_entry_meta = {}
-            self._neutral_loss_count_today = 0
-            self._neutral_last_loss_at = None
-            self._neutral_post_loss_reentries_today = 0
-            self._bull_loss_count_today = 0
-            self._bull_last_loss_at = None
-            self._shadow_blocked_candidates = {}
-            self._latest_direct_dynamic_symbols = set()
-            self._latest_strong_leader_symbols = set()
-            self._latest_strong_leader_snapshot = {}
-            self._latest_math_leader_signals = {}
-            self._latest_math_queue_symbols = []
-            self._latest_math_backfill_symbols = []
-            self._latest_legacy_backfill_symbols = []
-            self._latest_math_queue_source = {}
-            self._latest_regime_probabilities = RegimeProbabilities(
-                bull_prob=0.25,
-                neutral_prob=0.25,
-                soft_bear_prob=0.25,
-                bear_prob=0.25,
-            )
-        elif self._state_loaded_for_today and not self.cfg.use_restored_pnl_for_daily_breaker:
-            restored_pnl = int(self.daily_pnl.realized_net_pnl)
-            if restored_pnl != 0 or self.daily_pnl.trade_count > 0:
-                self._daily_breaker_pnl_offset = restored_pnl
-                logger.warning(
-                    "재시작 복구 손익은 브레이커 기준에서 제외합니다 "
-                    "(복구 순실현=%s원, 복구 매매=%d건, 브레이커 시작값=0원).",
-                    f"{restored_pnl:,}",
-                    self.daily_pnl.trade_count,
-                )
-        self._recent_tick_volumes = {}
-        self._latest_tick_volumes = {}
-        self._recent_quotes = {}
-        self._shadow_blocked_candidates = {}
-        self._current_day = today
-        self._session_start_at = None
-        self._build_pool()
-        self._refresh_math_leader_signals()
-        self._check_market_regime()
-        regime_profile = self._build_regime_profile()
-        self._log_regime_profiles()
-        total_loss_limit = regime_profile["daily_total_loss_limit"]
-        capital_base = self._allocation_capital_base()
-        target_total_exposure = self._regime_target_total_exposure_amount()
-        max_single_position_amount = self._regime_max_single_position_amount()
-        target_long_slot_budget = int(
-            target_total_exposure / max(1, self._effective_max_position_count())
-        )
-        blocked_windows = ", ".join(
-            label for _, _, label in self._entry_block_windows
-        ) if self._entry_block_windows else "없음"
+        self._update_daily_breakers()
 
-        if self._halted and self._halt_date == today:
-            logger.info("당일 하드스탑 상태 유지: 신규 거래 중지")
-            if self._hard_stop_bypass_for_day:
-                logger.info("당일 하드스탑 우회 모드가 적용되어 거래를 계속 진행합니다.")
+    def get_watchlist(self) -> List[str]:
+        symbols = list(self.pool_override or self._pool or self.config.static_watchlist or DEFAULT_STATIC_WATCHLIST)
+        symbols.extend(self.config.inverse_etfs or DEFAULT_INVERSE_ETFS)
+        seen = set()
+        ordered: List[str] = []
+        for symbol in symbols:
+            normalized = str(symbol or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered
 
-        logger.info("전략 초기화: 모멘텀 스캘핑")
-        if self.market_data is not None:
-            logger.info(
-                "  시작 워밍업: 시장 데이터 준비 후 신규 진입 허용 (%d틱 연속, 유효 시세 최소 %d개)",
-                max(1, int(self.cfg.startup_market_data_ready_ticks)),
-                max(1, int(self.cfg.startup_market_data_min_valid_quote_count)),
-            )
-        logger.info("  시드: %s원, 기준자본: %s원, 기본 종목당: %s원",
-                     f"{self.cfg.seed_money:,}", f"{capital_base:,}", f"{self.cfg.per_stock_amount:,}")
-        logger.info("  최대 동시 보유 수: %d종목", self._effective_max_position_count())
-        logger.info("  익절: +%.1f%%, 개별손절: %s원, 추적손절: %.1f%%",
-                     regime_profile["take_profit_pct"],
-                     f"{regime_profile['per_position_stop_loss']:,}",
-                     regime_profile["trailing_stop_pct"])
-        logger.info("  일일 목표(순실현): +%s원, 최대손실(순실현): %s원",
-                     f"{regime_profile['daily_profit_target']:,}",
-                     f"{regime_profile['daily_loss_limit']:,}")
-        if self.cfg.enable_expected_net_filter:
-            logger.info(
-                "  진입 필터: 기대상승 %.2f%%, 최소 기대순익 %s원, 최소 RR %.2f",
-                regime_profile["expected_move_pct"],
-                f"{regime_profile['min_expected_net_profit']:,}",
-                regime_profile["min_expected_rr_ratio"],
-            )
-        if self.cfg.enable_unrealized_loss_guard:
-            logger.info("  보조손실컷(순손익추정): %s원", f"{total_loss_limit:,}")
-        if self._entry_block_windows:
-            logger.info("  신규 진입 차단 시간대: %s", blocked_windows)
-            if self.cfg.enable_dynamic_entry_block_windows:
-                logger.info(
-                    "  신규 진입 차단 시간대 자동해제: 약세점수 %d 이상",
-                    self.cfg.dynamic_entry_block_disable_bear_score,
-                )
-        logger.info(
-            "  오늘 적용값 요약: 총노출 %s원(%.0f%%), 종목당 목표 %s원, 종목당 최대 %s원(%.0f%%), "
-            "개별손절 %s원, 일손실한도 %s원, 보조손실컷 %s원, 진입임계(점수 %.2f/등락률 %.2f%%/최소가 %s원), 차단시간 [%s]",
-            f"{target_total_exposure:,}",
-            regime_profile["capital_utilization_pct"] * 100,
-            f"{target_long_slot_budget:,}",
-            f"{max_single_position_amount:,}",
-            regime_profile["max_single_position_pct"] * 100,
-            f"{regime_profile['per_position_stop_loss']:,}",
-            f"{regime_profile['daily_loss_limit']:,}",
-            f"{total_loss_limit:,}",
-            regime_profile["min_momentum_score"],
-            regime_profile["min_change_rate"],
-            f"{self.cfg.min_price:,}",
-            blocked_windows,
-        )
-        if self.cfg.enable_pullback_entry_filter:
-            logger.info(
-                "  눌림목 필터: 등락률 %.2f%% 이상은 고점대비 조정 %.2f%%~%.2f%% + 시가대비 %.2f%% 이상에서만 신규진입",
-                self.cfg.pullback_activation_change_rate,
-                self.cfg.pullback_required_min_drop_pct,
-                self.cfg.pullback_allowed_max_drop_pct,
-                self.cfg.pullback_min_vs_open_pct,
-            )
-        if self.cfg.enable_volume_spike_filter:
-            logger.info(
-                "  거래량 스파이크 게이트: 최근 %d개 대비 %.1fx~%.1fx + 최소 1틱 %d주",
-                self.cfg.volume_spike_min_history,
-                regime_profile["volume_spike_ratio"],
-                regime_profile["volume_spike_ratio_min"],
-                regime_profile["volume_spike_abs_min"],
-            )
-        logger.info("  레짐 프로파일: %s (현재 약세점수=%d)", self._regime_profile_name, self._bear_score)
-        logger.info(
-            "  레짐 조정: min_change=%s, min점수=%s, 익절=%s%%, 손절=%s원, 추적손절=%s%%, 최대보유=%d분",
-            f"{regime_profile['min_change_rate']:.2f}",
-            f"{regime_profile['min_momentum_score']:.2f}",
-            f"{regime_profile['take_profit_pct']:.2f}",
-            f"{regime_profile['per_position_stop_loss']:,}",
-            f"{regime_profile['trailing_stop_pct']:.2f}",
-            regime_profile["max_position_holding_minutes"],
-        )
-        logger.info("  시장 레짐: 약세점수=%d (모드: %s)",
-                     self._bear_score, self.cfg.bear_market_mode)
-        if self.cfg.inverse_enabled:
-            logger.info("  인버스: 활성화 (임계=%d, 최대%d종목)",
-                         self.cfg.bearish_threshold, self._regime_inverse_max_positions())
-            logger.info(
-                "  인버스 진입 강화: 약세점수≥%d, 등락률≥%.2f%%, 모멘텀≥%.2f, "
-                "추적손절 발동이익≥%.2f%%, 거래량스파이크 완화=-%.2f",
-                max(self.cfg.bearish_threshold, self._regime_inverse_min_bear_score()),
-                self._regime_inverse_min_change_rate(),
-                self._regime_inverse_min_momentum(),
-                self._regime_inverse_trailing_stop_activation_gain_pct(),
-                self.cfg.inverse_volume_spike_ratio_offset,
-            )
-        logger.info("  풀 크기: %d종목", len(self._pool))
-
-    def _log_regime_profiles(self):
-        capital_base = self._allocation_capital_base()
-        bull_profile = self._build_regime_profile(profile_name="bull")
-        neutral_profile = self._build_regime_profile(profile_name="neutral")
-        soft_bear_profile = self._build_regime_profile(profile_name="soft_bear")
-        bear_profile = self._build_regime_profile(profile_name="bear")
-        logger.info("레짐 프로파일 비교표 (활성=%s)", self._regime_profile_name)
-        logger.info(
-            "  [강세] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
-            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
-            f"{int(capital_base * bull_profile['capital_utilization_pct']):,}",
-            f"{int(capital_base * bull_profile['max_single_position_pct']):,}",
-            f"{bull_profile['take_profit_pct']:.2f}",
-            f"{bull_profile['per_position_stop_loss']:,}",
-            f"{bull_profile['trailing_stop_pct']:.2f}",
-            bull_profile["max_position_holding_minutes"],
-            f"{bull_profile['inverse_take_profit_pct']:.2f}",
-            f"{bull_profile['inverse_stop_loss_pct']:.2f}",
-            f"{bull_profile['inverse_trailing_stop_pct']:.2f}",
-            bull_profile["inverse_max_hold_minutes"],
-        )
-        logger.info(
-            "  [중립] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
-            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
-            f"{int(capital_base * neutral_profile['capital_utilization_pct']):,}",
-            f"{int(capital_base * neutral_profile['max_single_position_pct']):,}",
-            f"{neutral_profile['take_profit_pct']:.2f}",
-            f"{neutral_profile['per_position_stop_loss']:,}",
-            f"{neutral_profile['trailing_stop_pct']:.2f}",
-            neutral_profile["max_position_holding_minutes"],
-            f"{neutral_profile['inverse_take_profit_pct']:.2f}",
-            f"{neutral_profile['inverse_stop_loss_pct']:.2f}",
-            f"{neutral_profile['inverse_trailing_stop_pct']:.2f}",
-            neutral_profile["inverse_max_hold_minutes"],
-        )
-        logger.info(
-            "  [완만약세] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
-            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
-            f"{int(capital_base * soft_bear_profile['capital_utilization_pct']):,}",
-            f"{int(capital_base * soft_bear_profile['max_single_position_pct']):,}",
-            f"{soft_bear_profile['take_profit_pct']:.2f}",
-            f"{soft_bear_profile['per_position_stop_loss']:,}",
-            f"{soft_bear_profile['trailing_stop_pct']:.2f}",
-            soft_bear_profile["max_position_holding_minutes"],
-            f"{soft_bear_profile['inverse_take_profit_pct']:.2f}",
-            f"{soft_bear_profile['inverse_stop_loss_pct']:.2f}",
-            f"{soft_bear_profile['inverse_trailing_stop_pct']:.2f}",
-            soft_bear_profile["inverse_max_hold_minutes"],
-        )
-        logger.info(
-            "  [약세] long 예산=%s원/%s원 익절=%s%% 손절=%s원 추적=%s%% 보유=%d분 / "
-            "inv 익절=%s%% inv손절=%s%% inv추적=%s%% inv보유=%d분",
-            f"{int(capital_base * bear_profile['capital_utilization_pct']):,}",
-            f"{int(capital_base * bear_profile['max_single_position_pct']):,}",
-            f"{bear_profile['take_profit_pct']:.2f}",
-            f"{bear_profile['per_position_stop_loss']:,}",
-            f"{bear_profile['trailing_stop_pct']:.2f}",
-            bear_profile["max_position_holding_minutes"],
-            f"{bear_profile['inverse_take_profit_pct']:.2f}",
-            f"{bear_profile['inverse_stop_loss_pct']:.2f}",
-            f"{bear_profile['inverse_trailing_stop_pct']:.2f}",
-            bear_profile["inverse_max_hold_minutes"],
-        )
-
-    def _load_daily_state(self):
-        if not self._state_path:
+    def update_runtime_pool(self, symbols: List[str]):
+        if self.pool_override:
             return
+        dynamic_limit = max(1, int(self.config.dynamic_pool_size))
+        static_core_limit = min(10, max(4, dynamic_limit // 2))
+        runtime_symbols = list(symbols or [])[:dynamic_limit]
+        runtime_symbols.extend(list(self.config.static_watchlist or DEFAULT_STATIC_WATCHLIST)[:static_core_limit])
+        seen = set()
+        ordered: List[str] = []
+        for symbol in runtime_symbols:
+            normalized = str(symbol or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        if ordered and ordered != self._pool:
+            self._pool = ordered
+            self._save_daily_state_if_due(min_interval_seconds=10)
+
+    def load_avg_volumes(self, avg_volumes: Dict[str, int]):
+        self._avg_volumes = {
+            str(symbol): int(volume)
+            for symbol, volume in (avg_volumes or {}).items()
+            if int(volume or 0) > 0
+        }
+
+    def should_continue(self) -> bool:
+        return not self._halted
+
+    # ------------------------------------------------------------------
+    # 상태 저장 / 복구
+    # ------------------------------------------------------------------
+    def _daily_state_path(self) -> Path:
+        return Path(self.config.daily_state_path)
+
+    @staticmethod
+    def _serialize_datetime(value: Optional[datetime]) -> str:
+        return value.isoformat() if isinstance(value, datetime) else ""
+
+    @staticmethod
+    def _deserialize_datetime(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
         try:
-            self._loaded_position_meta = {}
-            if not self._state_path.exists():
-                return
-            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
-            raw_date = payload.get("date")
-            if not raw_date:
-                return
+            return datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
 
-            state_day = datetime.strptime(raw_date, "%Y-%m-%d").date()
-            if state_day != self._today():
-                return
+    def _serialize_datetime_map(self, items: Dict[str, datetime]) -> Dict[str, str]:
+        serialized: Dict[str, str] = {}
+        now = self._now()
+        for key, value in (items or {}).items():
+            if not isinstance(value, datetime) or value <= now:
+                continue
+            normalized = str(key or "").strip()
+            if not normalized:
+                continue
+            serialized[normalized] = value.isoformat()
+        return serialized
 
-            self._current_day = state_day
-            self.daily_pnl = DailyPnL(
-                realized_gross_pnl=payload.get("realized_gross_pnl", 0),
-                realized_net_pnl=payload.get("realized_net_pnl", 0),
-                fees_paid=payload.get("fees_paid", 0),
-                taxes_paid=payload.get("taxes_paid", 0),
-                trade_count=payload.get("trade_count", 0),
-                win_count=payload.get("win_count", 0),
-                loss_count=payload.get("loss_count", 0),
-                breakeven_count=payload.get("breakeven_count", 0),
-                winning_net_pnl_sum=payload.get("winning_net_pnl_sum", 0),
-                losing_net_pnl_sum=payload.get("losing_net_pnl_sum", 0),
-                largest_win_net=payload.get("largest_win_net", 0),
-                largest_loss_net=payload.get("largest_loss_net", 0),
+    def _deserialize_datetime_map(self, items: Dict[str, Any]) -> Dict[str, datetime]:
+        restored: Dict[str, datetime] = {}
+        now = self._now()
+        for key, raw_value in (items or {}).items():
+            normalized = str(key or "").strip()
+            parsed = self._deserialize_datetime(raw_value)
+            if not normalized or parsed is None or parsed <= now:
+                continue
+            restored[normalized] = parsed
+        return restored
+
+    @staticmethod
+    def _daily_pnl_snapshot_fields() -> Tuple[str, ...]:
+        return DAILY_PNL_SNAPSHOT_FIELDS
+
+    def _empty_daily_pnl_snapshot(self) -> Dict[str, int]:
+        return empty_daily_pnl_snapshot()
+
+    def _capture_daily_pnl_snapshot(self) -> Dict[str, int]:
+        snapshot = {
+            field: int(getattr(self.daily_pnl, field, 0) or 0)
+            for field in self._daily_pnl_snapshot_fields()
+        }
+        snapshot["breaker_excluded_realized_net_pnl"] = int(self._breaker_excluded_realized_net_pnl or 0)
+        return snapshot
+
+    def _apply_daily_pnl_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        resolved = dict(snapshot or {})
+        for field in self._daily_pnl_snapshot_fields():
+            setattr(self.daily_pnl, field, int(resolved.get(field, 0) or 0))
+        self._breaker_excluded_realized_net_pnl = int(
+            resolved.get("breaker_excluded_realized_net_pnl", 0) or 0
+        )
+
+    def _rebuild_daily_pnl_from_ledgers(self) -> None:
+        snapshot = rebuild_daily_pnl_snapshot_from_ledgers(
+            seed_snapshot=self._ledger_seed_snapshot or self._empty_daily_pnl_snapshot(),
+            sell_fill_ledger=self._sell_fill_ledger,
+            closed_trade_ledger=self._closed_trade_ledger,
+        )
+        self._apply_daily_pnl_snapshot(snapshot)
+
+    def _make_trade_key(self, symbol: str, timestamp: Optional[datetime] = None) -> str:
+        moment = timestamp or self._now()
+        return f"{str(symbol or '').strip()}:{moment.isoformat(timespec='seconds')}"
+
+    def _make_sell_fill_id(self, result: OrderResult) -> str:
+        order_no = str(getattr(result, "order_no", "") or "").strip()
+        if order_no:
+            return order_no
+        symbol = str(getattr(result, "symbol", "") or "").strip() or "unknown"
+        stamp = self._serialize_datetime(getattr(result, "timestamp", None) or self._now())
+        return f"{symbol}:{stamp}:{len(self._sell_fill_ledger) + 1}"
+
+    def _upsert_closed_trade_record(
+        self,
+        *,
+        trade_key: str,
+        symbol: str,
+        strategy_name: str,
+        setup_name: str,
+    ) -> None:
+        normalized_trade_key = str(trade_key or "").strip()
+        if not normalized_trade_key:
+            return
+        fills = [
+            entry
+            for entry in self._sell_fill_ledger
+            if str(entry.get("trade_key", "") or "").strip() == normalized_trade_key
+        ]
+        if not fills:
+            self._closed_trade_ledger.pop(normalized_trade_key, None)
+            return
+        self._closed_trade_ledger[normalized_trade_key] = {
+            "trade_key": normalized_trade_key,
+            "symbol": str(symbol or "").strip(),
+            "strategy_name": str(strategy_name or "").strip(),
+            "setup_name": str(setup_name or "").strip(),
+            "net_pnl": sum(int(entry.get("net_pnl", 0) or 0) for entry in fills),
+        }
+
+    def _append_sell_fill_record(
+        self,
+        *,
+        result: OrderResult,
+        position: PositionState,
+        quantity: int,
+        sell_price: int,
+        gross_pnl: int,
+        net_pnl: int,
+        fees: int,
+        taxes: int,
+        count_as_closed_trade: bool,
+        counts_for_daily_breaker: bool,
+        price_estimated: bool,
+    ) -> None:
+        trade_key = str(getattr(position, "trade_key", "") or "").strip() or self._make_trade_key(position.symbol, position.buy_time)
+        self._sell_fill_ledger.append(
+            {
+                "fill_id": self._make_sell_fill_id(result),
+                "order_no": str(getattr(result, "order_no", "") or "").strip(),
+                "symbol": str(position.symbol or "").strip(),
+                "trade_key": trade_key,
+                "quantity": int(quantity or 0),
+                "buy_price": int(position.buy_price or 0),
+                "sell_price": int(sell_price or 0),
+                "gross_pnl": int(gross_pnl or 0),
+                "net_pnl": int(net_pnl or 0),
+                "fees": int(fees or 0),
+                "taxes": int(taxes or 0),
+                "counts_for_daily_breaker": bool(counts_for_daily_breaker),
+                "count_as_closed_trade": bool(count_as_closed_trade),
+                "price_estimated": bool(price_estimated),
+                "fill_mode": str(getattr(result, "fill_mode", "") or ""),
+                "timestamp": self._serialize_datetime(getattr(result, "timestamp", None) or self._now()),
+                "requested_reason": str(getattr(result, "requested_reason", "") or ""),
+                "entry_strategy_name": str(getattr(position, "entry_strategy_name", "") or ""),
+                "entry_setup_name": str(getattr(position, "entry_setup_name", "") or ""),
+                "entry_queue_source": str(getattr(position, "queue_source", "") or ""),
+                "entry_is_restored": bool(getattr(position, "is_restored", False)),
+                "entry_reason": str(getattr(position, "entry_reason", "") or ""),
+                "entry_grade": str(getattr(position, "entry_grade", "") or ""),
+                "entry_grade_math": str(getattr(position, "entry_grade_math", "") or ""),
+                "entry_ev": float(getattr(position, "entry_ev", 0.0) or 0.0),
+                "entry_ev_confidence": str(getattr(position, "entry_ev_confidence", "") or ""),
+                "conviction_tier": str(getattr(position, "conviction_tier", "") or ""),
+                "bull_risk_mode": str(getattr(position, "bull_risk_mode", "") or ""),
+                "post_loss_admission_class": str(getattr(position, "post_loss_admission_class", "") or ""),
+                "candidate_class": str(getattr(position, "candidate_class", "") or ""),
+                "execution_mode": str(getattr(position, "execution_mode", "") or ""),
+                "live_route": str(getattr(position, "live_route", "") or ""),
+                "size_multiplier": float(getattr(position, "size_multiplier", 1.0) or 1.0),
+                "conviction_score": float(getattr(position, "conviction_score", 0.0) or 0.0),
+                "conviction_rank": int(getattr(position, "conviction_rank", 0) or 0),
+                "planned_target_net_pnl": int(getattr(position, "planned_target_net_pnl", 0) or 0),
+                "planned_stop_net_loss_abs": int(getattr(position, "planned_stop_net_loss_abs", 0) or 0),
+                "planned_risk_net_loss_abs": int(getattr(position, "planned_risk_net_loss_abs", 0) or 0),
+                "entry_expected_net_pnl": float(getattr(position, "entry_expected_net_pnl", 0.0) or 0.0),
+                "entry_prediction_net_pnl": int(getattr(position, "entry_prediction_net_pnl", 0) or 0),
+                "entry_prediction_lower_net_pnl": int(getattr(position, "entry_prediction_lower_net_pnl", 0) or 0),
+                "entry_prediction_win_probability": float(
+                    getattr(position, "entry_prediction_win_probability", 0.0) or 0.0
+                ),
+            }
+        )
+        if count_as_closed_trade:
+            self._upsert_closed_trade_record(
+                trade_key=trade_key,
+                symbol=position.symbol,
+                strategy_name=position.entry_strategy_name,
+                setup_name=position.entry_setup_name,
             )
-            self._neutral_loss_count_today = int(payload.get("neutral_loss_count", 0) or 0)
-            self._neutral_post_loss_reentries_today = int(payload.get("neutral_post_loss_reentries", 0) or 0)
-            self._neutral_last_loss_at = self._parse_state_datetime(payload.get("neutral_last_loss_at"))
-            self._bull_loss_count_today = int(payload.get("bull_loss_count", 0) or 0)
-            self._bull_last_loss_at = self._parse_state_datetime(payload.get("bull_last_loss_at"))
-            raw_halt_date = payload.get("halt_date")
-            if isinstance(raw_halt_date, str):
-                try:
-                    self._halt_date = datetime.strptime(raw_halt_date, "%Y-%m-%d").date()
-                except ValueError:
-                    self._halt_date = None
-            else:
-                self._halt_date = None
-            self._halted = bool(payload.get("halted", False))
-            raw_positions = payload.get("open_positions")
-            if isinstance(raw_positions, dict):
-                self._loaded_position_meta = raw_positions
-            self._state_loaded_for_today = True
-            logger.info(
-                "일일 상태 복구 완료: %s (누적실현=%s원, 매매=%d건)",
-                raw_date,
-                f"{self.daily_pnl.realized_net_pnl:,}",
-                self.daily_pnl.trade_count,
+        self._rebuild_daily_pnl_from_ledgers()
+
+    def confirm_reconciled_sell_fills(self, account_api, *, results: Optional[List[OrderResult]] = None) -> List[Dict[str, Any]]:
+        pending_entries = [
+            entry
+            for entry in self._sell_fill_ledger
+            if bool(entry.get("price_estimated"))
+            and str(entry.get("order_no", "") or "").strip()
+        ]
+        if not pending_entries or account_api is None:
+            return []
+
+        history = account_api.get_order_history(
+            self._today(),
+            self._today(),
+            side="01",
+        )
+        if getattr(history, "empty", True):
+            return []
+
+        fill_rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in history.to_dict("records"):
+            if not isinstance(row, dict):
+                continue
+            order_no = str(row.get("odno", "") or "").strip()
+            symbol = str(row.get("pdno", "") or "").strip()
+            if not order_no or not symbol:
+                continue
+            qty = account_api._coerce_int(row.get("tot_ccld_qty")) or 0
+            price = account_api._coerce_int(row.get("avg_prvs")) or 0
+            if qty > 0 and price <= 0:
+                total_amt = account_api._coerce_int(row.get("tot_ccld_amt")) or 0
+                if total_amt > 0:
+                    price = int(round(total_amt / qty))
+            if qty <= 0 or price <= 0:
+                continue
+            key = (order_no, symbol)
+            existing = fill_rows.get(key)
+            existing_qty = account_api._coerce_int(existing.get("tot_ccld_qty")) if isinstance(existing, dict) else 0
+            if existing is None or qty >= existing_qty:
+                normalized = dict(row)
+                normalized["_resolved_qty"] = qty
+                normalized["_resolved_price"] = price
+                fill_rows[key] = normalized
+
+        corrections: List[Dict[str, Any]] = []
+        result_by_key: Dict[Tuple[str, str], OrderResult] = {}
+        for result in results or []:
+            result_key = (
+                str(getattr(result, "order_no", "") or "").strip(),
+                str(getattr(result, "symbol", "") or "").strip(),
             )
-        except Exception as e:
-            logger.warning("일일 상태 복구 실패(무시): %s", e)
+            if result_key[0] and result_key[1]:
+                result_by_key[result_key] = result
+
+        for entry in pending_entries:
+            key = (
+                str(entry.get("order_no", "") or "").strip(),
+                str(entry.get("symbol", "") or "").strip(),
+            )
+            row = fill_rows.get(key)
+            if row is None:
+                continue
+            correction = self.correct_reconciled_sell_fill(
+                fill_id=str(entry.get("fill_id", "") or ""),
+                order_no=key[0],
+                symbol=key[1],
+                confirmed_quantity=int(row.get("_resolved_qty", 0) or 0),
+                confirmed_price=int(row.get("_resolved_price", 0) or 0),
+            )
+            if not correction:
+                continue
+            matched_result = result_by_key.get(key)
+            if matched_result is not None:
+                matched_result.quantity = int(correction.get("quantity", matched_result.quantity) or matched_result.quantity)
+                matched_result.price = int(correction.get("corrected_price", matched_result.price) or matched_result.price)
+                matched_result.fill_mode = "account_reconciled_confirmed"
+            corrections.append(correction)
+        return corrections
+
+    def correct_reconciled_sell_fill(
+        self,
+        *,
+        fill_id: str,
+        order_no: str,
+        symbol: str,
+        confirmed_quantity: int,
+        confirmed_price: int,
+    ) -> Optional[Dict[str, Any]]:
+        resolved_fill_id = str(fill_id or "").strip()
+        resolved_order_no = str(order_no or "").strip()
+        resolved_symbol = str(symbol or "").strip()
+        if confirmed_quantity <= 0 or confirmed_price <= 0:
+            return None
+
+        entry = None
+        for candidate in self._sell_fill_ledger:
+            candidate_fill_id = str(candidate.get("fill_id", "") or "").strip()
+            candidate_order_no = str(candidate.get("order_no", "") or "").strip()
+            candidate_symbol = str(candidate.get("symbol", "") or "").strip()
+            if resolved_fill_id and candidate_fill_id == resolved_fill_id:
+                entry = candidate
+                break
+            if resolved_order_no and candidate_order_no == resolved_order_no and candidate_symbol == resolved_symbol:
+                entry = candidate
+                break
+        if entry is None or not bool(entry.get("price_estimated")):
+            return None
+
+        previous_qty = int(entry.get("quantity", 0) or 0)
+        if previous_qty <= 0 or confirmed_quantity != previous_qty:
+            return None
+
+        previous_price = int(entry.get("sell_price", 0) or 0)
+        if confirmed_price == previous_price:
+            entry["price_estimated"] = False
+            entry["fill_mode"] = "account_reconciled_confirmed"
+            self._rebuild_daily_pnl_from_ledgers()
+            self._update_daily_breakers()
+            self._save_daily_state()
+            return None
+
+        quantity = previous_qty
+        buy_price = int(entry.get("buy_price", 0) or 0)
+        previous_net_pnl = int(entry.get("net_pnl", 0) or 0)
+        previous_gross_pnl = int(entry.get("gross_pnl", 0) or 0)
+        previous_fees = int(entry.get("fees", 0) or 0)
+        previous_taxes = int(entry.get("taxes", 0) or 0)
+        corrected_pnl = calculate_trade_pnl_from_prices(
+            entry_price=buy_price,
+            exit_price=confirmed_price,
+            quantity=quantity,
+            commission_rate=float(self.config.commission_rate),
+            tax_slippage_rate=float(self.config.tax_slippage_rate),
+        )
+        corrected_gross_pnl = int(corrected_pnl.gross_pnl)
+        corrected_net_pnl = int(corrected_pnl.net_pnl)
+        corrected_fees = int(corrected_pnl.fees)
+        corrected_taxes = int(corrected_pnl.taxes)
+
+        entry["sell_price"] = confirmed_price
+        entry["gross_pnl"] = corrected_gross_pnl
+        entry["net_pnl"] = corrected_net_pnl
+        entry["fees"] = corrected_fees
+        entry["taxes"] = corrected_taxes
+        entry["price_estimated"] = False
+        entry["fill_mode"] = "account_reconciled_confirmed"
+
+        trade_key = str(entry.get("trade_key", "") or "").strip()
+        position = self.positions.get(resolved_symbol)
+        if position is not None and str(getattr(position, "trade_key", "") or "").strip() == trade_key:
+            position.realized_gross_pnl_so_far += corrected_gross_pnl - previous_gross_pnl
+            position.realized_net_pnl_so_far += corrected_net_pnl - previous_net_pnl
+            position.realized_fees_paid_so_far += corrected_fees - previous_fees
+            position.realized_taxes_paid_so_far += corrected_taxes - previous_taxes
+        if trade_key and trade_key in self._closed_trade_ledger:
+            self._upsert_closed_trade_record(
+                trade_key=trade_key,
+                symbol=resolved_symbol,
+                strategy_name=str(entry.get("entry_strategy_name", "") or ""),
+                setup_name=str(entry.get("entry_setup_name", "") or ""),
+            )
+
+        self._rebuild_daily_pnl_from_ledgers()
+        self._update_daily_breakers()
+        self._save_daily_state()
+
+        delta_net_pnl = corrected_net_pnl - previous_net_pnl
+        logger.info(
+            "매도 체결 정정: %s order_no=%s previous_price=%d corrected_price=%d previous_net_pnl=%d corrected_net_pnl=%d delta_net_pnl=%d",
+            resolved_symbol,
+            resolved_order_no or "-",
+            previous_price,
+            confirmed_price,
+            previous_net_pnl,
+            corrected_net_pnl,
+            delta_net_pnl,
+        )
+        return {
+            "fill_id": resolved_fill_id or resolved_order_no,
+            "order_no": resolved_order_no,
+            "symbol": resolved_symbol,
+            "quantity": quantity,
+            "previous_price": previous_price,
+            "corrected_price": confirmed_price,
+            "previous_net_pnl": previous_net_pnl,
+            "corrected_net_pnl": corrected_net_pnl,
+            "previous_gross_pnl": previous_gross_pnl,
+            "corrected_gross_pnl": corrected_gross_pnl,
+            "delta_net_pnl": delta_net_pnl,
+        }
+
+    def _buy_time_from_trade_key(self, trade_key: str, fallback: datetime) -> datetime:
+        normalized = str(trade_key or "").strip()
+        _symbol, separator, raw_timestamp = normalized.partition(":")
+        if not separator:
+            return fallback
+        parsed = self._deserialize_datetime(raw_timestamp)
+        return parsed or fallback
+
+    def _pop_estimated_exit_for_account_restore(
+        self,
+        symbol: str,
+        *,
+        quantity: int,
+        buy_price: int,
+        now: datetime,
+    ) -> Optional[PositionState]:
+        normalized = str(symbol or "").strip()
+        if not normalized or quantity <= 0:
+            return None
+        matched_index = -1
+        matched: Optional[Dict[str, Any]] = None
+        for index in range(len(self._sell_fill_ledger) - 1, -1, -1):
+            entry = self._sell_fill_ledger[index]
+            if str(entry.get("symbol", "") or "").strip() != normalized:
+                continue
+            if not bool(entry.get("price_estimated")):
+                continue
+            if str(entry.get("fill_mode", "") or "") != "account_reconciled_estimated":
+                continue
+            if str(entry.get("order_no", "") or "").strip():
+                continue
+            if bool(entry.get("entry_is_restored", False)):
+                continue
+            entry_qty = int(entry.get("quantity", 0) or 0)
+            if entry_qty > 0 and entry_qty != int(quantity):
+                continue
+            matched_index = index
+            matched = dict(entry)
+            break
+        if matched is None or matched_index < 0:
+            return None
+
+        self._sell_fill_ledger.pop(matched_index)
+        trade_key = str(matched.get("trade_key", "") or "").strip()
+        if trade_key:
+            self._upsert_closed_trade_record(
+                trade_key=trade_key,
+                symbol=normalized,
+                strategy_name=str(matched.get("entry_strategy_name", "") or ""),
+                setup_name=str(matched.get("entry_setup_name", "") or ""),
+            )
+        self._rebuild_daily_pnl_from_ledgers()
+
+        resolved_buy_price = int(buy_price or 0) or int(matched.get("buy_price", 0) or 0)
+        resolved_quantity = int(quantity or 0) or int(matched.get("quantity", 0) or 0)
+        buy_time = self._buy_time_from_trade_key(trade_key, now)
+        entry_strategy_name = str(matched.get("entry_strategy_name", "") or "") or INTRADAY_STRATEGY
+        entry_setup_name = str(matched.get("entry_setup_name", "") or "") or "expected_value"
+        position = PositionState(
+            symbol=normalized,
+            buy_price=max(1, int(resolved_buy_price or 0)),
+            quantity=max(1, int(resolved_quantity or 0)),
+            invested_amount=max(0, int(resolved_buy_price or 0) * int(resolved_quantity or 0)),
+            buy_time=buy_time,
+            is_restored=False,
+            entry_strategy_name=entry_strategy_name,
+            entry_setup_name=entry_setup_name,
+            entry_reason=str(matched.get("entry_reason", "") or entry_setup_name),
+            regime_label=self._resolve_regime_profile_name(),
+            planned_risk_stage=self._current_bull_risk_mode(),
+            entry_grade=str(matched.get("entry_grade", "") or ""),
+            entry_grade_math=str(matched.get("entry_grade_math", "") or ""),
+            entry_ev=float(matched.get("entry_ev", 0.0) or 0.0),
+            entry_ev_confidence=str(matched.get("entry_ev_confidence", "") or ""),
+            conviction_tier=str(matched.get("conviction_tier", "") or ""),
+            bull_risk_mode=str(matched.get("bull_risk_mode", "") or self._current_bull_risk_mode()),
+            post_loss_admission_class=str(matched.get("post_loss_admission_class", "") or "general"),
+            candidate_class=str(matched.get("candidate_class", "") or ""),
+            execution_mode=str(matched.get("execution_mode", "") or "live"),
+            live_route=str(matched.get("live_route", "") or entry_strategy_name),
+            queue_source=str(matched.get("entry_queue_source", "") or ""),
+            size_multiplier=float(matched.get("size_multiplier", 1.0) or 1.0),
+            conviction_score=float(matched.get("conviction_score", 0.0) or 0.0),
+            conviction_rank=int(matched.get("conviction_rank", 0) or 0),
+            planned_target_net_pnl=int(matched.get("planned_target_net_pnl", 0) or 0),
+            planned_stop_net_loss_abs=int(matched.get("planned_stop_net_loss_abs", 0) or 0),
+            planned_risk_net_loss_abs=int(matched.get("planned_risk_net_loss_abs", 0) or 0),
+            entry_expected_net_pnl=float(matched.get("entry_expected_net_pnl", 0.0) or 0.0),
+            entry_prediction_net_pnl=int(matched.get("entry_prediction_net_pnl", 0) or 0),
+            entry_prediction_lower_net_pnl=int(matched.get("entry_prediction_lower_net_pnl", 0) or 0),
+            entry_prediction_win_probability=float(matched.get("entry_prediction_win_probability", 0.0) or 0.0),
+            trade_key=trade_key or self._make_trade_key(normalized, buy_time),
+        )
+        logger.warning(
+            "추정청산 후 계좌에 다시 나타난 포지션을 원래 거래로 복구합니다: %s %d주 @ %d원 "
+            "(removed_estimated_net=%d)",
+            normalized,
+            int(position.quantity),
+            int(position.buy_price),
+            int(matched.get("net_pnl", 0) or 0),
+        )
+        return position
+
+    def _serialize_position_state(self, pos: PositionState) -> Dict[str, Any]:
+        payload = dict(vars(pos))
+        payload["buy_time"] = self._serialize_datetime(getattr(pos, "buy_time", None))
+        payload["restored_at"] = self._serialize_datetime(getattr(pos, "restored_at", None))
+        payload["pending_exit_started_at"] = self._serialize_datetime(getattr(pos, "pending_exit_started_at", None))
+        payload["pending_entry_started_at"] = self._serialize_datetime(getattr(pos, "pending_entry_started_at", None))
+        return payload
+
+    def _deserialize_position_state(self, payload: Dict[str, Any]) -> Optional[PositionState]:
+        symbol = str((payload or {}).get("symbol") or "").strip()
+        if not symbol:
+            return None
+        state = dict(payload or {})
+        state["buy_time"] = self._deserialize_datetime(state.get("buy_time")) or self._now()
+        state["restored_at"] = self._deserialize_datetime(state.get("restored_at"))
+        state["pending_exit_started_at"] = self._deserialize_datetime(state.get("pending_exit_started_at"))
+        state["pending_entry_started_at"] = self._deserialize_datetime(state.get("pending_entry_started_at"))
+        allowed_fields = {item.name for item in fields(PositionState)}
+        state = {key: value for key, value in state.items() if key in allowed_fields}
+        try:
+            return PositionState(**state)
+        except TypeError:
+            logger.warning("포지션 상태 복구 중 알 수 없는 필드가 있어 건너뜁니다: %s", symbol)
+            return None
+
+    def has_runtime_state_snapshot(self) -> bool:
+        daily_pnl = getattr(self, "daily_pnl", None)
+        has_daily_pnl = bool(
+            daily_pnl is not None
+            and (
+                int(getattr(daily_pnl, "trade_count", 0) or 0) > 0
+                or int(getattr(daily_pnl, "realized_net_pnl", 0) or 0) != 0
+            )
+        )
+        return bool(
+            self._state_restored_today
+            or self.positions
+            or self._pool
+            or self._latest_math_queue_symbols
+            or self._latest_math_backfill_symbols
+            or self._latest_opening_fast_symbols
+            or self._latest_opening_hot_symbols
+            or self._symbol_entry_cooldown_until
+            or self._symbol_order_unavailable
+            or self._restore_ignore_until
+            or self._halted
+            or has_daily_pnl
+        )
+
+    def _save_daily_state_if_due(self, *, force: bool = False, min_interval_seconds: int = 5) -> None:
+        now = self._now()
+        if not force:
+            last_saved_at = getattr(self, "_last_daily_state_save_at", None)
+            if last_saved_at is not None and (now - last_saved_at).total_seconds() < max(0, int(min_interval_seconds)):
+                return
+        self._save_daily_state()
 
     def _save_daily_state(self):
-        if not self._state_path:
-            return
-        try:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "date": self._current_day.isoformat() if self._current_day else None,
+        path = self._daily_state_path()
+        payload = {
+            "date": self._today(),
+            "bull_loss_count_today": self._bull_loss_count_today,
+            "halted": self._halted,
+            "halt_reason": str(getattr(self, "_halt_reason", "") or ""),
+            "ledger_seed_snapshot": dict(self._ledger_seed_snapshot or {}),
+            "daily_pnl": {
                 "realized_gross_pnl": self.daily_pnl.realized_gross_pnl,
                 "realized_net_pnl": self.daily_pnl.realized_net_pnl,
                 "fees_paid": self.daily_pnl.fees_paid,
@@ -2388,3678 +839,3731 @@ class MomentumScalpStrategy(BaseStrategy):
                 "losing_net_pnl_sum": self.daily_pnl.losing_net_pnl_sum,
                 "largest_win_net": self.daily_pnl.largest_win_net,
                 "largest_loss_net": self.daily_pnl.largest_loss_net,
-                "neutral_loss_count": self._neutral_loss_count_today,
-                "neutral_last_loss_at": self._neutral_last_loss_at.isoformat(timespec="seconds")
-                if self._neutral_last_loss_at
-                else None,
-                "neutral_post_loss_reentries": self._neutral_post_loss_reentries_today,
-                "bull_loss_count": self._bull_loss_count_today,
-                "bull_last_loss_at": self._bull_last_loss_at.isoformat(timespec="seconds")
-                if self._bull_last_loss_at
-                else None,
-                "halted": self._halted,
-                "halt_date": self._halt_date.isoformat() if self._halt_date else None,
-                "open_positions": self._serialize_open_positions_for_state(),
-                "updated_at": self._now().isoformat(timespec="seconds"),
-            }
-            self._state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.warning("일일 상태 저장 실패(무시): %s", e)
-
-    def _serialize_open_positions_for_state(self) -> Dict[str, dict]:
-        payload: Dict[str, dict] = {}
-        for sym, pos in self.positions.items():
-            payload[sym] = {
-                "buy_price": pos.buy_price,
-                "quantity": pos.quantity,
-                "invested_amount": pos.invested_amount,
-                "buy_time": pos.buy_time.isoformat(timespec="seconds"),
-                "high_since_buy": pos.high_since_buy,
-                "entry_strategy_name": pos.entry_strategy_name,
-                "entry_setup_name": pos.entry_setup_name,
-                "entry_reason": pos.entry_reason,
-                "regime_label": pos.regime_label,
-                "bear_score": pos.bear_score,
-                "planned_risk_stage": pos.planned_risk_stage,
-                "entry_grade": pos.entry_grade,
-                "leader_score": pos.leader_score,
-                "leader_percentile": pos.leader_percentile,
-                "entry_grade_math": pos.entry_grade_math,
-                "entry_ev": pos.entry_ev,
-                "entry_ev_confidence": pos.entry_ev_confidence,
-                "bull_prob": pos.bull_prob,
-                "neutral_prob": pos.neutral_prob,
-                "soft_bear_prob": pos.soft_bear_prob,
-                "bear_prob": pos.bear_prob,
-                "partial_exit_done": pos.partial_exit_done,
-            }
-        return payload
-
-    @staticmethod
-    def _parse_state_datetime(raw: Optional[str]) -> Optional[datetime]:
-        if not isinstance(raw, str) or not raw:
-            return None
+            },
+            "breaker_excluded_realized_net_pnl": self._breaker_excluded_realized_net_pnl,
+            "session_start_at": self._serialize_datetime(self._session_start_at),
+            "pool": list(self._pool or []),
+            "latest_math_queue_symbols": list(self._latest_math_queue_symbols or []),
+            "latest_math_backfill_symbols": list(self._latest_math_backfill_symbols or []),
+            "latest_opening_fast_symbols": sorted(self._latest_opening_fast_symbols or set()),
+            "latest_opening_hot_symbols": sorted(self._latest_opening_hot_symbols or set()),
+            "latest_math_queue_source": dict(self._latest_math_queue_source or {}),
+            "pending_entry_meta": {
+                str(symbol): dict(meta)
+                for symbol, meta in (self._pending_entry_meta or {}).items()
+                if str(symbol or "").strip() and isinstance(meta, dict)
+            },
+            "symbol_entry_cooldown_until": self._serialize_datetime_map(self._symbol_entry_cooldown_until),
+            "symbol_order_unavailable": {
+                str(symbol): dict(meta)
+                for symbol, meta in (self._symbol_order_unavailable or {}).items()
+                if str(symbol or "").strip() and isinstance(meta, dict)
+            },
+            "restore_ignore_until": self._serialize_datetime_map(self._restore_ignore_until),
+            "sell_fill_ledger": list(self._sell_fill_ledger or []),
+            "closed_trade_ledger": dict(self._closed_trade_ledger or {}),
+            "positions": [
+                self._serialize_position_state(pos)
+                for pos in self.positions.values()
+            ],
+        }
         try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            return None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._last_daily_state_save_at = self._now()
+        except OSError:
+            logger.exception("일일 상태 저장 실패")
 
-    def _clear_restored_positions_after_grace(self, now: datetime):
-        grace_seconds = max(0, int(self.cfg.restored_position_grace_seconds))
-        if grace_seconds <= 0:
-            for pos in self.positions.values():
-                if pos.is_restored:
-                    pos.is_restored = False
-                    pos.restored_at = None
+    def _load_daily_state(self):
+        path = self._daily_state_path()
+        self._state_restored_today = False
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.exception("일일 상태 로드 실패")
+            return
+        if str(payload.get("date") or "") != self._today():
             return
 
-        released = 0
-        for pos in self.positions.values():
-            if not pos.is_restored or pos.restored_at is None:
-                continue
-            elapsed = (now - pos.restored_at).total_seconds()
-            if elapsed >= grace_seconds:
-                pos.is_restored = False
-                pos.restored_at = None
-                released += 1
-
-        if released > 0:
-            logger.info(
-                "재시작 복구 유예 종료: %d종목에 보유시간 규칙을 다시 적용합니다.",
-                released,
-            )
-
-    def get_watchlist(self) -> List[str]:
-        now = self._now()
-        if (self._last_pool_refresh and
-                (now - self._last_pool_refresh).total_seconds() >= self.cfg.pool_refresh_interval):
-            self._build_pool()
-        return self._pool
-
-    def on_tick(self, quote: Quote) -> List[Order]:
-        self._quotes_cache[quote.symbol] = quote
-        self._record_recent_quote(quote)
-        if self._session_start_at is None:
-            self._session_start_at = self._now()
-        orders = []
-
-        if self._halted:
-            return orders
-
-        if quote.symbol in self.positions:
-            order = self._evaluate_sell(quote)
-            if order:
-                orders.append(order)
-            else:
-                scale_in = self._evaluate_buy(quote)
-                if scale_in:
-                    orders.append(scale_in)
-
-        else:
-            long_count = sum(1 for s in self.positions if s not in self._inverse_symbols)
-            max_long_count = self._effective_max_position_count()
-            if long_count < max_long_count:
-                order = self._evaluate_buy(quote)
-                if order:
-                    orders.append(order)
-
-        return orders
-
-    def on_batch_tick(self, quotes: List[Quote]) -> List[Order]:
-        """배치 시세를 받아 전체적으로 판단한다."""
-        now = self._now()
-        if self._session_start_at is None:
-            self._session_start_at = now
-        for q in quotes:
-            self._quotes_cache[q.symbol] = q
-            self._record_recent_quote(q)
-            self._update_tick_volume_state(q)
-            self._refresh_entry_signal_if_stale(q.symbol, now)
-
-        self._refresh_math_leader_signals(quotes)
-        self._clear_restored_positions_after_grace(now)
-        self._cleanup_stale_entry_signals(now)
-        self._check_market_regime(quotes=quotes)
-        self._update_shadow_blocked_candidates(quotes, now=now)
-        market_data_ready = self._update_market_data_readiness(quotes=quotes, now=now)
-        self._record_quote_tape(quotes, market_data_ready=market_data_ready)
-        effective_max_position_count = self._effective_max_position_count()
-
-        # 거래 중지 상태면 주문 없음
-        if self._halted:
-            return []
-
-        # 미실현 손익 업데이트 + 고가 추적
-        for sym, pos in self.positions.items():
-            q = self._quotes_cache.get(sym)
-            if q:
-                if q.current_price > pos.high_since_buy:
-                    pos.high_since_buy = q.current_price
-
-        # 장마감 청산 (15:15 이후) — 반드시 halt 설정 (실거래 모드만)
-        if self.market_data is not None:
-            if now.hour >= 15 and now.minute >= 15:
-                self._halted = True
-                self._halt_date = now.date()
-                if self.positions:
-                    logger.info("장마감 임박 → 전량 청산")
-                    self._alerts.send(
-                        event_key="market_close_liquidation",
-                        title="장마감 전량 청산",
-                        message="15:15 이후 장마감 규칙에 따라 보유 포지션 전량 청산을 수행합니다.",
-                        level="warning",
-                        cooldown_seconds=1800,
-                    )
-                    return self._liquidate_all()
-                return []
-
-        # 단계형 리스크 관리: 실현 + 미실현 합산 총손익 기준
-        realized_net = self._effective_realized_net_for_breaker()
-        unrealized_net = self._estimate_unrealized_net_pnl()
-        total_net = realized_net + unrealized_net
-        risk_stage = self._current_risk_stage(total_net)
-        self._log_risk_stage_change(risk_stage, total_net)
-        if not self._hard_stop_bypass_for_day:
-            breaker_orders = self._evaluate_daily_breakers(liquidate=True)
-            if breaker_orders is not None:
-                return breaker_orders
-        else:
-            logger.info("당일 하드스탑 무시 모드: 일일 손익 브레이크는 비활성화됩니다.")
-
-        # 개별 종목 평가
-        orders = []
-
-        # 1) 매도 먼저 (일반 + 인버스 모두)
-        for q in quotes:
-            if q.symbol in self.positions:
-                if q.symbol in self._inverse_symbols:
-                    order = self._evaluate_inverse_sell(q)
-                else:
-                    order = self._evaluate_sell(q)
-                if order:
-                    orders.append(order)
-
-        if self._startup_rebalance_active and len(self.positions) < effective_max_position_count:
-            self._startup_rebalance_active = False
-            for p in self.positions.values():
-                p.is_restored = False
-            logger.info("재시작 복구 모드 해제: 보유 슬롯이 확보되어 보유시간 규칙을 정상 적용합니다.")
-
-        if self._startup_rebalance_active and len(self.positions) >= effective_max_position_count:
-            self._startup_rebalance_ticks -= 1
-            logger.info(
-                "재시작 복구 모드: 기존 보유 %d종목 감시 중, 신규 진입 잠시 보류 (%d틱 남음)",
-                len(self.positions),
-                max(self._startup_rebalance_ticks, 0),
-            )
-            if self._startup_rebalance_ticks <= 0:
-                self._startup_rebalance_active = False
-                for p in self.positions.values():
-                    p.is_restored = False
-                logger.info("재시작 복구 모드 종료: 보유 포지션의 보유시간 규칙 정상 적용")
-            return orders
-
-        if not market_data_ready:
-            return orders
-
-        # 2) 일반 매수 후보를 모멘텀 점수 기준으로 정렬 후 진입 시도
-        ranked_candidates = self._rank_long_entry_candidates(quotes)
-        for score, q in ranked_candidates:
-            if q.symbol in self._inverse_symbols:
-                continue  # 인버스는 아래에서 별도 처리
-            long_count = sum(
-                1 for s in self.positions if s not in self._inverse_symbols
-            )
-            pending_long = sum(
-                1 for o in orders
-                if (
-                    o.side == OrderSide.BUY and
-                    o.symbol not in self._inverse_symbols and
-                    o.symbol not in self.positions
-                )
-            )
-            if q.symbol not in self.positions and long_count + pending_long >= effective_max_position_count:
-                continue
-
-            order = self._evaluate_buy(q, pending_orders=orders, score_hint=score)
-            if order:
-                orders.append(order)
-
-        # 3) 인버스 매수 (인버스 포지션 카운트 기준)
-        if self.cfg.inverse_enabled and self._bear_score >= self.cfg.bearish_threshold:
-            regime_inverse_max_positions = self._regime_inverse_max_positions()
-            if regime_inverse_max_positions <= 0:
-                return orders
-            for q in quotes:
-                if q.symbol not in self._inverse_symbols:
-                    continue
-                inv_count = sum(
-                    1 for s in self.positions if s in self._inverse_symbols
-                )
-                pending_inv = sum(
-                    1 for o in orders
-                    if o.side == OrderSide.BUY and o.symbol in self._inverse_symbols
-                )
-                if inv_count + pending_inv >= regime_inverse_max_positions:
-                    break
-                if q.symbol not in self.positions:
-                    order = self._evaluate_inverse_buy(q, pending_orders=orders)
-                    if order:
-                        orders.append(order)
-
-        return orders
-
-    def _has_valid_index_regime_info(self) -> bool:
-        index_info = self._cached_index_regime_info
-        return bool(index_info) and all(float(value) > 0 for value in index_info)
-
-    def _update_market_data_readiness(self, quotes: List[Quote], now: datetime) -> bool:
-        if self.market_data is None:
-            self._market_data_ready_for_entries = True
-            self._market_data_ready_streak = 0
-            self._market_data_readiness_reason = ""
-            return True
-
-        regular_quotes = [q for q in quotes if q.symbol not in self._inverse_symbols]
-        valid_quotes = [
-            q for q in regular_quotes
-            if q.current_price > 0 and q.open_price > 0
+        self._bull_loss_count_today = int(payload.get("bull_loss_count_today", 0) or 0)
+        restored_halted = bool(payload.get("halted", False))
+        self._halted = restored_halted
+        self._halt_reason = str(payload.get("halt_reason", "") or "")
+        daily_pnl = payload.get("daily_pnl") or {}
+        for field in self._daily_pnl_snapshot_fields():
+            if hasattr(self.daily_pnl, field):
+                setattr(self.daily_pnl, field, int(daily_pnl.get(field, getattr(self.daily_pnl, field)) or 0))
+        self._breaker_excluded_realized_net_pnl = int(payload.get("breaker_excluded_realized_net_pnl", 0) or 0)
+        self._ledger_seed_snapshot = payload.get("ledger_seed_snapshot") or {}
+        if not self._ledger_seed_snapshot:
+            self._ledger_seed_snapshot = self._capture_daily_pnl_snapshot()
+        self._sell_fill_ledger = [
+            dict(item)
+            for item in (payload.get("sell_fill_ledger") or [])
+            if isinstance(item, dict)
         ]
-        valid_index = self._has_valid_index_regime_info()
-        required_valid_quotes = min(
-            max(1, int(self.cfg.startup_market_data_min_valid_quote_count)),
-            max(1, len(regular_quotes)),
-        ) if regular_quotes else max(1, int(self.cfg.startup_market_data_min_valid_quote_count))
-        valid_quote_count = len(valid_quotes)
-        market_data_valid = (
-            valid_index
-            and bool(regular_quotes)
-            and valid_quote_count >= required_valid_quotes
+        self._normalize_sell_fill_breaker_flags()
+        raw_closed_trade_ledger = payload.get("closed_trade_ledger") or {}
+        if isinstance(raw_closed_trade_ledger, dict):
+            self._closed_trade_ledger = {
+                str(key or "").strip(): dict(value)
+                for key, value in raw_closed_trade_ledger.items()
+                if str(key or "").strip() and isinstance(value, dict)
+            }
+        else:
+            self._closed_trade_ledger = {}
+        if self._sell_fill_ledger or self._closed_trade_ledger:
+            self._rebuild_daily_pnl_from_ledgers()
+        session_start_at = self._deserialize_datetime(payload.get("session_start_at"))
+        if session_start_at is not None:
+            self._session_start_at = session_start_at
+        pool = [str(symbol or "").strip() for symbol in (payload.get("pool") or []) if str(symbol or "").strip()]
+        if pool:
+            self._pool = pool
+        self._latest_math_queue_symbols = [
+            str(symbol or "").strip()
+            for symbol in (payload.get("latest_math_queue_symbols") or [])
+            if str(symbol or "").strip()
+        ]
+        self._latest_math_backfill_symbols = [
+            str(symbol or "").strip()
+            for symbol in (payload.get("latest_math_backfill_symbols") or [])
+            if str(symbol or "").strip()
+        ]
+        self._latest_opening_fast_symbols = {
+            str(symbol or "").strip()
+            for symbol in (payload.get("latest_opening_fast_symbols") or [])
+            if str(symbol or "").strip()
+        }
+        self._latest_opening_hot_symbols = {
+            str(symbol or "").strip()
+            for symbol in (payload.get("latest_opening_hot_symbols") or [])
+            if str(symbol or "").strip()
+        }
+        self._latest_math_queue_source = {
+            str(symbol or "").strip(): str(source or "").strip()
+            for symbol, source in (payload.get("latest_math_queue_source") or {}).items()
+            if str(symbol or "").strip()
+        }
+        self._pending_entry_meta = {
+            str(symbol or "").strip(): dict(meta)
+            for symbol, meta in (payload.get("pending_entry_meta") or {}).items()
+            if str(symbol or "").strip() and isinstance(meta, dict)
+        }
+        self._symbol_entry_cooldown_until = self._deserialize_datetime_map(payload.get("symbol_entry_cooldown_until") or {})
+        self._symbol_order_unavailable = {
+            str(symbol or "").strip(): dict(meta)
+            for symbol, meta in (payload.get("symbol_order_unavailable") or {}).items()
+            if str(symbol or "").strip() and isinstance(meta, dict)
+        }
+        self._restore_ignore_until = self._deserialize_datetime_map(payload.get("restore_ignore_until") or {})
+        restored_positions: Dict[str, PositionState] = {}
+        for item in (payload.get("positions") or []):
+            pos = self._deserialize_position_state(item)
+            if pos is None:
+                continue
+            restored_positions[pos.symbol] = pos
+        if restored_positions:
+            self.positions = restored_positions
+        if (
+            restored_halted
+            and bool(self.config.allow_hard_stop_bypass_for_day)
+            and int(self.daily_pnl.realized_net_pnl) < int(self.config.daily_profit_target)
+        ):
+            restored_realized_net_pnl = int(self.daily_pnl.realized_net_pnl)
+            self._halted = False
+            self._halt_reason = ""
+            if not bool(self.config.use_restored_pnl_for_daily_breaker):
+                self._breaker_excluded_realized_net_pnl = restored_realized_net_pnl
+                if isinstance(self._ledger_seed_snapshot, dict):
+                    self._ledger_seed_snapshot["breaker_excluded_realized_net_pnl"] = restored_realized_net_pnl
+            logger.warning(
+                "당일 하드스탑 우회 설정으로 저장된 halted 상태를 해제합니다: "
+                "restored_realized_net_pnl=%d breaker_realized_net_pnl=%d",
+                restored_realized_net_pnl,
+                self._realized_net_pnl_for_daily_breaker(),
+            )
+            self._save_daily_state_if_due(force=True)
+        if self._restored_loss_halt_is_stale():
+            restored_realized_net_pnl = int(self.daily_pnl.realized_net_pnl)
+            restored_total_net_pnl = self._total_net_pnl_for_daily_breaker()
+            previous_halt_reason = str(getattr(self, "_halt_reason", "") or "")
+            self._halted = False
+            self._halt_reason = ""
+            logger.warning(
+                "저장된 손실 하드스탑이 현재 손익과 맞지 않아 해제합니다: "
+                "previous_reason=%s realized_net_pnl=%d breaker_net_pnl=%d",
+                previous_halt_reason,
+                restored_realized_net_pnl,
+                restored_total_net_pnl,
+            )
+            self._save_daily_state_if_due(force=True)
+        self._state_restored_today = bool(
+            restored_positions
+            or self._pool
+            or self._latest_math_queue_symbols
+            or self._latest_math_backfill_symbols
+            or self._latest_opening_fast_symbols
+            or self._latest_opening_hot_symbols
+            or self._symbol_entry_cooldown_until
+            or self._symbol_order_unavailable
+            or self._restore_ignore_until
+            or self._halted
+            or int(getattr(self.daily_pnl, "trade_count", 0) or 0) > 0
+            or int(getattr(self.daily_pnl, "realized_net_pnl", 0) or 0) != 0
         )
 
-        if market_data_valid:
-            self._market_data_ready_streak += 1
-            required_ticks = max(1, int(self.cfg.startup_market_data_ready_ticks))
-            if not self._market_data_ready_for_entries and self._market_data_ready_streak >= required_ticks:
-                self._market_data_ready_for_entries = True
-                self._market_data_readiness_reason = ""
-                logger.info(
-                    "시장 데이터 준비 완료: 신규 진입 재개 (지수 유효, 유효 시세 %d/%d, 연속 %d틱)",
-                    valid_quote_count,
-                    len(regular_quotes),
-                    self._market_data_ready_streak,
+    def _position_from_entry_meta(
+        self,
+        *,
+        symbol: str,
+        buy_price: int,
+        quantity: int,
+        invested_amount: int,
+        buy_time: datetime,
+        meta: Dict[str, Any],
+    ) -> PositionState:
+        meta = dict(meta or {})
+        return PositionState(
+            symbol=symbol,
+            buy_price=int(buy_price or 0),
+            quantity=int(quantity or 0),
+            invested_amount=max(0, int(invested_amount or 0)),
+            buy_time=buy_time,
+            entry_strategy_name=str(meta.get("strategy_name", "")),
+            entry_setup_name=str(meta.get("setup_name", "")),
+            entry_reason=str(meta.get("entry_reason", meta.get("setup_name", ""))),
+            regime_label=str(meta.get("regime_label", self._resolve_regime_profile_name())),
+            bear_score=int(meta.get("bear_score", self._bear_score) or 0),
+            planned_risk_stage=str(meta.get("planned_risk_stage", self._current_bull_risk_mode())),
+            entry_grade=str(meta.get("entry_grade", "")),
+            leader_score=float(meta.get("leader_score", 0.0) or 0.0),
+            leader_percentile=float(meta.get("leader_percentile", 0.0) or 0.0),
+            entry_grade_math=str(meta.get("entry_grade_math", "")),
+            entry_ev=float(meta.get("entry_ev", 0.0) or 0.0),
+            entry_ev_confidence=str(meta.get("entry_ev_confidence", "")),
+            conviction_tier=str(meta.get("conviction_tier", "")),
+            bull_risk_mode=str(meta.get("bull_risk_mode", self._current_bull_risk_mode())),
+            post_loss_admission_class=str(meta.get("post_loss_admission_class", "general")),
+            candidate_class=str(meta.get("candidate_class", "")),
+            execution_mode=str(meta.get("execution_mode", "live")),
+            live_route=str(meta.get("live_route", "")),
+            queue_source=str(meta.get("queue_source", "")),
+            size_multiplier=float(meta.get("size_multiplier", 1.0) or 1.0),
+            conviction_score=float(meta.get("conviction_score", 0.0) or 0.0),
+            conviction_rank=int(meta.get("conviction_rank", 0) or 0),
+            bull_prob=float(meta.get("bull_prob", 0.0) or 0.0),
+            neutral_prob=float(meta.get("neutral_prob", 0.0) or 0.0),
+            soft_bear_prob=float(meta.get("soft_bear_prob", 0.0) or 0.0),
+            bear_prob=float(meta.get("bear_prob", 0.0) or 0.0),
+            shock_score=float(meta.get("shock_score", 0.0) or 0.0),
+            shock_confidence=float(meta.get("shock_confidence", 0.0) or 0.0),
+            adaptive_take_profit_pct=float(meta.get("adaptive_take_profit_pct", meta.get("planned_take_profit_pct", 0.0)) or 0.0),
+            adaptive_stop_loss_pct=float(meta.get("adaptive_stop_loss_pct", 0.0) or 0.0),
+            adaptive_trailing_activation_pct=float(meta.get("adaptive_trailing_activation_pct", 0.0) or 0.0),
+            adaptive_trailing_stop_pct=float(meta.get("adaptive_trailing_stop_pct", 0.0) or 0.0),
+            adaptive_max_hold_minutes=int(meta.get("adaptive_max_hold_minutes", 0) or 0),
+            planned_target_net_pnl=int(meta.get("planned_target_net_pnl", 0) or 0),
+            planned_stop_net_loss_abs=int(meta.get("planned_stop_net_loss_abs", 0) or 0),
+            planned_risk_net_loss_abs=int(
+                meta.get("planned_risk_net_loss_abs", meta.get("planned_stop_net_loss_abs", 0)) or 0
+            ),
+            entry_expected_net_pnl=float(meta.get("entry_expected_net_pnl", 0.0) or 0.0),
+            entry_prediction_net_pnl=int(meta.get("price_prediction_net_pnl", meta.get("entry_prediction_net_pnl", 0)) or 0),
+            entry_prediction_lower_net_pnl=int(
+                meta.get("price_prediction_lower_net_pnl", meta.get("entry_prediction_lower_net_pnl", 0)) or 0
+            ),
+            entry_prediction_upper_net_pnl=int(
+                meta.get("price_prediction_upper_net_pnl", meta.get("entry_prediction_upper_net_pnl", 0)) or 0
+            ),
+            entry_prediction_win_probability=float(meta.get("entry_prediction_win_probability", 0.0) or 0.0),
+            entry_signal_price=int(
+                meta.get(
+                    "entry_signal_price",
+                    meta.get("pending_order_reference_price", meta.get("price_prediction_signal_price", 0)),
                 )
-            return self._market_data_ready_for_entries
+                or 0
+            ),
+            entry_prediction_return_pct=float(meta.get("price_prediction_return_pct", 0.0) or 0.0),
+            entry_prediction_lower_pct=float(meta.get("price_prediction_lower_pct", 0.0) or 0.0),
+            entry_prediction_upper_pct=float(meta.get("price_prediction_upper_pct", 0.0) or 0.0),
+            trade_key=self._make_trade_key(symbol, buy_time),
+        )
 
-        previous_ready = self._market_data_ready_for_entries
-        self._market_data_ready_for_entries = False
-        self._market_data_ready_streak = 0
-
-        reason_parts: List[str] = []
-        if not valid_index:
-            reason_parts.append("지수 일봉 미준비")
-        if not regular_quotes:
-            reason_parts.append("일반 종목 시세 없음")
-        elif valid_quote_count < required_valid_quotes:
-            reason_parts.append(
-                f"유효 시세 부족 {valid_quote_count}/{required_valid_quotes}"
-            )
-        self._market_data_readiness_reason = ", ".join(reason_parts) if reason_parts else "시장 데이터 미준비"
-
-        log_interval = max(1, int(self.cfg.startup_market_data_wait_log_interval_seconds))
-        should_log = previous_ready
-        if not should_log:
-            if self._last_market_data_wait_log_at is None:
-                should_log = True
-            else:
-                should_log = (now - self._last_market_data_wait_log_at).total_seconds() >= log_interval
-        if should_log:
-            logger.warning(
-                "시장 데이터 준비 대기: 신규 진입 보류 (%s, 유효 시세 %d/%d, 지수캐시=%s)",
-                self._market_data_readiness_reason,
-                valid_quote_count,
-                len(regular_quotes),
-                "OK" if valid_index else "NONE",
-            )
-            self._last_market_data_wait_log_at = now
-        return False
-
-    def on_order_filled(self, result: OrderResult):
-        if result.side == OrderSide.BUY:
-            if not result.success:
-                self._pending_entry_meta.pop(result.symbol, None)
-                return
-
-            fill_price = result.price
-            if fill_price <= 0:
-                cached = self._quotes_cache.get(result.symbol)
-                fill_price = cached.current_price if cached else 0
-            if fill_price <= 0:
-                self._pending_entry_meta.pop(result.symbol, None)
-                return
-
-            buy_notional = fill_price * result.quantity
-            buy_fee = self._calc_commission_cost(buy_notional)
-            if buy_fee > 0:
-                self.daily_pnl.fees_paid += buy_fee
-                # 매수 수수료는 체결 시점에 확정 비용으로 반영
-                self.daily_pnl.realized_net_pnl -= buy_fee
-
-            entry_meta = dict(self._pending_entry_meta.pop(result.symbol, {}))
-            existing = self.positions.get(result.symbol)
-            if existing:
-                total_qty = existing.quantity + result.quantity
-                total_invested = existing.invested_amount + (fill_price * result.quantity)
-                existing.quantity = total_qty
-                existing.invested_amount = total_invested
-                existing.buy_price = int(round(total_invested / total_qty))
-                existing.is_restored = False
-                existing.restored_at = None
-                existing.partial_exit_done = False
-                if fill_price > existing.high_since_buy:
-                    existing.high_since_buy = fill_price
-                if entry_meta and not existing.entry_setup_name:
-                    existing.entry_strategy_name = str(entry_meta.get("strategy_name", "") or "")
-                    existing.entry_setup_name = str(entry_meta.get("setup_name", "") or "")
-                    existing.entry_reason = str(entry_meta.get("entry_reason", "") or "")
-                    existing.regime_label = str(entry_meta.get("regime_label", "") or "")
-                    existing.bear_score = int(entry_meta.get("bear_score", 0) or 0)
-                    existing.planned_risk_stage = str(entry_meta.get("planned_risk_stage", "") or "")
-                    existing.entry_grade = str(entry_meta.get("entry_grade", "") or "")
-                    existing.leader_score = float(entry_meta.get("leader_score", 0.0) or 0.0)
-                    existing.leader_percentile = float(entry_meta.get("leader_percentile", 0.0) or 0.0)
-                    existing.entry_grade_math = str(entry_meta.get("entry_grade_math", "") or "")
-                    existing.entry_ev = float(entry_meta.get("entry_ev", 0.0) or 0.0)
-                    existing.entry_ev_confidence = str(entry_meta.get("entry_ev_confidence", "") or "")
-                    existing.bull_prob = float(entry_meta.get("bull_prob", 0.0) or 0.0)
-                    existing.neutral_prob = float(entry_meta.get("neutral_prob", 0.0) or 0.0)
-                    existing.soft_bear_prob = float(entry_meta.get("soft_bear_prob", 0.0) or 0.0)
-                    existing.bear_prob = float(entry_meta.get("bear_prob", 0.0) or 0.0)
-                tag = "[INV] " if result.symbol in self._inverse_symbols else ""
-                logger.info(
-                    "%s추가매수 체결: %s +%d주 @ %s원 (평단 %s원, 총 %d주, entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s)",
-                    tag,
-                    result.symbol,
-                    result.quantity,
-                    f"{fill_price:,}",
-                    f"{existing.buy_price:,}",
-                    existing.quantity,
-                    existing.entry_grade_math or "-",
-                    existing.leader_score,
-                    existing.leader_percentile,
-                    existing.entry_ev,
-                    existing.entry_ev_confidence or "-",
+    def _pending_entry_reconcile_grace_seconds(self) -> int:
+        return max(
+            30,
+            int(
+                getattr(
+                    self.config,
+                    "pending_entry_reconcile_grace_seconds",
+                    getattr(self.config, "pending_order_block_seconds", 180),
                 )
-                alert_key_suffix = self._now().strftime("%H%M%S%f")
-                self._alerts.send(
-                    event_key=f"buy_fill_add_{result.symbol}_{alert_key_suffix}",
-                    title="추가매수 체결",
-                    message=(
-                        f"{result.symbol} +{result.quantity}주 @ {fill_price:,}원\n"
-                        f"평단 {existing.buy_price:,}원, 총 {existing.quantity}주"
-                    ),
-                    level="info",
-                    cooldown_seconds=0,
+                or 180
+            ),
+        )
+
+    def _pending_entry_meta_in_reconcile_grace(
+        self,
+        meta: Dict[str, Any],
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        moment = now or self._now()
+        created_at = self._deserialize_datetime(
+            meta.get("pending_order_created_at") or meta.get("entry_signal_timestamp")
+        )
+        if created_at is None:
+            return True
+        return (moment - created_at).total_seconds() < self._pending_entry_reconcile_grace_seconds()
+
+    def _clear_pending_entry_position_state(self, pos: PositionState) -> None:
+        pos.pending_entry_started_at = None
+        pos.pending_entry_reference_price = 0
+        pos.pending_entry_fill_mode = ""
+
+    def _net_for_signal_projection_pct(
+        self,
+        *,
+        signal_price: int,
+        entry_price: int,
+        quantity: int,
+        return_pct: float,
+    ) -> int:
+        qty = max(0, int(quantity or 0))
+        base_price = max(0, int(signal_price or 0))
+        buy_price = max(0, int(entry_price or 0))
+        if qty <= 0 or base_price <= 0 or buy_price <= 0:
+            return 0
+        projected_exit_price = max(
+            1,
+            int(
+                round(
+                    float(base_price)
+                    * (1.0 + (float(return_pct) / 100.0) - float(self.config.exit_market_slippage_rate))
                 )
-                self._save_daily_state()
-                return
+            ),
+        )
+        return self._estimate_trade_net_pnl_from_prices(
+            entry_price=buy_price,
+            exit_price=projected_exit_price,
+            quantity=qty,
+        )
 
-            if bool(entry_meta.get("neutral_post_loss_retry")):
-                self._neutral_post_loss_reentries_today += 1
-                logger.info(
-                    "중립장 손실 후 재도전 사용: %d/%d (%s)",
-                    self._neutral_post_loss_reentries_today,
-                    max(0, int(self.cfg.neutral_post_loss_reentry_limit)),
-                    result.symbol,
-                )
-
-            self.positions[result.symbol] = PositionState(
-                symbol=result.symbol,
-                buy_price=fill_price,
-                quantity=result.quantity,
-                invested_amount=fill_price * result.quantity,
-                is_restored=False,
-                restored_at=None,
-                entry_strategy_name=str(entry_meta.get("strategy_name", "") or ""),
-                entry_setup_name=str(entry_meta.get("setup_name", "") or ""),
-                entry_reason=str(entry_meta.get("entry_reason", "") or ""),
-                regime_label=str(entry_meta.get("regime_label", "") or ""),
-                bear_score=int(entry_meta.get("bear_score", 0) or 0),
-                planned_risk_stage=str(entry_meta.get("planned_risk_stage", "") or ""),
-                entry_grade=str(entry_meta.get("entry_grade", "") or ""),
-                leader_score=float(entry_meta.get("leader_score", 0.0) or 0.0),
-                leader_percentile=float(entry_meta.get("leader_percentile", 0.0) or 0.0),
-                entry_grade_math=str(entry_meta.get("entry_grade_math", "") or ""),
-                entry_ev=float(entry_meta.get("entry_ev", 0.0) or 0.0),
-                entry_ev_confidence=str(entry_meta.get("entry_ev_confidence", "") or ""),
-                bull_prob=float(entry_meta.get("bull_prob", 0.0) or 0.0),
-                neutral_prob=float(entry_meta.get("neutral_prob", 0.0) or 0.0),
-                soft_bear_prob=float(entry_meta.get("soft_bear_prob", 0.0) or 0.0),
-                bear_prob=float(entry_meta.get("bear_prob", 0.0) or 0.0),
-            )
-            tag = "[INV] " if result.symbol in self._inverse_symbols else ""
-            logger.info(
-                "%s매수 체결: %s %d주 @ %s원 "
-                "(strategy_name=%s, setup_name=%s, regime_label=%s, bear_score=%d, planned_risk_stage=%s, entry_grade=%s, "
-                "entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s, "
-                "bull_prob=%.4f, neutral_prob=%.4f, soft_bear_prob=%.4f, bear_prob=%.4f)",
-                tag,
-                result.symbol,
-                result.quantity,
-                f"{fill_price:,}",
-                self.positions[result.symbol].entry_strategy_name or "-",
-                self.positions[result.symbol].entry_setup_name or "-",
-                self.positions[result.symbol].regime_label or "-",
-                self.positions[result.symbol].bear_score,
-                self.positions[result.symbol].planned_risk_stage or "-",
-                self.positions[result.symbol].entry_grade or "-",
-                self.positions[result.symbol].entry_grade_math or "-",
-                self.positions[result.symbol].leader_score,
-                self.positions[result.symbol].leader_percentile,
-                self.positions[result.symbol].entry_ev,
-                self.positions[result.symbol].entry_ev_confidence or "-",
-                self.positions[result.symbol].bull_prob,
-                self.positions[result.symbol].neutral_prob,
-                self.positions[result.symbol].soft_bear_prob,
-                self.positions[result.symbol].bear_prob,
-            )
-            alert_key_suffix = self._now().strftime("%H%M%S%f")
-            self._alerts.send(
-                event_key=f"buy_fill_{result.symbol}_{alert_key_suffix}",
-                title="매수 체결",
-                message=(
-                    f"{result.symbol} {result.quantity}주 @ {fill_price:,}원\n"
-                    f"전략 {self.positions[result.symbol].entry_strategy_name or '-'} / "
-                    f"셋업 {self.positions[result.symbol].entry_setup_name or '-'} / "
-                    f"레짐 {self.positions[result.symbol].regime_label or '-'}"
-                ),
-                level="info",
-                cooldown_seconds=0,
-            )
-            self._save_daily_state()
-
-        elif result.side == OrderSide.SELL:
-            if not result.success:
-                # 매도 실패 시 실제 보유는 유지되므로 포지션을 제거하면 안 된다.
-                logger.warning("매도 실패(포지션 유지): %s", result.symbol)
-                self._alerts.send(
-                    event_key=f"sell_failed_{result.symbol}",
-                    title="매도 실패 (포지션 유지)",
-                    message=f"{result.symbol} 매도 주문이 실패했습니다. 포지션은 유지됩니다.",
-                    level="warning",
-                    cooldown_seconds=300,
-                )
-                return
-
-            pos = self.positions.get(result.symbol)
-            if pos:
-                original_qty = int(pos.quantity)
-                filled_qty = max(0, min(int(result.quantity or 0), original_qty))
-                if filled_qty <= 0:
-                    return
-                sell_price = result.price
-                if sell_price <= 0:
-                    cached = self._quotes_cache.get(result.symbol)
-                    sell_price = cached.current_price if cached else pos.buy_price
-
-                gross_pnl = (sell_price - pos.buy_price) * filled_qty
-                sell_notional = sell_price * filled_qty
-                sell_fee = self._calc_commission_cost(sell_notional)
-                sell_tax_slippage = self._calc_sell_tax_slippage_cost(sell_notional)
-                net_pnl = gross_pnl - sell_fee - sell_tax_slippage
-
-                self.daily_pnl.realized_gross_pnl += gross_pnl
-                self.daily_pnl.realized_net_pnl += net_pnl
-                self.daily_pnl.fees_paid += sell_fee
-                self.daily_pnl.taxes_paid += sell_tax_slippage
-                self.daily_pnl.trade_count += 1
-                if net_pnl > 0:
-                    self.daily_pnl.win_count += 1
-                    self.daily_pnl.winning_net_pnl_sum += net_pnl
-                    self.daily_pnl.largest_win_net = max(self.daily_pnl.largest_win_net, net_pnl)
-                elif net_pnl < 0:
-                    self.daily_pnl.loss_count += 1
-                    self.daily_pnl.losing_net_pnl_sum += net_pnl
-                    self.daily_pnl.largest_loss_net = min(self.daily_pnl.largest_loss_net, net_pnl)
-                else:
-                    self.daily_pnl.breakeven_count += 1
-
-                is_partial_exit = filled_qty < original_qty
-
-                if (
-                    net_pnl < 0
-                    and pos.regime_label == "neutral"
-                    and result.symbol not in self._inverse_symbols
-                    and not is_partial_exit
-                ):
-                    self._neutral_loss_count_today += 1
-                    self._neutral_last_loss_at = self._now()
-                    logger.info(
-                        "중립장 손실 카운트 증가: %d/%d (%s)",
-                        self._neutral_loss_count_today,
-                        max(1, int(self.cfg.neutral_max_losses_per_day)),
-                        result.symbol,
-                    )
-
-                if net_pnl < 0 and not is_partial_exit:
-                    if pos.entry_strategy_name == "bull_breakout_strategy":
-                        self._bull_loss_count_today += 1
-                        self._bull_last_loss_at = self._now()
-                        logger.info(
-                            "bull 손실 카운트 증가: %d회 (%s)",
-                            self._bull_loss_count_today,
-                            result.symbol,
-                        )
-                    self._apply_loss_cooldowns(result.symbol, pos.entry_strategy_name)
-
-                self._sell_cooldown[result.symbol] = self._now()
-
-                if is_partial_exit:
-                    remaining_qty = original_qty - filled_qty
-                    pos.quantity = remaining_qty
-                    pos.invested_amount = max(0, pos.buy_price * remaining_qty)
-                    pos.partial_exit_done = True
-                else:
-                    self.positions.pop(result.symbol, None)
-
-                tag = "[INV] " if result.symbol in self._inverse_symbols else ""
-                if is_partial_exit:
-                    logger.info(
-                        "%s부분매도 체결: %s %d주 @ %s원 "
-                        "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, 잔여 %d주, "
-                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s, "
-                        "entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s)",
-                        tag,
-                        result.symbol,
-                        filled_qty,
-                        f"{sell_price:,}",
-                        f"{gross_pnl:,}",
-                        f"{net_pnl:,}",
-                        f"{self.daily_pnl.realized_net_pnl:,}",
-                        pos.quantity,
-                        pos.entry_strategy_name or "-",
-                        pos.entry_setup_name or "-",
-                        pos.regime_label or "-",
-                        pos.entry_grade or "-",
-                        pos.entry_grade_math or "-",
-                        pos.leader_score,
-                        pos.leader_percentile,
-                        pos.entry_ev,
-                        pos.entry_ev_confidence or "-",
-                    )
-                else:
-                    logger.info(
-                        "%s매도 체결: %s %d주 @ %s원 "
-                        "(총손익: %s원, 순손익: %s원, 누적순손익: %s원, "
-                        "strategy_name=%s, setup_name=%s, regime_label=%s, entry_grade=%s, "
-                        "entry_grade_math=%s, leader_score=%.4f, leader_pct=%.4f, entry_ev=%.2f, entry_ev_conf=%s)",
-                        tag,
-                        result.symbol,
-                        filled_qty,
-                        f"{sell_price:,}",
-                        f"{gross_pnl:,}",
-                        f"{net_pnl:,}",
-                        f"{self.daily_pnl.realized_net_pnl:,}",
-                        pos.entry_strategy_name or "-",
-                        pos.entry_setup_name or "-",
-                        pos.regime_label or "-",
-                        pos.entry_grade or "-",
-                        pos.entry_grade_math or "-",
-                        pos.leader_score,
-                        pos.leader_percentile,
-                        pos.entry_ev,
-                        pos.entry_ev_confidence or "-",
-                    )
-                alert_key_suffix = self._now().strftime("%H%M%S%f")
-                self._alerts.send(
-                    event_key=f"{'partial_' if is_partial_exit else ''}sell_fill_{result.symbol}_{alert_key_suffix}",
-                    title="부분매도 체결" if is_partial_exit else "매도 체결",
-                    message=(
-                        f"{result.symbol} {filled_qty}주 @ {sell_price:,}원\n"
-                        f"순손익 {net_pnl:,}원, 누적순손익 {self.daily_pnl.realized_net_pnl:,}원\n"
-                        f"전략 {pos.entry_strategy_name or '-'} / "
-                        f"셋업 {pos.entry_setup_name or '-'} / "
-                        f"레짐 {pos.regime_label or '-'}"
-                    ),
-                    level="info" if net_pnl >= 0 else "warning",
-                    cooldown_seconds=0,
-                )
-
-                self._save_daily_state()
-                if not self._hard_stop_bypass_for_day:
-                    self._evaluate_daily_breakers(liquidate=False)
-
-    def should_continue(self) -> bool:
-        if self._halted and not self.positions:
+    def _reprice_position_ev_after_confirmed_entry(
+        self,
+        pos: PositionState,
+        *,
+        signal_price: int = 0,
+    ) -> bool:
+        if pos is None or str(getattr(pos, "entry_setup_name", "") or "") != "expected_value":
             return False
+        qty = max(0, int(getattr(pos, "quantity", 0) or 0))
+        buy_price = max(0, int(getattr(pos, "buy_price", 0) or 0))
+        base_price = max(
+            0,
+            int(signal_price or 0),
+            int(getattr(pos, "entry_signal_price", 0) or 0),
+            int(getattr(pos, "pending_entry_reference_price", 0) or 0),
+        )
+        predicted_pct = float(getattr(pos, "entry_prediction_return_pct", 0.0) or 0.0)
+        lower_pct = float(getattr(pos, "entry_prediction_lower_pct", 0.0) or 0.0)
+        upper_pct = float(getattr(pos, "entry_prediction_upper_pct", 0.0) or 0.0)
+        if qty <= 0 or buy_price <= 0 or base_price <= 0 or predicted_pct == 0.0:
+            return False
+
+        predicted_net = self._net_for_signal_projection_pct(
+            signal_price=base_price,
+            entry_price=buy_price,
+            quantity=qty,
+            return_pct=predicted_pct,
+        )
+        lower_net = self._net_for_signal_projection_pct(
+            signal_price=base_price,
+            entry_price=buy_price,
+            quantity=qty,
+            return_pct=lower_pct,
+        )
+        upper_net = self._net_for_signal_projection_pct(
+            signal_price=base_price,
+            entry_price=buy_price,
+            quantity=qty,
+            return_pct=upper_pct,
+        )
+        flat_net = self._estimate_trade_net_pnl_from_prices(
+            entry_price=buy_price,
+            exit_price=buy_price,
+            quantity=qty,
+        )
+        cost_floor = abs(min(0, int(flat_net))) + 1
+        lower_risk = abs(min(0, int(lower_net)))
+        prior_stop = max(0, int(getattr(pos, "planned_stop_net_loss_abs", 0) or 0))
+        prior_risk = max(
+            prior_stop,
+            int(getattr(pos, "planned_risk_net_loss_abs", 0) or 0),
+        )
+        repriced_stop = max(1, cost_floor, lower_risk)
+        if prior_stop > 0 and lower_risk <= cost_floor:
+            planned_stop = max(cost_floor, prior_stop)
+        else:
+            planned_stop = min(prior_stop, repriced_stop) if prior_stop > 0 else repriced_stop
+        planned_stop = max(1, int(planned_stop))
+        execution_buffer = max(
+            1,
+            int(
+                round(
+                    float(cost_floor) * 0.10
+                    + float(buy_price * qty)
+                    * max(0.0, float(self.config.exit_market_slippage_rate))
+                    * 0.25
+                )
+            ),
+        )
+        planned_risk = max(
+            1,
+            prior_risk,
+            max(planned_stop, lower_risk) + execution_buffer,
+        )
+        win_probability = self._clip_float(
+            float(getattr(pos, "entry_prediction_win_probability", 0.0) or 0.0),
+            0.0,
+            1.0,
+        )
+        break_even_probability = (
+            float(planned_risk) / max(1.0, float(max(0, int(predicted_net)) + planned_risk))
+            if predicted_net > 0
+            else 1.0
+        )
+        expected_net = (
+            (win_probability * float(predicted_net))
+            - ((1.0 - win_probability) * float(planned_risk))
+        )
+
+        pos.entry_signal_price = int(base_price)
+        pos.entry_prediction_net_pnl = int(predicted_net)
+        pos.entry_prediction_lower_net_pnl = int(lower_net)
+        pos.entry_prediction_upper_net_pnl = int(upper_net)
+        pos.entry_expected_net_pnl = round(float(expected_net), 2)
+        pos.entry_ev = round(float(expected_net), 2)
+        pos.entry_ev_confidence = "live_plan_repriced"
+
+        prior_target = max(0, int(getattr(pos, "planned_target_net_pnl", 0) or 0))
+        if predicted_net > 0:
+            pos.planned_target_net_pnl = max(1, min(prior_target or int(predicted_net), int(predicted_net)))
+        else:
+            pos.planned_target_net_pnl = 1
+
+        if predicted_net <= 0 or expected_net <= 0.0 or win_probability <= break_even_probability:
+            pos.planned_stop_net_loss_abs = 1
+            pos.planned_risk_net_loss_abs = int(planned_risk)
+            if int(getattr(pos, "adaptive_max_hold_minutes", 0) or 0) <= 0:
+                pos.adaptive_max_hold_minutes = 1
+            logger.warning(
+                "실체결가 기준 EV 재가격정 결과 보유 우위가 사라져 방어 청산 계획으로 전환합니다: "
+                "%s signal=%d entry=%d qty=%d pred_net=%d lower_net=%d exp=%.2f win=%.3f be=%.3f",
+                pos.symbol,
+                int(base_price),
+                int(buy_price),
+                int(qty),
+                int(predicted_net),
+                int(lower_net),
+                float(expected_net),
+                float(win_probability),
+                float(break_even_probability),
+            )
+        else:
+            pos.planned_stop_net_loss_abs = int(planned_stop)
+            pos.planned_risk_net_loss_abs = int(planned_risk)
+            logger.info(
+                "실체결가 기준 EV 재가격정: %s signal=%d entry=%d qty=%d pred_net=%d "
+                "lower_net=%d exp=%.2f stop=%d target=%d",
+                pos.symbol,
+                int(base_price),
+                int(buy_price),
+                int(qty),
+                int(predicted_net),
+                int(lower_net),
+                float(expected_net),
+                int(pos.planned_stop_net_loss_abs),
+                int(pos.planned_target_net_pnl),
+            )
         return True
 
-    def _base_max_position_count(self) -> int:
-        """기본 동시 보유 가능한 최대 종목 수를 계산한다."""
-        if self.cfg.max_position_count > 0:
-            return self.cfg.max_position_count
-
-        per_stock = max(1, self.cfg.per_stock_amount)
-        auto_count = max(1, self.cfg.seed_money // per_stock)
-        return auto_count
-
-    def _resolve_profile_max_position_count(self, profile_name: str) -> int:
-        base_count = self._base_max_position_count()
-        override = None
-        if profile_name == "bull":
-            override = self.cfg.bull_max_position_count
-        elif profile_name == "soft_bear":
-            override = (
-                self.cfg.soft_bear_max_position_count
-                if self.cfg.soft_bear_max_position_count is not None
-                else self.cfg.bear_max_position_count
-            )
-        elif profile_name == "bear":
-            override = self.cfg.bear_max_position_count
-        elif profile_name == "neutral":
-            override = self.cfg.neutral_max_position_count
-
-        if profile_name == "soft_bear" and self._soft_bear_strong_leader_lane_active():
-            return max(0, int(self.cfg.soft_bear_strong_leader_max_positions))
-        if override is None:
-            return base_count
-        return max(0, int(override))
-
-    @staticmethod
-    def _clamp_ratio(value: Optional[float], fallback: float) -> float:
-        raw = fallback if value is None else value
-        return max(0.05, min(1.0, float(raw)))
-
-    def _resolve_profile_capital_utilization_pct(self, profile_name: str) -> float:
-        override = None
-        if profile_name == "bull":
-            override = self.cfg.bull_capital_utilization_pct
-        elif profile_name == "neutral":
-            override = self.cfg.neutral_capital_utilization_pct
-        elif profile_name == "soft_bear":
-            override = self.cfg.soft_bear_capital_utilization_pct
-        elif profile_name == "bear":
-            override = self.cfg.bear_capital_utilization_pct
-        return self._clamp_ratio(override, self.cfg.capital_utilization_pct)
-
-    def _resolve_profile_max_single_position_pct(self, profile_name: str) -> float:
-        override = None
-        if profile_name == "bull":
-            override = self.cfg.bull_max_single_position_pct
-        elif profile_name == "neutral":
-            override = self.cfg.neutral_max_single_position_pct
-        elif profile_name == "soft_bear":
-            override = self.cfg.soft_bear_max_single_position_pct
-        elif profile_name == "bear":
-            override = self.cfg.bear_max_single_position_pct
-        return self._clamp_ratio(override, self.cfg.max_single_position_pct)
-
-    def _effective_max_position_count(self) -> int:
-        """현재 레짐 기준의 동시 보유 가능한 최대 종목 수를 계산한다."""
-        profile = self._build_regime_profile()
-        return int(profile.get("max_position_count", self._base_max_position_count()))
-
-    def _resolve_regime_profile_name(self, bear_score: Optional[int] = None) -> str:
-        if not self.cfg.enable_regime_adaptive:
-            return "static"
-        score = self._bear_score if bear_score is None else bear_score
-        if score <= 0:
-            return "bull"
-        if self._math_live_layer_enabled():
-            dominant_profile, dominant_prob, runner_prob = self._math_regime_choice()
-            if dominant_prob >= runner_prob + float(self.cfg.math_gate_regime_margin):
-                return dominant_profile
-        if score == 1 and (self._strong_bull_override_active or self._index_support_bull_bias_active):
-            return "bull"
-        if score == 1:
-            return "neutral"
-        if score == 2:
-            return "soft_bear"
-        if score >= 3:
-            return "bear"
-        return "neutral"
-
-    def _is_early_session_guard_active(self) -> bool:
-        if not self.cfg.enable_early_session_guard or self._session_start_at is None:
-            return False
-        elapsed = (self._now() - self._session_start_at).total_seconds()
-        return elapsed <= self.cfg.early_session_guard_minutes * 60
-
-    @staticmethod
-    def _parse_hhmm_to_minutes(raw: str) -> Optional[int]:
-        text = raw.strip()
-        parts = text.split(":")
-        if len(parts) != 2:
-            return None
-        try:
-            hour = int(parts[0])
-            minute = int(parts[1])
-        except ValueError:
-            return None
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            return None
-        return hour * 60 + minute
-
-    def _parse_entry_block_windows(self, raw_windows: List[str]) -> List[tuple[int, int, str]]:
-        parsed: List[tuple[int, int, str]] = []
-        for raw in raw_windows or []:
-            text = str(raw).strip()
-            if not text:
-                continue
-            if "-" not in text:
-                logger.warning("신규 진입 차단 시간 형식 오류(무시): %s", text)
-                continue
-            start_raw, end_raw = text.split("-", 1)
-            start_min = self._parse_hhmm_to_minutes(start_raw)
-            end_min = self._parse_hhmm_to_minutes(end_raw)
-            if start_min is None or end_min is None:
-                logger.warning("신규 진입 차단 시간 파싱 실패(무시): %s", text)
-                continue
-            if start_min >= end_min:
-                logger.warning("신규 진입 차단 시간 범위 오류(무시): %s", text)
-                continue
-            parsed.append((start_min, end_min, f"{start_raw.strip()}-{end_raw.strip()}"))
-        parsed.sort(key=lambda item: item[0])
-        return parsed
-
-    def _is_new_entry_window_blocked(self, now: datetime) -> bool:
-        if not self._entry_block_windows:
-            return False
-        current_minute = now.hour * 60 + now.minute
-        for start_min, end_min, label in self._entry_block_windows:
-            if start_min <= current_minute < end_min:
-                if (
-                    self.cfg.enable_dynamic_entry_block_windows
-                    and self._bear_score >= self.cfg.dynamic_entry_block_disable_bear_score
-                ):
-                    bypass_key = f"{now.strftime('%Y-%m-%d %H:%M')}-{label}"
-                    if self._last_entry_block_bypass_log_key != bypass_key:
-                        logger.info(
-                            "신규 진입 차단 시간대 자동해제(%s): 현재 %02d:%02d, 약세점수=%d",
-                            label,
-                            now.hour,
-                            now.minute,
-                            self._bear_score,
-                        )
-                        self._last_entry_block_bypass_log_key = bypass_key
-                    return False
-                log_key = f"{now.strftime('%Y-%m-%d %H:%M')}-{label}"
-                if self._last_entry_block_log_key != log_key:
-                    logger.info(
-                        "신규 진입 차단 시간대(%s): 현재 %02d:%02d",
-                        label,
-                        now.hour,
-                        now.minute,
-                    )
-                    self._last_entry_block_log_key = log_key
-                return True
-        return False
-
-    def _log_entry_filter_once_per_minute(
+    def _position_pending_entry_reconcile_pending(
         self,
-        symbol: str,
-        reason: str,
-        message: str,
-        *args,
-    ):
-        minute_key = self._now().strftime("%Y-%m-%d %H:%M")
-        key = f"{symbol}:{reason}"
-        if self._entry_filter_log_cache.get(key) == minute_key:
+        pos: PositionState,
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        started_at = getattr(pos, "pending_entry_started_at", None)
+        if started_at is None:
+            return False
+        fill_mode = str(getattr(pos, "pending_entry_fill_mode", "") or "")
+        if fill_mode not in {"market_pending", "limit_then_market_pending", "partial_fill_pending"}:
+            return False
+        moment = now or self._now()
+        return (moment - started_at).total_seconds() < self._pending_entry_reconcile_grace_seconds()
+
+    def _position_pending_exit_reconcile_pending(
+        self,
+        pos: PositionState,
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        started_at = getattr(pos, "pending_exit_started_at", None)
+        if started_at is None:
+            return False
+        fill_mode = str(getattr(pos, "pending_exit_fill_mode", "") or "")
+        if fill_mode not in {"market_pending", "limit_then_market_pending", "order_result_pending"}:
+            return False
+        if int(getattr(pos, "pending_exit_quantity", 0) or 0) <= 0:
+            return False
+        moment = now or self._now()
+        return (moment - started_at).total_seconds() < self._pending_entry_reconcile_grace_seconds()
+
+    def _clear_account_absent_stale_pending_entries(self, account_symbols: set[str]) -> None:
+        if not self._pending_entry_meta:
             return
-        self._entry_filter_log_cache[key] = minute_key
-        logger.info(message, *args)
-
-    def _build_regime_profile(self, profile_name: Optional[str] = None) -> dict:
-        """현재 레짐 또는 특정 레짐을 기준으로 실시간 프로파일 값을 만든다."""
-        is_preview = profile_name is not None
-
-        if not self.cfg.enable_regime_adaptive:
-            profile = {
-                "max_position_count": self._base_max_position_count(),
-                "min_change_rate": self.cfg.min_change_rate,
-                "bullish_min_change_rate": self.cfg.bullish_min_change_rate,
-                "min_momentum_score": self.cfg.min_momentum_score,
-                "bullish_min_momentum_score": self.cfg.bullish_min_momentum_score,
-                "volume_spike_ratio": self.cfg.volume_spike_ratio,
-                "volume_spike_ratio_min": self.cfg.volume_spike_ratio_min,
-                "volume_spike_abs_min": self.cfg.volume_spike_abs_min,
-                "take_profit_pct": self.cfg.take_profit_pct,
-                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
-                "trailing_stop_pct": self.cfg.trailing_stop_pct,
-                "trailing_stop_activation_gain_pct": self.cfg.trailing_stop_activation_gain_pct,
-                "max_position_holding_minutes": self.cfg.max_position_holding_minutes,
-                "cooldown_seconds": self.cfg.cooldown_seconds,
-                "loss_trade_cooldown_seconds": self.cfg.loss_trade_cooldown_seconds,
-                "expected_move_pct": self.cfg.expected_move_pct,
-                "min_expected_net_profit": self.cfg.min_expected_net_profit,
-                "min_expected_rr_ratio": self.cfg.min_expected_rr_ratio,
-                "per_stock_alloc_scale": 1.0,
-                "max_stock_alloc_scale": 1.0,
-                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("static"),
-                "max_single_position_pct": self._resolve_profile_max_single_position_pct("static"),
-                "daily_loss_limit": self.cfg.daily_loss_limit,
-                "daily_profit_target": self.cfg.daily_profit_target,
-                "daily_total_loss_limit": (
-                    self.cfg.daily_total_loss_limit
-                    if self.cfg.daily_total_loss_limit is not None
-                    else self.cfg.daily_loss_limit
-                ),
-                "min_bear_score_for_new_long": self.cfg.min_bear_score_for_new_long,
-                "bear_market_entry_score": self.cfg.bear_market_entry_score,
-                "inverse_take_profit_pct": self.cfg.inverse_take_profit_pct,
-                "inverse_stop_loss_pct": self.cfg.inverse_stop_loss_pct,
-                "inverse_trailing_stop_pct": self.cfg.inverse_trailing_stop_pct,
-                "inverse_trailing_stop_activation_gain_pct": self.cfg.inverse_trailing_stop_activation_gain_pct,
-                "inverse_max_hold_minutes": self.cfg.inverse_max_hold_minutes,
-                "inverse_max_positions": self.cfg.inverse_max_positions,
-                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
-                "inverse_min_momentum": self.cfg.inverse_min_momentum,
-                "inverse_min_bear_score": self.cfg.inverse_min_bear_score,
-            }
-            if not is_preview:
-                self._regime_profile_name = "static"
-            return profile
-
-        if profile_name is None:
-            profile_name = self._resolve_regime_profile_name()
-            self._regime_profile_name = profile_name
-        else:
-            if profile_name == "auto":
-                profile_name = self._resolve_regime_profile_name()
-        daily_total_loss_limit = (
-            self.cfg.daily_total_loss_limit
-            if self.cfg.daily_total_loss_limit is not None
-            else self.cfg.daily_loss_limit
-        )
-        soft_inverse_max_positions = self.cfg.soft_bear_inverse_max_positions
-        if soft_inverse_max_positions is None:
-            soft_inverse_max_positions = min(self.cfg.inverse_max_positions, 1)
-
-        base_profile = {
-            "daily_loss_limit": int(self.cfg.daily_loss_limit),
-            "daily_profit_target": int(self.cfg.daily_profit_target),
-            "daily_total_loss_limit": int(daily_total_loss_limit),
-            "min_bear_score_for_new_long": self.cfg.min_bear_score_for_new_long,
-            "bear_market_entry_score": self.cfg.bear_market_entry_score,
-            "inverse_take_profit_pct": 0.9,
-            "inverse_stop_loss_pct": -0.6,
-            "inverse_trailing_stop_pct": -0.3,
-            "inverse_trailing_stop_activation_gain_pct": 0.5,
-            "inverse_max_hold_minutes": max(30, self.cfg.inverse_max_hold_minutes),
-        }
-
-        profiles = {
-            "bull": {
-                "max_position_count": self._resolve_profile_max_position_count("bull"),
-                "min_change_rate": max(0.45, self.cfg.bullish_min_change_rate),
-                "bullish_min_change_rate": max(0.45, self.cfg.bullish_min_change_rate),
-                "min_momentum_score": max(2.2, self.cfg.min_momentum_score * 0.8),
-                "bullish_min_momentum_score": max(
-                    self.cfg.bullish_min_momentum_score_floor,
-                    self.cfg.bullish_min_momentum_score,
-                ),
-                "volume_spike_ratio": max(1.0, self.cfg.volume_spike_ratio * 0.72),
-                "volume_spike_ratio_min": max(0.85, self.cfg.volume_spike_ratio_min * 0.82),
-                "volume_spike_abs_min": int(max(1_000, self.cfg.volume_spike_abs_min * 0.60)),
-                "take_profit_pct": 1.6,
-                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
-                "trailing_stop_pct": -0.55,
-                "trailing_stop_activation_gain_pct": 1.0,
-                "max_position_holding_minutes": max(45, int(self.cfg.max_position_holding_minutes * 1.3)),
-                "cooldown_seconds": max(120, int(self.cfg.cooldown_seconds * 0.7)),
-                "loss_trade_cooldown_seconds": max(180, int(self.cfg.loss_trade_cooldown_seconds * 0.85)),
-                "expected_move_pct": 1.6,
-                "min_expected_net_profit": max(120, int(self.cfg.min_expected_net_profit * 0.75)),
-                "min_expected_rr_ratio": max(0.65, self.cfg.min_expected_rr_ratio),
-                "per_stock_alloc_scale": 1.0,
-                "max_stock_alloc_scale": 1.0,
-                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("bull"),
-                "max_single_position_pct": self._resolve_profile_max_single_position_pct("bull"),
-                "inverse_max_positions": self.cfg.inverse_max_positions,
-                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
-                "inverse_min_momentum": self.cfg.inverse_min_momentum,
-                "inverse_min_bear_score": max(3, self.cfg.inverse_min_bear_score),
-            },
-            "neutral": {
-                "max_position_count": self._resolve_profile_max_position_count("neutral"),
-                "min_change_rate": max(0.35, self.cfg.min_change_rate * 0.45),
-                "bullish_min_change_rate": max(0.45, self.cfg.bullish_min_change_rate),
-                "min_momentum_score": max(1.8, self.cfg.min_momentum_score * 0.58),
-                "bullish_min_momentum_score": max(2.2, self.cfg.bullish_min_momentum_score * 0.85),
-                "volume_spike_ratio": max(0.95, self.cfg.volume_spike_ratio * 0.68),
-                "volume_spike_ratio_min": max(0.90, self.cfg.volume_spike_ratio_min * 0.80),
-                "volume_spike_abs_min": int(max(1_500, self.cfg.volume_spike_abs_min * 0.60)),
-                "take_profit_pct": 1.0,
-                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
-                "trailing_stop_pct": -0.35,
-                "trailing_stop_activation_gain_pct": 0.7,
-                "max_position_holding_minutes": max(18, int(self.cfg.max_position_holding_minutes * 0.65)),
-                "cooldown_seconds": max(180, int(self.cfg.cooldown_seconds * 0.90)),
-                "loss_trade_cooldown_seconds": max(240, int(self.cfg.loss_trade_cooldown_seconds * 1.05)),
-                "expected_move_pct": 1.0,
-                "min_expected_net_profit": max(80, int(self.cfg.min_expected_net_profit * 0.45)),
-                "min_expected_rr_ratio": max(0.45, self.cfg.min_expected_rr_ratio * 0.8),
-                "per_stock_alloc_scale": 0.9,
-                "max_stock_alloc_scale": 0.9,
-                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("neutral"),
-                "max_single_position_pct": self._resolve_profile_max_single_position_pct("neutral"),
-                "inverse_max_positions": 0,
-                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
-                "inverse_min_momentum": self.cfg.inverse_min_momentum,
-                "inverse_min_bear_score": max(3, self.cfg.inverse_min_bear_score),
-            },
-            "soft_bear": {
-                "max_position_count": self._resolve_profile_max_position_count("soft_bear"),
-                "min_change_rate": max(0.50, self.cfg.min_change_rate),
-                "bullish_min_change_rate": max(0.50, self.cfg.bullish_min_change_rate),
-                "min_momentum_score": max(2.2, self.cfg.min_momentum_score * 0.75),
-                "bullish_min_momentum_score": max(2.4, self.cfg.bullish_min_momentum_score * 0.9),
-                "volume_spike_ratio": max(1.0, self.cfg.volume_spike_ratio * 0.72),
-                "volume_spike_ratio_min": max(0.95, self.cfg.volume_spike_ratio_min * 0.85),
-                "volume_spike_abs_min": int(max(2_000, self.cfg.volume_spike_abs_min * 0.72)),
-                "take_profit_pct": 0.9,
-                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
-                "trailing_stop_pct": -0.30,
-                "trailing_stop_activation_gain_pct": 0.6,
-                "max_position_holding_minutes": max(12, int(self.cfg.max_position_holding_minutes * 0.45)),
-                "cooldown_seconds": max(240, int(self.cfg.cooldown_seconds * 1.05)),
-                "loss_trade_cooldown_seconds": max(300, int(self.cfg.loss_trade_cooldown_seconds * 1.1)),
-                "expected_move_pct": 0.9,
-                "min_expected_net_profit": max(60, int(self.cfg.min_expected_net_profit * 0.35)),
-                "min_expected_rr_ratio": max(0.40, self.cfg.min_expected_rr_ratio * 0.7),
-                "per_stock_alloc_scale": 0.7,
-                "max_stock_alloc_scale": 0.7,
-                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("soft_bear"),
-                "max_single_position_pct": self._resolve_profile_max_single_position_pct("soft_bear"),
-                "inverse_max_positions": max(0, int(soft_inverse_max_positions)),
-                "inverse_min_change_rate": self.cfg.soft_bear_inverse_min_change_rate,
-                "inverse_min_momentum": self.cfg.soft_bear_inverse_min_momentum,
-                "inverse_min_bear_score": max(2, self.cfg.bearish_threshold),
-            },
-            "bear": {
-                "max_position_count": self._resolve_profile_max_position_count("bear"),
-                "min_change_rate": max(0.60, self.cfg.min_change_rate),
-                "bullish_min_change_rate": max(0.60, self.cfg.bullish_min_change_rate),
-                "min_momentum_score": max(2.4, self.cfg.min_momentum_score * 0.78),
-                "bullish_min_momentum_score": max(2.6, self.cfg.bullish_min_momentum_score * 0.92),
-                "volume_spike_ratio": max(1.1, self.cfg.volume_spike_ratio * 0.82),
-                "volume_spike_ratio_min": max(1.0, self.cfg.volume_spike_ratio_min * 0.90),
-                "volume_spike_abs_min": int(max(2_400, self.cfg.volume_spike_abs_min * 0.82)),
-                "take_profit_pct": 0.9,
-                "per_position_stop_loss": -int(self.cfg.long_stop_loss_cap_amount),
-                "trailing_stop_pct": -0.30,
-                "trailing_stop_activation_gain_pct": 0.6,
-                "max_position_holding_minutes": max(10, int(self.cfg.max_position_holding_minutes * 0.40)),
-                "cooldown_seconds": max(300, int(self.cfg.cooldown_seconds * 1.10)),
-                "loss_trade_cooldown_seconds": max(300, int(self.cfg.loss_trade_cooldown_seconds * 1.15)),
-                "expected_move_pct": 0.9,
-                "min_expected_net_profit": max(60, int(self.cfg.min_expected_net_profit * 0.35)),
-                "min_expected_rr_ratio": max(0.40, self.cfg.min_expected_rr_ratio * 0.7),
-                "per_stock_alloc_scale": 0.6,
-                "max_stock_alloc_scale": 0.6,
-                "capital_utilization_pct": self._resolve_profile_capital_utilization_pct("bear"),
-                "max_single_position_pct": self._resolve_profile_max_single_position_pct("bear"),
-                "inverse_max_positions": self.cfg.inverse_max_positions,
-                "inverse_min_change_rate": self.cfg.inverse_min_change_rate,
-                "inverse_min_momentum": self.cfg.inverse_min_momentum,
-                "inverse_min_bear_score": max(3, self.cfg.inverse_min_bear_score),
-            },
-        }
-        profile = dict(base_profile)
-        profile.update(profiles.get(profile_name, profiles["neutral"]))
-        return profile
-
-    def _get_regime_value(self, key: str, default):
-        profile = self._build_regime_profile()
-        return profile.get(key, default)
-
-    def _regime_min_change_rate(self) -> float:
-        return float(self._get_regime_value("min_change_rate", self.cfg.min_change_rate))
-
-    def _regime_bullish_min_change_rate(self) -> float:
-        return float(self._get_regime_value("bullish_min_change_rate", self.cfg.bullish_min_change_rate))
-
-    def _regime_min_momentum_score(self) -> float:
-        return float(self._get_regime_value("min_momentum_score", self.cfg.min_momentum_score))
-
-    def _regime_bullish_min_momentum_score(self) -> float:
-        return float(self._get_regime_value("bullish_min_momentum_score", self.cfg.bullish_min_momentum_score))
-
-    def _regime_take_profit_pct(self) -> float:
-        return float(self._get_regime_value("take_profit_pct", self.cfg.take_profit_pct))
-
-    def _regime_per_position_stop_loss(self) -> int:
-        return int(self._get_regime_value("per_position_stop_loss", self.cfg.per_position_stop_loss))
-
-    def _regime_trailing_stop_pct(self) -> float:
-        return float(self._get_regime_value("trailing_stop_pct", self.cfg.trailing_stop_pct))
-
-    def _regime_trailing_stop_activation_gain_pct(self) -> float:
-        return float(
-            self._get_regime_value(
-                "trailing_stop_activation_gain_pct",
-                self.cfg.trailing_stop_activation_gain_pct,
+        now = self._now()
+        grace_seconds = self._pending_entry_reconcile_grace_seconds()
+        cleared: List[str] = []
+        for raw_symbol, raw_meta in list(self._pending_entry_meta.items()):
+            symbol = str(raw_symbol or "").strip()
+            if not symbol or symbol in account_symbols or symbol in self.positions:
+                continue
+            if not isinstance(raw_meta, dict):
+                continue
+            created_at = self._deserialize_datetime(
+                raw_meta.get("pending_order_created_at") or raw_meta.get("entry_signal_timestamp")
             )
-        )
-
-    def _regime_max_holding_minutes(self) -> int:
-        return int(self._get_regime_value("max_position_holding_minutes", self.cfg.max_position_holding_minutes))
-
-    def _regime_cooldown_seconds(self) -> int:
-        return max(10, int(self._get_regime_value("cooldown_seconds", self.cfg.cooldown_seconds)))
-
-    def _regime_loss_cooldown_seconds(self) -> int:
-        return max(
-            10,
-            int(self._get_regime_value("loss_trade_cooldown_seconds", self.cfg.loss_trade_cooldown_seconds)),
-        )
-
-    def _regime_expected_move_pct(self) -> float:
-        return float(self._get_regime_value("expected_move_pct", self.cfg.expected_move_pct))
-
-    def _regime_min_expected_net_profit(self) -> int:
-        return int(self._get_regime_value("min_expected_net_profit", self.cfg.min_expected_net_profit))
-
-    def _regime_min_expected_rr_ratio(self) -> float:
-        return float(self._get_regime_value("min_expected_rr_ratio", self.cfg.min_expected_rr_ratio))
-
-    def _regime_inverse_take_profit_pct(self) -> float:
-        return float(self._get_regime_value("inverse_take_profit_pct", self.cfg.inverse_take_profit_pct))
-
-    def _regime_inverse_stop_loss_pct(self) -> float:
-        return float(self._get_regime_value("inverse_stop_loss_pct", self.cfg.inverse_stop_loss_pct))
-
-    def _regime_inverse_trailing_stop_pct(self) -> float:
-        return float(self._get_regime_value("inverse_trailing_stop_pct", self.cfg.inverse_trailing_stop_pct))
-
-    def _regime_inverse_trailing_stop_activation_gain_pct(self) -> float:
-        return float(
-            self._get_regime_value(
-                "inverse_trailing_stop_activation_gain_pct",
-                self.cfg.inverse_trailing_stop_activation_gain_pct,
+            if created_at is None:
+                continue
+            if (now - created_at).total_seconds() < grace_seconds:
+                continue
+            self._pending_entry_meta.pop(symbol, None)
+            cleared.append(symbol)
+        if cleared:
+            logger.warning(
+                "계좌 보유에서 확인되지 않은 오래된 pending 진입 메타를 정리합니다: %s",
+                ",".join(sorted(cleared)),
             )
+            self._save_daily_state_if_due(force=True)
+
+    def _reconcile_pending_exit_account_quantity(
+        self,
+        pos: PositionState,
+        *,
+        account_quantity: int,
+    ) -> Optional[PositionState]:
+        before_quantity = max(0, int(getattr(pos, "quantity", 0) or 0))
+        after_quantity = max(0, int(account_quantity or 0))
+        if after_quantity >= before_quantity or getattr(pos, "pending_exit_started_at", None) is None:
+            return pos
+
+        sell_quantity = before_quantity - after_quantity
+        sell_price = max(0, int(getattr(pos, "pending_exit_reference_price", 0) or 0))
+        if sell_price <= 0:
+            quote = self._quotes_cache.get(pos.symbol)
+            if quote is None:
+                recent_quotes = list(self._recent_quotes.get(pos.symbol, []))
+                quote = recent_quotes[-1] if recent_quotes else None
+            if quote is not None:
+                sell_price = max(0, int(getattr(quote, "current_price", 0) or 0))
+        if sell_price <= 0:
+            logger.warning(
+                "계좌 수량 감소를 확인했지만 매도 추정가가 없어 포지션을 유지합니다: %s %d→%d주",
+                pos.symbol,
+                before_quantity,
+                after_quantity,
+            )
+            return pos
+
+        synthetic = OrderResult(
+            success=True,
+            order_no=str(getattr(pos, "pending_exit_order_no", "") or ""),
+            message="account_quantity_decrease_reconciled",
+            symbol=pos.symbol,
+            side=OrderSide.SELL,
+            quantity=sell_quantity,
+            price=sell_price,
+            reference_price=sell_price,
+            fill_mode="account_reconciled_estimated",
+            requested_reason=str(getattr(pos, "pending_exit_reason", "") or "account_reconcile"),
+            timestamp=self._now(),
         )
-
-    def _regime_inverse_max_hold_minutes(self) -> int:
-        return int(self._get_regime_value("inverse_max_hold_minutes", self.cfg.inverse_max_hold_minutes))
-
-    def _regime_inverse_max_positions(self) -> int:
-        return max(0, int(self._get_regime_value("inverse_max_positions", self.cfg.inverse_max_positions)))
-
-    def _regime_inverse_min_change_rate(self) -> float:
-        return float(self._get_regime_value("inverse_min_change_rate", self.cfg.inverse_min_change_rate))
-
-    def _regime_inverse_min_momentum(self) -> float:
-        return float(self._get_regime_value("inverse_min_momentum", self.cfg.inverse_min_momentum))
-
-    def _regime_inverse_min_bear_score(self) -> int:
-        return int(self._get_regime_value("inverse_min_bear_score", self.cfg.inverse_min_bear_score))
-
-    def _regime_per_stock_alloc_scale(self) -> float:
-        return float(self._get_regime_value("per_stock_alloc_scale", 1.0))
-
-    def _regime_max_stock_alloc_scale(self) -> float:
-        return float(self._get_regime_value("max_stock_alloc_scale", 1.0))
-
-    def _regime_capital_utilization_pct(self) -> float:
-        return self._clamp_ratio(
-            self._get_regime_value("capital_utilization_pct", self.cfg.capital_utilization_pct),
-            self.cfg.capital_utilization_pct,
+        logger.warning(
+            "pending 매도 후 계좌 수량 감소를 체결로 반영합니다: %s %d주 @ %d원 (계좌 %d→%d주)",
+            pos.symbol,
+            sell_quantity,
+            sell_price,
+            before_quantity,
+            after_quantity,
         )
-
-    def _regime_max_single_position_pct(self) -> float:
-        return self._clamp_ratio(
-            self._get_regime_value("max_single_position_pct", self.cfg.max_single_position_pct),
-            self.cfg.max_single_position_pct,
-        )
-
-    def _allocation_capital_base(self) -> int:
-        realized_net = int(self.daily_pnl.realized_net_pnl)
-        return max(0, self.cfg.seed_money + realized_net)
-
-    def _regime_target_total_exposure_amount(self) -> int:
-        capital_base = self._allocation_capital_base()
-        return int(capital_base * self._regime_capital_utilization_pct() * self._risk_exposure_scale())
-
-    def _regime_max_single_position_amount(self) -> int:
-        capital_base = self._allocation_capital_base()
-        return int(capital_base * self._regime_max_single_position_pct() * self._risk_exposure_scale())
-
-    def _regime_volume_spike_ratio(self) -> float:
-        return float(self._get_regime_value("volume_spike_ratio", self.cfg.volume_spike_ratio))
-
-    def _regime_volume_spike_ratio_min(self) -> float:
-        return float(self._get_regime_value("volume_spike_ratio_min", self.cfg.volume_spike_ratio_min))
-
-    def _regime_volume_spike_abs_min(self) -> int:
-        return int(self._get_regime_value("volume_spike_abs_min", self.cfg.volume_spike_abs_min))
-
-    def _regime_bear_score_for_new_long(self) -> int:
-        return int(self._get_regime_value("min_bear_score_for_new_long", self.cfg.min_bear_score_for_new_long))
-
-    def _regime_bear_market_entry_score(self) -> float:
-        return float(self._get_regime_value("bear_market_entry_score", self.cfg.bear_market_entry_score))
+        self.on_order_filled(synthetic)
+        return self.positions.get(pos.symbol)
 
     def sync_positions_from_account(self, account_positions: List[Position]):
-        """계좌 보유를 전략 포지션 상태와 동기화한다.
-
-        장중 재시작 시 메모리 상태가 초기화되더라도 실제 보유 기준으로
-        포지션 한도/추가매수 판단이 일관되게 동작하도록 한다.
-        """
-        synced: Dict[str, PositionState] = {}
         now = self._now()
-
-        for p in account_positions or []:
-            qty = int(p.quantity or 0)
-            if qty <= 0:
+        synced: Dict[str, PositionState] = {}
+        account_symbols = {
+            str(getattr(item, "symbol", "") or "").strip()
+            for item in (account_positions or [])
+            if str(getattr(item, "symbol", "") or "").strip()
+        }
+        self._restore_ignore_until = {
+            symbol: until
+            for symbol, until in self._restore_ignore_until.items()
+            if until > now
+        }
+        for item in account_positions or []:
+            symbol = str(getattr(item, "symbol", "") or "").strip()
+            if not symbol:
                 continue
-
-            avg_price = int(round(float(p.avg_price or 0)))
-            if avg_price <= 0:
+            ignore_until = self._restore_ignore_until.get(symbol)
+            if ignore_until is not None and ignore_until > now:
+                logger.info("계좌 복구 무시 유지: %s (%.0fs 남음)", symbol, (ignore_until - now).total_seconds())
                 continue
-
-            current_price = int(p.current_price or 0)
-            snapshot = self._loaded_position_meta.get(p.symbol, {})
-            restored_buy_time = self._parse_state_datetime(snapshot.get("buy_time"))
-            if restored_buy_time is None:
-                restored_buy_time = now
-            restored_high = int(snapshot.get("high_since_buy", 0) or 0)
-            restored_invested = int(snapshot.get("invested_amount", 0) or 0)
-            synced[p.symbol] = PositionState(
-                symbol=p.symbol,
-                buy_price=avg_price,
-                quantity=qty,
-                invested_amount=restored_invested if restored_invested > 0 else avg_price * qty,
-                buy_time=restored_buy_time,
-                high_since_buy=max(
-                    avg_price,
-                    current_price if current_price > 0 else avg_price,
-                    restored_high,
-                ),
+            existing = self.positions.get(symbol)
+            if existing is not None:
+                account_quantity = max(0, int(getattr(item, "quantity", 0) or 0))
+                existing = self._reconcile_pending_exit_account_quantity(
+                    existing,
+                    account_quantity=account_quantity,
+                )
+                if existing is None:
+                    continue
+                previous_quantity = max(0, int(getattr(existing, "quantity", 0) or 0))
+                pending_reference_price = max(
+                    0,
+                    int(getattr(existing, "pending_entry_reference_price", 0) or 0),
+                    int(getattr(existing, "entry_signal_price", 0) or 0),
+                )
+                existing.quantity = account_quantity
+                existing.buy_price = int(round(float(getattr(item, "avg_price", existing.buy_price) or existing.buy_price)))
+                existing.invested_amount = max(0, existing.buy_price * existing.quantity)
+                existing.high_since_buy = max(existing.high_since_buy, existing.buy_price)
+                if getattr(existing, "pending_entry_started_at", None) is not None:
+                    if pending_reference_price > 0:
+                        existing.entry_signal_price = int(pending_reference_price)
+                    self._reprice_position_ev_after_confirmed_entry(
+                        existing,
+                        signal_price=int(pending_reference_price),
+                    )
+                    self._clear_pending_entry_position_state(existing)
+                    self._pending_entry_meta.pop(symbol, None)
+                    logger.warning(
+                        "계좌 동기화로 pending 매수 임시 포지션을 확정합니다: %s %d주 @ %d원",
+                        symbol,
+                        int(existing.quantity or 0),
+                        int(existing.buy_price or 0),
+                    )
+                elif account_quantity > previous_quantity:
+                    self._reprice_position_ev_after_confirmed_entry(
+                        existing,
+                        signal_price=int(pending_reference_price),
+                    )
+                    logger.warning(
+                        "계좌 수량 증가를 실제 총수량 기준 EV에 반영합니다: %s %d→%d주 @ %d원",
+                        symbol,
+                        previous_quantity,
+                        account_quantity,
+                        int(existing.buy_price or 0),
+                    )
+                if not str(getattr(existing, "trade_key", "") or "").strip():
+                    existing.trade_key = self._make_trade_key(symbol, existing.buy_time)
+                synced[symbol] = existing
+                continue
+            pending_meta = self._pending_entry_meta.pop(symbol, None)
+            if isinstance(pending_meta, dict):
+                buy_price = int(round(float(getattr(item, "avg_price", 0) or 0)))
+                quantity = int(getattr(item, "quantity", 0) or 0)
+                position = self._position_from_entry_meta(
+                    symbol=symbol,
+                    buy_price=buy_price,
+                    quantity=quantity,
+                    invested_amount=max(0, buy_price * quantity),
+                    buy_time=now,
+                    meta=pending_meta,
+                )
+                self._reprice_position_ev_after_confirmed_entry(
+                    position,
+                    signal_price=int(
+                        pending_meta.get(
+                            "entry_signal_price",
+                            pending_meta.get("pending_order_reference_price", 0),
+                        )
+                        or 0
+                    ),
+                )
+                synced[symbol] = position
+                logger.warning(
+                    "계좌 동기화로 pending 매수 체결을 실전 포지션으로 복구합니다: %s %d주 @ %d원",
+                    symbol,
+                    quantity,
+                    buy_price,
+                )
+                continue
+            restored_quantity = int(getattr(item, "quantity", 0) or 0)
+            restored_buy_price = int(round(float(getattr(item, "avg_price", 0) or 0)))
+            recovered_position = self._pop_estimated_exit_for_account_restore(
+                symbol,
+                quantity=restored_quantity,
+                buy_price=restored_buy_price,
+                now=now,
+            )
+            if recovered_position is not None:
+                synced[symbol] = recovered_position
+                continue
+            restored_strategy = OPENING_STRATEGY if self._opening_conviction_window_active() else INTRADAY_STRATEGY
+            synced[symbol] = PositionState(
+                symbol=symbol,
+                buy_price=restored_buy_price,
+                quantity=restored_quantity,
+                invested_amount=int(getattr(item, "eval_amount", 0) or 0),
+                buy_time=now,
                 is_restored=True,
                 restored_at=now,
-                entry_strategy_name=str(snapshot.get("entry_strategy_name", "") or ""),
-                entry_setup_name=str(snapshot.get("entry_setup_name", "") or ""),
-                entry_reason=str(snapshot.get("entry_reason", "") or ""),
-                regime_label=str(snapshot.get("regime_label", "") or ""),
-                bear_score=int(snapshot.get("bear_score", 0) or 0),
-                planned_risk_stage=str(snapshot.get("planned_risk_stage", "") or ""),
-                entry_grade=str(snapshot.get("entry_grade", "") or ""),
-                leader_score=float(snapshot.get("leader_score", 0.0) or 0.0),
-                leader_percentile=float(snapshot.get("leader_percentile", 0.0) or 0.0),
-                entry_grade_math=str(snapshot.get("entry_grade_math", "") or ""),
-                entry_ev=float(snapshot.get("entry_ev", 0.0) or 0.0),
-                entry_ev_confidence=str(snapshot.get("entry_ev_confidence", "") or ""),
-                bull_prob=float(snapshot.get("bull_prob", 0.0) or 0.0),
-                neutral_prob=float(snapshot.get("neutral_prob", 0.0) or 0.0),
-                soft_bear_prob=float(snapshot.get("soft_bear_prob", 0.0) or 0.0),
-                bear_prob=float(snapshot.get("bear_prob", 0.0) or 0.0),
-                partial_exit_done=bool(snapshot.get("partial_exit_done", False)),
+                entry_strategy_name=restored_strategy,
+                entry_setup_name="restored_position",
+                entry_reason="restored_position",
+                regime_label=self._resolve_regime_profile_name(),
+                bear_score=self._bear_score,
+                planned_risk_stage=self._current_bull_risk_mode(),
+                queue_source="account_restore",
+                live_route=restored_strategy,
+                trade_key=self._make_trade_key(symbol, now),
             )
-
+            order_logger.info(
+                "기존보유 복원: %s %d주 @ 평균단가 %s원 "
+                "(실시간 매수주문 아님, source=account_restore, setup_name=restored_position)",
+                symbol,
+                restored_quantity,
+                f"{restored_buy_price:,}" if restored_buy_price > 0 else "0",
+            )
+        for symbol, existing in list(self.positions.items()):
+            if symbol in synced or symbol in account_symbols:
+                continue
+            if self._position_pending_entry_reconcile_pending(existing, now=now):
+                synced[symbol] = existing
+                logger.warning(
+                    "계좌 보유 미반영 pending 매수 포지션을 로컬에서 유지합니다: %s %d주 @ %d원 "
+                    "(fill_mode=%s)",
+                    symbol,
+                    int(existing.quantity or 0),
+                    int(existing.buy_price or 0),
+                    str(getattr(existing, "pending_entry_fill_mode", "") or ""),
+                )
+                continue
+            if getattr(existing, "pending_entry_started_at", None) is not None:
+                logger.warning(
+                    "유예시간 동안 계좌에서 확인되지 않은 pending 매수 임시 포지션을 손익 없이 제거합니다: "
+                    "%s %d주 @ %d원",
+                    symbol,
+                    int(existing.quantity or 0),
+                    int(existing.buy_price or 0),
+                )
+                continue
+            if getattr(existing, "pending_exit_started_at", None) is not None:
+                reconciled = self._reconcile_pending_exit_account_quantity(
+                    existing,
+                    account_quantity=0,
+                )
+                if reconciled is not None:
+                    synced[symbol] = reconciled
         self.positions = synced
-        self._startup_rebalance_active = len(self.positions) >= self._effective_max_position_count()
-        self._startup_rebalance_ticks = (
-            self.cfg.startup_full_position_recheck_ticks if self._startup_rebalance_active else 0
-        )
-        logger.info(
-            "계좌 보유 동기화 완료: %d종목 (최대 허용 %d, 재시작복구=%s, %d틱)",
-            len(self.positions),
-            self._effective_max_position_count(),
-            self._startup_rebalance_active,
-            self._startup_rebalance_ticks,
-        )
+        self._clear_account_absent_stale_pending_entries(account_symbols)
+        self._state_restored_today = self._state_restored_today or bool(synced)
+        self._save_daily_state()
 
-    # --- 내부 로직 ---
-
-    def _build_pool(self):
-        """종목 풀을 구성한다."""
-        if self._pool_override:
-            self._pool = list(self._pool_override)
-            # 인버스 ETF가 override에 없으면 추가
-            if self.cfg.inverse_enabled:
-                for sym in self.cfg.inverse_etfs:
-                    if sym not in self._pool:
-                        self._pool.append(sym)
-            self._last_pool_refresh = self._now()
+    # ------------------------------------------------------------------
+    # 데이터 / 게이트 로딩
+    # ------------------------------------------------------------------
+    def _load_entry_ev_data(self):
+        report_root = Path("reports")
+        if not report_root.exists():
+            self._entry_ev_table = {}
+            self._entry_ev_history_records = []
             return
-
-        pool = set(self.cfg.static_watchlist)
-        appeared: set[str] = set()
-        direct_dynamic: set[str] = set()
-        strong_leader_snapshot: Dict[str, dict] = {}
-        math_queue_symbols: List[str] = []
-        math_backfill_symbols: List[str] = []
-        legacy_backfill_symbols: List[str] = []
-        math_queue_source: Dict[str, str] = {}
-
-        # 인버스 ETF 추가
-        if self.cfg.inverse_enabled:
-            for sym in self.cfg.inverse_etfs:
-                pool.add(sym)
-
-        if self.market_data:
+        raw_scorecards = load_recent_scorecards(
+            report_root,
+            max(int(self.config.ev_window_days), int(self.config.conviction_ev_window_days)),
+        )
+        max_age_days = max(
+            int(getattr(self.config, "ev_scorecard_max_age_days", 8) or 0),
+            int(getattr(self.config, "conviction_ev_scorecard_max_age_days", 14) or 0),
+        )
+        scorecards: List[Dict[str, Any]] = []
+        today = date.today()
+        for card in raw_scorecards:
+            card_date_text = str(card.get("date") or "")
             try:
-                rising = self.market_data.get_fluctuation_ranking(
-                    count=max(self.cfg.dynamic_pool_size, self.cfg.dynamic_pool_ranking_fetch_count),
-                    min_change_rate=self.cfg.min_change_rate,
-                    max_change_rate=self.cfg.max_change_rate,
-                    min_price=self.cfg.min_price,
-                    min_volume=self.cfg.min_volume,
-                )
-                by_rank = rising[: max(0, int(self.cfg.dynamic_pool_size))]
-                by_turnover = sorted(
-                    rising,
-                    key=lambda item: (
-                        self._ranking_trade_amount(item),
-                        float(item.change_rate),
-                        -int(item.rank or 0),
-                    ),
-                    reverse=True,
-                )[: max(0, int(self.cfg.dynamic_pool_turnover_slots))]
-                cache_leaders = sorted(
-                    [
-                        quote
-                        for quote in self._quotes_cache.values()
-                        if (
-                            quote.symbol not in self._inverse_symbols
-                            and quote.current_price >= self.cfg.min_price
-                            and quote.change_rate >= self.cfg.dynamic_pool_quote_min_change_rate
-                            and quote.trade_amount > 0
-                        )
-                    ],
-                    key=lambda quote: (
-                        int(quote.trade_amount),
-                        float(quote.change_rate),
-                        int(quote.volume),
-                    ),
-                    reverse=True,
-                )[: max(0, int(self.cfg.dynamic_pool_quote_trade_amount_slots))]
-
-                source_quotes: Dict[str, Quote] = {}
-                for quote in list(self._quotes_cache.values()) + list(cache_leaders) + list(rising):
-                    if quote.symbol in self._inverse_symbols:
-                        continue
-                    if int(getattr(quote, "current_price", 0) or 0) <= 0:
-                        continue
-                    if not all(hasattr(quote, attr) for attr in ("open_price", "high_price", "low_price")):
-                        continue
-                    source_quotes[quote.symbol] = quote
-
-                for item in by_rank:
-                    appeared.add(item.symbol)
-                for item in by_turnover:
-                    appeared.add(item.symbol)
-                for quote in cache_leaders:
-                    appeared.add(quote.symbol)
-                for item in rising:
-                    trade_amount = self._ranking_trade_amount(item)
-                    if not self._is_dynamic_strong_leader_candidate(
-                        symbol=item.symbol,
-                        current_price=int(item.current_price),
-                        change_rate=float(item.change_rate),
-                        trade_amount=trade_amount,
-                        rank=int(item.rank or 0),
-                    ):
-                        continue
-                    strong_leader_snapshot[item.symbol] = {
-                        "change_rate": float(item.change_rate),
-                        "trade_amount": int(trade_amount),
-                        "rank": int(item.rank or 0),
-                    }
-                    direct_dynamic.add(item.symbol)
-                for quote in cache_leaders:
-                    trade_amount = self._quote_trade_amount(quote)
-                    if not self._is_dynamic_strong_leader_candidate(
-                        symbol=quote.symbol,
-                        current_price=int(quote.current_price),
-                        change_rate=float(quote.change_rate),
-                        trade_amount=trade_amount,
-                        rank=None,
-                    ):
-                        continue
-                    existing = strong_leader_snapshot.get(quote.symbol, {})
-                    strong_leader_snapshot[quote.symbol] = {
-                        "change_rate": max(float(existing.get("change_rate", 0.0)), float(quote.change_rate)),
-                        "trade_amount": max(int(existing.get("trade_amount", 0)), int(trade_amount)),
-                        "rank": int(existing.get("rank", 999)),
-                    }
-                    direct_dynamic.add(quote.symbol)
-
-                ranked_math_leaders = self._math_queue_ranked_signals(list(source_quotes.values()))
-                percentile_floor = float(self.cfg.math_queue_percentile_floor)
-                math_queue_limit = max(0, int(self.cfg.math_queue_top_n))
-                for signal in ranked_math_leaders:
-                    if signal.leader_percentile < percentile_floor:
-                        continue
-                    math_queue_symbols.append(signal.symbol)
-                    math_queue_source[signal.symbol] = "math_queue"
-                    if len(math_queue_symbols) >= math_queue_limit:
-                        break
-
-                remaining_backfill = max(0, int(self.cfg.math_queue_backfill_slots))
-                for signal in ranked_math_leaders:
-                    if remaining_backfill <= 0:
-                        break
-                    if signal.symbol in math_queue_source:
-                        continue
-                    math_backfill_symbols.append(signal.symbol)
-                    math_queue_source[signal.symbol] = "math_backfill"
-                    remaining_backfill -= 1
-
-                legacy_candidates: List[str] = []
-                for item in by_turnover:
-                    legacy_candidates.append(item.symbol)
-                for item in by_rank:
-                    legacy_candidates.append(item.symbol)
-                for quote in cache_leaders:
-                    legacy_candidates.append(quote.symbol)
-                for symbol in legacy_candidates:
-                    if remaining_backfill <= 0:
-                        break
-                    if symbol in math_queue_source:
-                        continue
-                    if symbol in legacy_backfill_symbols:
-                        continue
-                    legacy_backfill_symbols.append(symbol)
-                    math_queue_source[symbol] = "legacy_backfill"
-                    remaining_backfill -= 1
-
-                for symbol in math_queue_symbols:
-                    appeared.add(symbol)
-                    direct_dynamic.add(symbol)
-                    quote = source_quotes.get(symbol) or self._quotes_cache.get(symbol)
-                    if quote is not None:
-                        existing = strong_leader_snapshot.get(symbol, {})
-                        strong_leader_snapshot[symbol] = {
-                            "change_rate": max(float(existing.get("change_rate", 0.0)), float(quote.change_rate)),
-                            "trade_amount": max(int(existing.get("trade_amount", 0)), int(self._quote_trade_amount(quote))),
-                            "rank": int(existing.get("rank", 999)),
-                        }
-                for symbol in math_backfill_symbols + legacy_backfill_symbols:
-                    appeared.add(symbol)
-                logger.info(
-                    "동적 풀 갱신: 등락률 %d개 + 거래대금 %d개 + 실시간 리더 %d개 (총 %d종목)",
-                    len(by_rank),
-                    len(by_turnover),
-                    len(cache_leaders),
-                    len(pool),
-                )
-                if math_queue_symbols:
-                    logger.info(
-                        "math leader queue: %d개 [%s]",
-                        len(math_queue_symbols),
-                        self._format_symbol_sample(math_queue_symbols),
-                    )
-                if math_backfill_symbols:
-                    logger.info(
-                        "math backfill: %d개 [%s]",
-                        len(math_backfill_symbols),
-                        self._format_symbol_sample(math_backfill_symbols),
-                    )
-                if legacy_backfill_symbols:
-                    logger.info(
-                        "legacy backfill: %d개 [%s]",
-                        len(legacy_backfill_symbols),
-                        self._format_symbol_sample(legacy_backfill_symbols),
-                    )
-            except Exception as e:
-                logger.warning("등락률 순위 조회 실패, 정적 풀만 사용: %s", e)
-
-        self._pool_build_epoch += 1
-        if self.cfg.enable_pool_persistence_gate:
-            self._record_pool_appearances(appeared)
-            persistent = {
-                sym
-                for sym in appeared
-                if self._is_pool_persistent(sym)
-            }
-            for sym in math_queue_symbols:
-                pool.add(sym)
-            for sym in direct_dynamic:
-                pool.add(sym)
-            for sym in appeared:
-                if sym in persistent:
-                    pool.add(sym)
-            if appeared:
-                logger.info("풀 지속성 반영: %d개 동적 후보 중 %d개 채택",
-                            len(appeared), len(persistent))
-            if direct_dynamic:
-                logger.info(
-                    "강한 리더 즉시 편입: %d개 [%s]",
-                    len(direct_dynamic),
-                    self._format_symbol_sample(direct_dynamic),
-                )
-        else:
-            pool.update(appeared)
-
-        for sym in math_backfill_symbols + legacy_backfill_symbols:
-            pool.add(sym)
-        self._latest_direct_dynamic_symbols = set(direct_dynamic)
-        self._latest_strong_leader_symbols = set(strong_leader_snapshot.keys())
-        self._latest_strong_leader_snapshot = strong_leader_snapshot
-        self._latest_math_queue_symbols = list(math_queue_symbols)
-        self._latest_math_backfill_symbols = list(math_backfill_symbols)
-        self._latest_legacy_backfill_symbols = list(legacy_backfill_symbols)
-        self._latest_math_queue_source = dict(math_queue_source)
-        if strong_leader_snapshot:
-            logger.info(
-                "장중 강한 리더 후보: %d개 [%s]",
-                len(strong_leader_snapshot),
-                self._format_symbol_sample(strong_leader_snapshot.keys()),
-            )
-        self._pool = list(pool)[:55]  # 인버스 포함하여 여유 확보
-        self._last_pool_refresh = self._now()
-        self._refresh_math_leader_signals()
-        leader_rows = []
-        for symbol in sorted(
-            set(math_queue_symbols)
-            | set(math_backfill_symbols)
-            | set(legacy_backfill_symbols)
-            | direct_dynamic
-            | set(strong_leader_snapshot.keys())
-        ):
-            quote = self._quotes_cache.get(symbol)
-            signal = self._latest_math_leader_signals.get(symbol)
-            leader_rows.append(
-                {
-                    "symbol": symbol,
-                    "name": quote.name if quote else "",
-                    "change_rate": float(quote.change_rate if quote else strong_leader_snapshot.get(symbol, {}).get("change_rate", 0.0)),
-                    "trade_amount": int(
-                        self._quote_trade_amount(quote) if quote else strong_leader_snapshot.get(symbol, {}).get("trade_amount", 0)
-                    ),
-                    "leader_score": round(signal.leader_score, 6) if signal else 0.0,
-                    "leader_percentile": round(signal.leader_percentile, 6) if signal else 0.0,
-                    "entry_grade_math": signal.entry_grade if signal else "C",
-                    "queue_source": math_queue_source.get(symbol, ""),
-                    "direct_dynamic": symbol in direct_dynamic,
-                    "strong_leader_candidate": symbol in strong_leader_snapshot,
-                }
-            )
-        self._record_leader_tape("pool_refresh", leader_rows)
-
-    def _record_pool_appearances(self, symbols: set[str]):
-        if not self.cfg.enable_pool_persistence_gate:
-            return
-
-        max_window = max(1, self.cfg.momentum_pool_persistence_window)
-        min_keep_epoch = self._pool_build_epoch - max_window + 1
-
-        for dq in self._pool_appearance.values():
-            while dq and dq[0] < min_keep_epoch:
-                dq.popleft()
-        for sym in list(self._pool_appearance.keys()):
-            if not self._pool_appearance[sym]:
-                self._pool_appearance.pop(sym, None)
-
-        for sym in symbols:
-            dq = self._pool_appearance.setdefault(sym, deque(maxlen=max_window))
-            dq.append(self._pool_build_epoch)
-
-    def _is_pool_persistent(self, symbol: str) -> bool:
-        if not self.cfg.enable_pool_persistence_gate:
-            return True
-        if symbol in self.cfg.static_watchlist:
-            return True
-        dq = self._pool_appearance.get(symbol)
-        if not dq:
-            return False
-        required = max(1, self.cfg.momentum_pool_min_appearances)
-        return len(dq) >= required
-
-    def _is_bullish_regime(self) -> bool:
-        """약세점수 기반 완화 모드 판정."""
-        return self._bear_score <= 0 or self._is_bull_bias_market()
-
-    def _meets_leader_support_bull_bias_override(
-        self,
-        *,
-        index_info: Optional[tuple[float, float, float]],
-        quote_decline_ratio: Optional[float],
-    ) -> bool:
-        leaders = list(self._latest_strong_leader_snapshot.values())
-        if len(leaders) < max(1, int(self.cfg.leader_support_bull_bias_min_count)):
-            return False
-        avg_change = sum(float(item.get("change_rate", 0.0)) for item in leaders) / len(leaders)
-        avg_trade_amount = sum(int(item.get("trade_amount", 0)) for item in leaders) / len(leaders)
-        if avg_change < float(self.cfg.leader_support_bull_bias_min_change_rate):
-            return False
-        if avg_trade_amount < float(self.cfg.leader_support_bull_bias_min_trade_amount):
-            return False
-        if (
-            quote_decline_ratio is not None
-            and quote_decline_ratio > float(self.cfg.leader_support_bull_bias_max_decliner_ratio)
-        ):
-            return False
-        if index_info is None:
-            return True
-        current, ma20, ma5 = index_info
-        if current <= 0 or ma20 <= 0 or ma5 <= 0:
-            return False
-        return current >= ma20 or current >= ma5
-
-    def _meets_strong_bull_override(
-        self,
-        *,
-        index_info: Optional[tuple[float, float, float]],
-        quote_avg_change: Optional[float],
-        quote_decline_ratio: Optional[float],
-        quote_count: int,
-    ) -> bool:
-        if index_info is None:
-            return False
-        current, ma20, ma5 = index_info
-        if current <= 0 or ma20 <= 0 or ma5 <= 0:
-            return False
-        if current <= ma20 or current <= ma5:
-            return False
-        gap_pct = ((current - ma20) / ma20) * 100 if ma20 > 0 else 0.0
-        if gap_pct < float(self.cfg.strong_bull_override_index_gap_pct):
-            return False
-        if quote_count < max(1, int(self.cfg.strong_bull_override_min_quote_count)):
-            return False
-        if quote_avg_change is None or quote_avg_change < float(self.cfg.strong_bull_override_avg_change_rate_threshold):
-            return False
-        if quote_decline_ratio is None or quote_decline_ratio > float(self.cfg.strong_bull_override_max_decliner_ratio):
-            return False
-        return True
-
-    def _meets_index_support_bull_bias_override(
-        self,
-        *,
-        index_info: Optional[tuple[float, float, float]],
-        quote_avg_change: Optional[float],
-        quote_decline_ratio: Optional[float],
-        quote_count: int,
-    ) -> bool:
-        if index_info is None:
-            return False
-        current, ma20, ma5 = index_info
-        if current <= 0 or ma20 <= 0 or ma5 <= 0:
-            return False
-        if current <= ma20 or current <= ma5:
-            return False
-        gap_pct = ((current - ma20) / ma20) * 100 if ma20 > 0 else 0.0
-        if gap_pct < float(self.cfg.index_support_bull_bias_index_gap_pct):
-            return False
-        if quote_count < max(1, int(self.cfg.index_support_bull_bias_min_quote_count)):
-            return False
-        if quote_avg_change is None or quote_avg_change < float(self.cfg.index_support_bull_bias_avg_change_rate_threshold):
-            return False
-        if quote_decline_ratio is None or quote_decline_ratio > float(self.cfg.index_support_bull_bias_max_decliner_ratio):
-            return False
-        return True
-
-    def _is_bull_bias_market(self) -> bool:
-        if self._leader_support_bull_bias_active:
-            return True
-        if self._index_support_bull_bias_active:
-            return True
-        if self._strong_bull_override_active:
-            return True
-        if self._bear_score != 1:
-            return False
-        index_info = self._cached_index_regime_info
-        if index_info:
-            current, ma20, ma5 = index_info
-            if current <= 0 or current <= ma20 or current <= ma5:
-                return False
-        elif self.market_data is not None:
-            return False
-
-        active_quotes = self._active_pool_quotes(include_inverse=False)
-        if len(active_quotes) < 4:
-            return False
-
-        avg_change = sum(item.change_rate for item in active_quotes) / len(active_quotes)
-        declining_ratio = (
-            sum(1 for item in active_quotes if item.change_rate < 0) / len(active_quotes)
+                card_date = date.fromisoformat(card_date_text)
+            except ValueError:
+                scorecards.append(card)
+                continue
+            if max_age_days <= 0 or (today - card_date).days <= max_age_days:
+                scorecards.append(card)
+        self._entry_ev_table = build_entry_ev_table(
+            scorecards,
+            window_days=int(self.config.ev_window_days),
+            min_samples=int(self.config.ev_min_samples),
         )
-        return (
-            avg_change >= float(self.cfg.bull_bias_avg_change_rate_threshold)
-            and declining_ratio <= float(self.cfg.bull_bias_max_decliner_ratio)
-        )
+        history_records: List[Dict[str, Any]] = []
+        conviction_window = int(self.config.conviction_ev_window_days)
+        window_cards = scorecards[-conviction_window:] if conviction_window > 0 else scorecards
+        for card in window_cards:
+            history_records.extend(((card.get("log_analysis") or {}).get("trade_records") or []))
+        self._entry_ev_history_records = history_records
 
-    def _check_market_regime(self, quotes: Optional[List[Quote]] = None, force: bool = False):
-        """KOSPI + 실시간 후보군 추세를 결합해 약세 점수를 계산한다."""
+    # ------------------------------------------------------------------
+    # 레짐 / 시간 / 공통 상태
+    # ------------------------------------------------------------------
+    def _market_elapsed_since_open_seconds(self) -> int:
         now = self._now()
-        index_code = "0001"
+        session_start = self._session_start_at or now.replace(hour=9, minute=0, second=0, microsecond=0)
+        return max(0, int((now - session_start).total_seconds()))
 
-        quote_estimate = (
-            self._estimate_market_from_quotes(quotes)
-            if quotes is not None else None
+    def _minutes_since_market_open(self) -> int:
+        return self._market_elapsed_since_open_seconds() // 60
+
+
+    def _market_close_minutes_since_open(self) -> int:
+        now = self._now()
+        session_start = self._session_start_at or now.replace(hour=9, minute=0, second=0, microsecond=0)
+        market_close = session_start.replace(hour=15, minute=30, second=0, microsecond=0)
+        return max(0, int((market_close - session_start).total_seconds() // 60))
+
+
+
+
+    def _opening_conviction_window_active(self) -> bool:
+        if not self.config.enable_opening_conviction_lane:
+            return False
+        return self._minutes_since_market_open() < int(self.config.opening_conviction_window_minutes)
+
+    def _intraday_conviction_window_active(self) -> bool:
+        if not self.config.enable_intraday_conviction_lane:
+            return False
+        minutes = self._minutes_since_market_open()
+        if minutes < int(self.config.opening_conviction_window_minutes):
+            return False
+        end_minutes = min(
+            int(getattr(self.config, "intraday_conviction_end_minutes_after_open", 381) or 381),
+            self._market_close_minutes_since_open(),
         )
-        quote_score = quote_estimate[0] if quote_estimate is not None else None
-        quote_avg_change = quote_estimate[1] if quote_estimate is not None else None
-        quote_decline_ratio = quote_estimate[2] if quote_estimate is not None else None
+        return minutes < end_minutes
 
-        if (
-            quotes is None
-            and not force
-            and self._last_regime_check_at is not None
-            and (now - self._last_regime_check_at).total_seconds() < 120
-        ):
+    def _opening_fast_window_active(self) -> bool:
+        return self.config.enable_opening_fast_lane and self._minutes_since_market_open() < int(self.config.opening_fast_window_minutes)
+
+    def _opening_candidate_window_active(self) -> bool:
+        return self._minutes_since_market_open() < int(self.config.opening_candidate_window_minutes)
+
+    def _resolve_regime_profile_name(self) -> str:
+        probs = self._latest_regime_probabilities
+        if probs is not None:
+            dominant = probs.dominant_profile()
+            if dominant == "bull":
+                return "bull"
+            if dominant == "soft_bear":
+                return "soft_bear"
+            if dominant == "bear":
+                return "bear"
+            return "neutral"
+        if self._bear_score >= 3:
+            return "bear"
+        if self._bear_score >= 2:
+            return "soft_bear"
+        if self._bear_score == 1:
+            return "neutral"
+        return "bull"
+
+    def _current_bull_risk_mode(self) -> str:
+        first, second, third = self.config.bull_risk_mode_loss_thresholds
+        count = int(self._bull_loss_count_today)
+        if count >= int(third):
+            if self._bull_risk_stop_softened_by_market_context():
+                return "restricted"
+            return "stop"
+        if count >= int(second):
+            return "restricted"
+        if count >= int(first):
+            return "guarded"
+        return "normal"
+
+    def _bull_risk_stop_softened_by_market_context(self) -> bool:
+        if not bool(getattr(self.config, "bull_risk_mode_stop_soften_enabled", True)):
+            return False
+        if self._halted:
+            return False
+        realized = int(self._realized_net_pnl_for_daily_breaker())
+        min_net = int(getattr(self.config, "bull_risk_mode_stop_soften_min_net_pnl", -2500) or -2500)
+        if realized < min_net:
+            return False
+        if self._resolve_regime_profile_name() == "bear":
+            return False
+        if int(self._bear_score) >= 2 and not self._strong_bull_override_active:
+            return False
+        return self._strong_bull_override_active or self._bull_market_context in {"broad_bull", "bull"}
+
+    def _recover_bull_loss_count_after_win(self, net_pnl: int) -> None:
+        if not bool(getattr(self.config, "bull_risk_mode_profit_recovery_enabled", True)):
             return
-
-        if not self.market_data:
-            self._index_support_bull_bias_active = False
-            self._strong_bull_override_active = False
-            fallback_score = 0 if quote_score is None else max(0, min(int(quote_score), 3))
-            self._bear_score = fallback_score
-            self._bear_market = fallback_score >= 2
-            self._last_regime_check_at = now
-            if quote_score is not None:
-                logger.info(
-                    "시장 레짐(백테스트): quote=%d(평균%.2f%%, 하락비율%.1f%%), 최종=%d",
-                    quote_score,
-                    quote_avg_change,
-                    quote_decline_ratio * 100,
-                    fallback_score,
-                )
+        if int(self._bull_loss_count_today) <= 0:
             return
-
-        index_score = self._cached_index_regime_score
-        index_info = self._cached_index_regime_info
-        index_error = self._cached_index_regime_error
-        should_refresh_index = (
-            force
-            or self._last_index_regime_check_at is None
-            or (now - self._last_index_regime_check_at).total_seconds() >= 120
+        threshold = max(1, int(getattr(self.config, "bull_risk_mode_profit_recovery_min_net", 1200) or 1200))
+        if int(net_pnl) < threshold:
+            return
+        self._bull_loss_count_today = max(0, int(self._bull_loss_count_today) - 1)
+        logger.info(
+            "수익 회복으로 상승장 손절 카운트를 낮춥니다: net_pnl=%d bull_loss_count=%d",
+            int(net_pnl),
+            int(self._bull_loss_count_today),
         )
 
-        if should_refresh_index:
-            previous_index_score = self._cached_index_regime_score
-            previous_index_info = self._cached_index_regime_info
-            index_score = 0
-            index_info = None
-            index_error = None
-            try:
-                end_date = now.strftime("%Y%m%d")
-                start_date = (now - timedelta(days=45)).strftime("%Y%m%d")
+    def _cooldown_remaining(self, cooldowns: Dict[str, datetime], key: str) -> float:
+        normalized = str(key or "").strip()
+        if not normalized:
+            return 0.0
+        until = cooldowns.get(normalized)
+        if until is None:
+            return 0.0
+        remaining = (until - self._now()).total_seconds()
+        if remaining <= 0:
+            cooldowns.pop(normalized, None)
+            return 0.0
+        return float(remaining)
 
-                df = self.market_data.get_index_daily_prices(index_code, start_date, end_date)
-                if df.empty or len(df) < 20:
-                    index_info = None
-                else:
-                    close_col = None
-                    for candidate in ("bstp_nmix_prpr", "bstp_nmix_oprc", "stck_clpr"):
-                        if candidate in df.columns:
-                            close_col = candidate
-                            break
+    def _mark_cooldown(self, cooldowns: Dict[str, datetime], key: str, *, seconds: int) -> None:
+        normalized = str(key or "").strip()
+        cooldown_seconds = max(0, int(seconds))
+        if not normalized or cooldown_seconds <= 0:
+            return
+        candidate_until = self._now() + timedelta(seconds=cooldown_seconds)
+        current_until = cooldowns.get(normalized)
+        if current_until is None or candidate_until > current_until:
+            cooldowns[normalized] = candidate_until
+            self._save_daily_state_if_due(force=True)
 
-                    if close_col is None:
-                        raise KeyError("일봉 close 컬럼 미검출")
+    def _symbol_entry_cooldown_remaining(self, symbol: str) -> float:
+        return self._cooldown_remaining(self._symbol_entry_cooldown_until, symbol)
 
-                    close_series = pd.to_numeric(df[close_col], errors="coerce")
-                    if "stck_bsop_date" in df.columns:
-                        date_series = pd.to_numeric(df["stck_bsop_date"], errors="coerce")
-                        closes = (
-                            pd.DataFrame({"date": date_series, "close": close_series})
-                            .dropna()
-                            .sort_values("date")
-                            ["close"]
-                        )
-                    else:
-                        closes = close_series.dropna()
+    def _mark_symbol_entry_cooldown(self, symbol: str, *, seconds: int) -> None:
+        self._mark_cooldown(self._symbol_entry_cooldown_until, symbol, seconds=seconds)
 
-                    closes = closes[closes > 0]
+    def _is_symbol_order_unavailable(self, symbol: str) -> bool:
+        normalized = str(symbol or "").strip()
+        if not normalized:
+            return False
+        return normalized in (self._symbol_order_unavailable or {})
 
-                    if len(closes) < 20:
-                        index_info = None
-                    else:
-                        score = 0
-
-                        # 1. KOSPI < MA20: 중기 하락 추세
-                        ma20 = closes.tail(20).mean()
-                        current = closes.iloc[-1]
-                        if current < ma20:
-                            score += 1
-
-                        # 2. MA5 < MA20: 단기 데드크로스
-                        ma5 = closes.tail(5).mean()
-                        if ma5 < ma20:
-                            score += 1
-
-                        # 3. MA10 < MA20: 중기 추세 약세 보강
-                        ma10 = closes.tail(10).mean()
-                        if ma10 < ma20:
-                            score += 1
-
-                        # 4. 3일 연속 하락
-                        if len(closes) >= 4:
-                            last3 = closes.iloc[-3:]
-                            prev3 = closes.iloc[-4:-1]
-                            if all(c < p for c, p in zip(last3, prev3)):
-                                score += 1
-
-                        if current <= 0 or ma20 <= 0 or ma5 <= 0:
-                            raise ValueError("비정상 인덱스 응답(0 이하 값)")
-
-                        index_score = score
-                        index_info = (float(current), float(ma20), float(ma5))
-                if (
-                    index_info is None
-                    and previous_index_info is not None
-                    and all(float(value) > 0 for value in previous_index_info)
-                ):
-                    raise ValueError("비정상 인덱스 응답(유효 일봉 부족)")
-
-                self._cached_index_regime_score = index_score
-                self._cached_index_regime_info = index_info
-                self._cached_index_regime_error = None
-                self._last_index_regime_check_at = now
-            except Exception as e:
-                index_error = e
-                self._cached_index_regime_error = e
-                if (
-                    previous_index_info is not None
-                    and all(float(value) > 0 for value in previous_index_info)
-                ):
-                    index_score = previous_index_score or 0
-                    index_info = previous_index_info
-                    self._cached_index_regime_score = index_score
-                    self._cached_index_regime_info = index_info
-                    logger.warning("인덱스 일봉 비정상 응답 감지, 직전 캐시 유지: %s", e)
-                else:
-                    self._cached_index_regime_score = 0
-                    self._cached_index_regime_info = None
-                self._last_index_regime_check_at = now
-
-        if index_score is None:
-            index_score = 0
-
-        index_weight = 0.7
-        quote_weight = 0.3
-        quote_score_value = quote_score or 0
-        if quote_avg_change is None:
-            quote_avg_change = 0.0
-        if quote_decline_ratio is None:
-            quote_decline_ratio = 0.0
-        quote_count = (
-            len([q for q in quotes if q.symbol not in self._inverse_symbols])
-            if quotes is not None
-            else len(self._active_pool_quotes(include_inverse=False))
+    def _mark_symbol_order_unavailable(self, symbol: str, *, reason: str = "", error_code: str = "") -> None:
+        normalized = str(symbol or "").strip()
+        if not normalized:
+            return
+        self._symbol_order_unavailable[normalized] = {
+            "reason": str(reason or "symbol_order_unavailable"),
+            "error_code": str(error_code or ""),
+            "marked_at": self._now().isoformat(timespec="seconds"),
+        }
+        logger.warning(
+            "종목 주문불가 캐시 등록: %s reason=%s error_code=%s",
+            normalized,
+            self._symbol_order_unavailable[normalized]["reason"],
+            self._symbol_order_unavailable[normalized]["error_code"] or "-",
         )
+        self._save_daily_state_if_due(force=True)
 
-        raw_final_score = float(index_score)
-        if quote_score is not None:
-            raw_final_score = (
-                index_score * index_weight
-                + quote_score_value * quote_weight
-            )
-            # 후보군이 강세/약세로 급하게 치우쳐 있더라도 과잉 전환을 완화
-            if index_score >= 3 and quote_score == 0:
-                raw_final_score -= 1.0
-            elif index_score <= 0 and quote_score >= 3:
-                raw_final_score -= 0.5
 
-        # 스무딩: 직전 판정이 있으면 30% 반영해 급격한 상태 역전 방지
-        prev_score = self._bear_score if self._last_regime_check_at is not None else raw_final_score
-        final_score = round((raw_final_score * 0.75) + (prev_score * 0.25))
-        final_score = max(0, min(4, int(final_score)))
+    def _client_rate_limit_cooldown(self) -> float:
+        client = getattr(self.market_data, "client", None)
+        remaining_fn = getattr(client, "rate_limit_cooldown_remaining", None)
+        if not callable(remaining_fn):
+            return 0.0
+        try:
+            return max(0.0, float(remaining_fn()))
+        except Exception:
+            return 0.0
 
-        index_support_bull_bias = self._meets_index_support_bull_bias_override(
-            index_info=index_info,
-            quote_avg_change=quote_avg_change,
-            quote_decline_ratio=quote_decline_ratio,
-            quote_count=quote_count,
-        )
-        leader_support_bull_bias = self._meets_leader_support_bull_bias_override(
-            index_info=index_info,
-            quote_decline_ratio=quote_decline_ratio,
-        )
-        strong_bull_override = self._meets_strong_bull_override(
-            index_info=index_info,
-            quote_avg_change=quote_avg_change,
-            quote_decline_ratio=quote_decline_ratio,
-            quote_count=quote_count,
-        )
-        if strong_bull_override and final_score >= 2:
-            logger.info(
-                "강세 오버라이드 적용: score %d -> 1 (KOSPI-MA20 %.2f%%, 평균등락 %.2f%%, 하락비율 %.1f%%, 표본 %d개)",
-                final_score,
-                ((index_info[0] - index_info[1]) / index_info[1]) * 100 if index_info[1] > 0 else 0.0,
-                quote_avg_change,
-                quote_decline_ratio * 100,
-                quote_count,
-            )
-            final_score = 1
-        elif index_support_bull_bias and final_score >= 2:
-            logger.info(
-                "지수 지지 bull-bias 적용: score %d -> 1 (KOSPI-MA20 %.2f%%, 평균등락 %.2f%%, 하락비율 %.1f%%, 표본 %d개)",
-                final_score,
-                ((index_info[0] - index_info[1]) / index_info[1]) * 100 if index_info[1] > 0 else 0.0,
-                quote_avg_change,
-                quote_decline_ratio * 100,
-                quote_count,
-            )
-            final_score = 1
-        elif leader_support_bull_bias and final_score >= 2:
-            leader_count = len(self._latest_strong_leader_snapshot)
-            avg_leader_change = (
-                sum(float(item.get("change_rate", 0.0)) for item in self._latest_strong_leader_snapshot.values())
-                / max(1, leader_count)
-            )
-            avg_leader_trade_amount = int(
-                sum(int(item.get("trade_amount", 0)) for item in self._latest_strong_leader_snapshot.values())
-                / max(1, leader_count)
-            )
-            logger.info(
-                "강한 리더 bull-bias 적용: score %d -> 1 (리더 %d개, 평균등락 %.2f%%, 평균거래대금 %s원)",
-                final_score,
-                leader_count,
-                avg_leader_change,
-                f"{avg_leader_trade_amount:,}",
-            )
-            final_score = 1
 
-        final_score = max(0, min(final_score, 3))
-        strong_leader_signals = [
-            signal
-            for signal in self._latest_math_leader_signals.values()
-            if signal.entry_grade == "A"
+    def _long_position_symbols(self) -> List[str]:
+        return list(self.positions.keys())
+
+
+    def _max_long_positions_allowed(self) -> int:
+        profile = self._resolve_regime_profile_name()
+        candidates = [
+            ("bull", self.config.bull_max_position_count),
+            ("neutral", self.config.neutral_max_position_count),
+            ("soft_bear", self.config.soft_bear_max_position_count),
+            ("bear", self.config.bear_max_position_count),
         ]
-        strong_leader_count = len(strong_leader_signals)
-        strong_leader_avg_score = (
-            sum(signal.leader_score for signal in strong_leader_signals) / max(1, strong_leader_count)
-            if strong_leader_signals
-            else 0.0
-        )
-        index_gap_ma20_pct = (
-            ((index_info[0] - index_info[1]) / index_info[1]) * 100
-            if index_info is not None and index_info[1] > 0
-            else 0.0
-        )
-        index_gap_ma5_pct = (
-            ((index_info[0] - index_info[2]) / index_info[2]) * 100
-            if index_info is not None and index_info[2] > 0
-            else 0.0
-        )
-        self._latest_regime_probabilities = compute_regime_probabilities(
-            index_gap_ma20_pct=index_gap_ma20_pct,
-            index_gap_ma5_pct=index_gap_ma5_pct,
-            avg_change=quote_avg_change,
-            decliner_ratio=quote_decline_ratio,
-            strong_leader_count=strong_leader_count,
-            strong_leader_avg_score=strong_leader_avg_score,
-        )
-        discrete_regime = self._resolve_regime_profile_name(final_score)
-        shadow_regime = self._latest_regime_probabilities.dominant_profile()
-        if (
-            self.cfg.enable_math_shadow_layer
-            and shadow_regime != discrete_regime
-            and max(
-                self._latest_regime_probabilities.bull_prob,
-                self._latest_regime_probabilities.neutral_prob,
-                self._latest_regime_probabilities.soft_bear_prob,
-                self._latest_regime_probabilities.bear_prob,
-            ) >= 0.40
-        ):
-            logger.info(
-                "수학 레짐 그림자 불일치: math_regime_shadow_disagreement=1 "
-                "discrete_regime=%s shadow_regime=%s "
-                "bull_prob=%.4f neutral_prob=%.4f soft_bear_prob=%.4f bear_prob=%.4f "
-                "strong_leader_count=%d strong_leader_avg_score=%.4f",
-                discrete_regime,
-                shadow_regime,
-                self._latest_regime_probabilities.bull_prob,
-                self._latest_regime_probabilities.neutral_prob,
-                self._latest_regime_probabilities.soft_bear_prob,
-                self._latest_regime_probabilities.bear_prob,
-                strong_leader_count,
-                strong_leader_avg_score,
-            )
-        self._bear_score = final_score
-        self._bear_market = final_score >= 2
-        self._leader_support_bull_bias_active = leader_support_bull_bias
-        self._index_support_bull_bias_active = index_support_bull_bias
-        self._strong_bull_override_active = strong_bull_override
-        self._last_regime_check_at = now
+        override = {name: value for name, value in candidates}.get(profile)
+        base = int(override if override is not None else self.config.max_position_count)
+        if base <= 0:
+            return 999999
+        if self._bull_market_context == "fragile_bull" and int(self.config.fragile_bull_max_long_positions) > 0:
+            return min(base, int(self.config.fragile_bull_max_long_positions))
+        return base
 
-        if index_info is not None and quote_score is not None:
-            logger.info(
-                "시장 레짐 계산: index=%d(가중 %.2f), quote=%d(평균%.2f%%, 하락비율%.1f%%), 최종=%d(이전=%s, 원시=%.2f), "
-                "지수=%s, KOSPI: %.1f, MA20: %.1f, MA5: %.1f",
-                index_score,
-                index_weight,
-                quote_score,
-                quote_avg_change,
-                quote_decline_ratio * 100,
-                final_score,
-                prev_score,
-                raw_final_score,
-                index_code,
-                index_info[0],
-                index_info[1],
-                index_info[2],
+    # ------------------------------------------------------------------
+    # 시그널 / 큐 / EV
+    # ------------------------------------------------------------------
+    def _leader_signal_for_quote(self, quote: Quote) -> LeaderSignal:
+        cached = self._latest_math_leader_signals.get(quote.symbol)
+        if cached is not None:
+            return cached
+        avg_volume = int(self._avg_volumes.get(quote.symbol, 0) or 0)
+        vs_open_pct = (
+            ((int(quote.current_price or 0) - int(quote.open_price or 0)) / max(1, int(quote.open_price or 0))) * 100.0
+            if int(quote.open_price or 0) > 0
+            else 0.0
+        )
+        high_proximity = (
+            min(1.0, max(0.0, int(quote.current_price or 0) / max(1, int(quote.high_price or 0))))
+            if int(quote.high_price or 0) > 0
+            else 0.0
+        )
+        volume_vs_avg = (int(quote.volume or 0) / avg_volume) if avg_volume > 0 else 1.0
+        recent_accel = 0.0
+        recent_quotes = list(self._recent_quotes.get(quote.symbol, []))
+        if len(recent_quotes) >= 2:
+            start = recent_quotes[0].current_price
+            end = recent_quotes[-1].current_price
+            if int(start or 0) > 0:
+                recent_accel = ((int(end or 0) - int(start or 0)) / int(start)) * 100.0
+        return LeaderSignal(
+            symbol=quote.symbol,
+            leader_score=0.0,
+            leader_percentile=0.0,
+            entry_grade="C",
+            change_rate=float(quote.change_rate or 0.0),
+            trade_amount=int(quote.trade_amount or 0),
+            vs_open_pct=round(vs_open_pct, 6),
+            high_proximity=round(high_proximity, 6),
+            volume_vs_avg=round(volume_vs_avg, 6),
+            reclaim_speed_ticks=99,
+            recent_acceleration_pct=round(recent_accel, 6),
+            effective_leader_score=0.0,
+        )
+
+    def _queue_source_for_symbol(self, symbol: str) -> str:
+        if symbol in self._latest_opening_fast_symbols and self._opening_fast_window_active():
+            return "opening_fast_queue"
+        if symbol in self._latest_opening_hot_symbols and self._opening_candidate_window_active():
+            return "opening_hot_queue"
+        if symbol in self._latest_math_queue_symbols:
+            return "math_queue"
+        if symbol in self._latest_math_backfill_symbols:
+            return "math_backfill"
+        source = self._latest_math_queue_source.get(symbol, "")
+        if source in {"opening_fast_queue", "opening_hot_queue"} and not self._opening_candidate_window_active():
+            return ""
+        return source
+
+    def _strategy_family_names(self, strategy_name: str) -> List[str]:
+        if strategy_name in {OPENING_STRATEGY, INTRADAY_STRATEGY, LEGACY_LONG_STRATEGY}:
+            return [strategy_name, OPENING_STRATEGY, INTRADAY_STRATEGY, LEGACY_LONG_STRATEGY]
+        return [strategy_name]
+
+    def _wrap_estimate(
+        self,
+        strategy_name: str,
+        regime_label: str,
+        hour_bucket: str,
+        entry_grade_math: str,
+        source: ExpectedValueEstimate,
+    ) -> ExpectedValueEstimate:
+        return ExpectedValueEstimate(
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+            hour_bucket=hour_bucket,
+            entry_grade=entry_grade_math,
+            entry_ev=float(source.entry_ev),
+            p_win=float(source.p_win),
+            confidence=str(source.confidence),
+            closed_trades=int(source.closed_trades),
+        )
+
+    def _aggregate_family_history(
+        self,
+        family_names: Sequence[str],
+        regime_label: str,
+        entry_grade_math: str,
+        strategy_name: str,
+        hour_bucket: str,
+    ) -> ExpectedValueEstimate:
+        family = set(family_names)
+
+        def _select_records(*, exact_regime: bool, exact_grade: bool) -> List[Dict[str, Any]]:
+            selected: List[Dict[str, Any]] = []
+            for item in self._entry_ev_history_records:
+                if str(item.get("strategy_name") or "") not in family:
+                    continue
+                item_regime = str(item.get("regime_label") or "")
+                item_grade = str(item.get("entry_grade_math") or "")
+                if exact_regime and item_regime != regime_label:
+                    continue
+                if exact_grade and item_grade != entry_grade_math:
+                    continue
+                selected.append(item)
+            return selected
+
+        min_samples = max(1, int(self.config.ev_min_samples))
+        records = _select_records(exact_regime=True, exact_grade=True)
+        if len(records) < min_samples:
+            broader = _select_records(exact_regime=True, exact_grade=False)
+            if len(broader) > len(records):
+                records = broader
+        if len(records) < min_samples and strategy_name in {OPENING_STRATEGY, INTRADAY_STRATEGY}:
+            broader = _select_records(exact_regime=False, exact_grade=True)
+            if len(broader) > len(records):
+                records = broader
+        if len(records) < min_samples and strategy_name in {OPENING_STRATEGY, INTRADAY_STRATEGY}:
+            broader = _select_records(exact_regime=False, exact_grade=False)
+            if len(broader) > len(records):
+                records = broader
+        if not records:
+            return ExpectedValueEstimate(
+                strategy_name=strategy_name,
+                regime_label=regime_label,
+                hour_bucket=hour_bucket,
+                entry_grade=entry_grade_math,
+                entry_ev=0.0,
+                p_win=0.5,
+                confidence="none",
+                closed_trades=0,
             )
-        elif index_info is not None:
-            logger.info(
-                "시장 레짐 계산: index=%d(가중 %.2f), quote=미사용, 최종=%d, 지수=%s, KOSPI: %.1f, MA20: %.1f, MA5: %.1f",
-                index_score,
-                raw_final_score,
-                final_score,
-                index_code,
-                index_info[0],
-                index_info[1],
-                index_info[2],
-            )
+        pnl_values = [float(item.get("net_pnl") or 0.0) for item in records]
+        wins = sum(1 for value in pnl_values if value > 0)
+        trades = len(pnl_values)
+        p_win = (wins + 1) / (trades + 2)
+        positive = [value for value in pnl_values if value > 0]
+        negative = [value for value in pnl_values if value < 0]
+        avg_win = mean(positive) if positive else 0.0
+        avg_loss = mean(negative) if negative else 0.0
+        entry_ev = (p_win * avg_win) + ((1 - p_win) * avg_loss)
+        if trades < int(self.config.ev_min_samples):
+            confidence = "low"
+        elif trades < int(self.config.ev_min_samples) * 2:
+            confidence = "medium"
         else:
-            if index_error is not None:
-                logger.warning("시장 레짐 확인 실패(일봉): %s", index_error)
-            logger.info(
-                "시장 레짐: 약세점수=%d (index 데이터 미확보)",
-                final_score,
-            )
+            confidence = "high"
+        return ExpectedValueEstimate(
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+            hour_bucket=hour_bucket,
+            entry_grade=entry_grade_math,
+            entry_ev=round(entry_ev, 2),
+            p_win=round(p_win, 6),
+            confidence=confidence,
+            closed_trades=trades,
+        )
 
-    def _cleanup_stale_entry_signals(self, now: datetime):
-        if not self.cfg.enable_entry_confirmation:
-            self._entry_signals.clear()
-            return
-
-        ttl = max(1, self.cfg.entry_confirmation_window_seconds)
-        remove = [
-            symbol
-            for symbol, signal in self._entry_signals.items()
-            if (now - signal.last_seen_at).total_seconds() > ttl
-        ]
-        for symbol in remove:
-            self._entry_signals.pop(symbol, None)
-
-    def _refresh_entry_signal_if_stale(self, symbol: str, now: datetime):
-        if not self.cfg.enable_entry_confirmation:
-            return
-        signal = self._entry_signals.get(symbol)
-        if not signal:
-            return
-        ttl = max(1, self.cfg.entry_confirmation_window_seconds)
-        if (now - signal.last_seen_at).total_seconds() > ttl:
-            self._entry_signals.pop(symbol, None)
-
-    def _rank_long_entry_candidates(
+    def _entry_ev_for_context(
         self,
-        quotes: List[Quote],
-    ) -> List[tuple[float, Quote]]:
-        if self._math_live_layer_enabled():
-            math_candidates = self._rank_long_entry_candidates_math_first(quotes)
-            if math_candidates:
-                return math_candidates
-        return self._rank_long_entry_candidates_legacy(quotes)
-
-    def _rank_long_entry_candidates_legacy(
-        self,
-        quotes: List[Quote],
-    ) -> List[tuple[float, Quote]]:
-        candidates: List[tuple[float, Quote]] = []
-        profile_name = self._resolve_regime_profile_name()
-        soft_bear_leader_lane = profile_name == "soft_bear" and self._soft_bear_strong_leader_lane_active()
-        if profile_name == "bear":
-            return candidates
-        if profile_name == "soft_bear" and not soft_bear_leader_lane:
-            return candidates
-        is_opening_guard = self._is_early_session_guard_active()
-        for q in quotes:
-            if q.symbol in self.positions:
-                continue
-            if q.symbol in self._inverse_symbols:
-                continue
-            if q.current_price <= 0 or q.current_price < self.cfg.min_price:
-                continue
-            min_change_rate = self._regime_min_change_rate()
-            if self._is_bullish_regime():
-                min_change_rate = self._regime_bullish_min_change_rate()
-            if soft_bear_leader_lane:
-                min_change_rate = float(self.cfg.soft_bear_strong_leader_min_change_rate)
-            if is_opening_guard and self._is_bullish_regime():
-                min_change_rate += self.cfg.early_session_min_change_rate_boost
-            if q.change_rate < min_change_rate:
-                continue
-            score = self._calc_momentum_score(q)
-            min_score = self._regime_min_momentum_score()
-            if self._is_bullish_regime():
-                min_score = self._regime_bullish_min_momentum_score()
-            if soft_bear_leader_lane:
-                min_score = float(self.cfg.soft_bear_strong_leader_min_momentum)
-            if is_opening_guard and self._is_bullish_regime():
-                min_score += self.cfg.early_session_min_score_boost
-            if score < min_score:
-                logger.debug(
-                    "진입 스킵(점수 미달): %s 점수=%.1f, 임계=%.1f",
-                    q.symbol,
-                    score,
-                    min_score,
-                )
-                continue
-            if soft_bear_leader_lane and not self._is_soft_bear_strong_leader_long_candidate(q, score=score):
-                continue
-            candidates.append((score, q))
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates
-
-    def _rank_long_entry_candidates_math_first(
-        self,
-        quotes: List[Quote],
-    ) -> List[tuple[float, Quote]]:
-        candidates: List[tuple[float, Quote]] = []
-        profile_name = self._resolve_regime_profile_name()
-        if profile_name == "bear":
-            return candidates
-
-        quotes_by_symbol = {quote.symbol: quote for quote in quotes}
-        ordered_symbols: List[str] = []
-        ordered_symbols.extend(self._latest_math_queue_symbols)
-        ordered_symbols.extend(self._latest_math_backfill_symbols)
-        ordered_symbols.extend(self._latest_legacy_backfill_symbols)
-        ordered_symbols.extend([quote.symbol for quote in quotes])
-
-        seen: set[str] = set()
-        for symbol in ordered_symbols:
-            if symbol in seen:
-                continue
-            seen.add(symbol)
-            quote = quotes_by_symbol.get(symbol) or self._quotes_cache.get(symbol)
-            if quote is None:
-                continue
-            if quote.symbol in self.positions or quote.symbol in self._inverse_symbols:
-                continue
-            if quote.current_price <= 0 or quote.current_price < self.cfg.min_price:
-                continue
-
-            signal = self._leader_signal_for_quote(quote)
-            queue_source = self._math_queue_source_for_symbol(quote.symbol)
-            if not queue_source:
-                continue
+        *,
+        strategy_name: str,
+        regime_label: str,
+        entry_grade_math: str,
+    ) -> ExpectedValueEstimate:
+        hour_bucket = self._now().strftime("%H")
+        family = self._strategy_family_names(strategy_name)
+        candidates: List[Tuple[int, ExpectedValueEstimate]] = []
+        for family_name in family:
+            for (table_strategy, table_regime, table_hour, table_grade), estimate in self._entry_ev_table.items():
+                if table_strategy != family_name or table_regime != regime_label:
+                    continue
+                priority = 100
+                if table_grade == entry_grade_math and table_hour == hour_bucket:
+                    priority = 0
+                elif table_grade == entry_grade_math:
+                    priority = 1
+                elif table_hour == hour_bucket:
+                    priority = 2
+                elif table_grade == "unknown":
+                    priority = 3
+                else:
+                    priority = 4
+                candidates.append((priority, estimate))
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], -int(item[1].closed_trades), -float(item[1].entry_ev)))
+            best = candidates[0][1]
+            wrapped = self._wrap_estimate(strategy_name, regime_label, hour_bucket, entry_grade_math, best)
             if (
-                signal.leader_percentile < float(self.cfg.math_queue_percentile_floor)
-                and queue_source == "math_queue"
+                strategy_name in {OPENING_STRATEGY, INTRADAY_STRATEGY}
+                and int(wrapped.closed_trades) < int(self.config.ev_min_samples)
+            ):
+                aggregated = self._aggregate_family_history(
+                    family,
+                    regime_label,
+                    entry_grade_math,
+                    strategy_name,
+                    hour_bucket,
+                )
+                if int(aggregated.closed_trades) >= int(wrapped.closed_trades):
+                    return aggregated
+            return wrapped
+        if strategy_name in {OPENING_STRATEGY, INTRADAY_STRATEGY}:
+            aggregated = self._aggregate_family_history(
+                family,
+                regime_label,
+                entry_grade_math,
+                strategy_name,
+                hour_bucket,
+            )
+            if aggregated.closed_trades > 0:
+                return aggregated
+        return ExpectedValueEstimate(
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+            hour_bucket=hour_bucket,
+            entry_grade=entry_grade_math,
+            entry_ev=0.0,
+            p_win=0.5,
+            confidence="none",
+            closed_trades=0,
+        )
+
+
+
+
+
+
+    @staticmethod
+    def _clip_float(value: float, low: float, high: float) -> float:
+        return max(low, min(high, float(value)))
+
+    @staticmethod
+    def _percentile_value(values: Sequence[float], percentile: float) -> float:
+        clean = sorted(float(value) for value in values if value is not None)
+        if not clean:
+            return 0.0
+        if len(clean) == 1:
+            return clean[0]
+        rank = (len(clean) - 1) * MomentumScalpStrategy._clip_float(percentile, 0.0, 1.0)
+        lower = int(rank)
+        upper = min(len(clean) - 1, lower + 1)
+        weight = rank - lower
+        return clean[lower] * (1.0 - weight) + clean[upper] * weight
+
+    def _refresh_adaptive_market_state(
+        self,
+        quotes: Sequence[Quote],
+        leader_signals: Dict[str, LeaderSignal],
+        *,
+        avg_change: float,
+        decliner_ratio: float,
+        probs: RegimeProbabilities,
+    ) -> None:
+        quote_count = max(0, len(quotes))
+        if quote_count <= 0:
+            return
+        advancer_ratio = 1.0 - self._clip_float(decliner_ratio, 0.0, 1.0)
+        signals = list(leader_signals.values())
+        signal_count = max(1, len(signals))
+        leader_density = sum(1 for signal in signals if float(signal.leader_percentile or 0.0) >= 0.80) / signal_count
+        elite_density = sum(1 for signal in signals if float(signal.leader_percentile or 0.0) >= 0.95) / signal_count
+        vs_open_p90 = self._percentile_value([float(signal.vs_open_pct or 0.0) for signal in signals], 0.90)
+        accel_p70 = self._percentile_value([float(signal.recent_acceleration_pct or 0.0) for signal in signals], 0.70)
+        shock = float(getattr(self._latest_market_shock_signal, "shock_confidence", 0.0) or 0.0)
+
+        bull_prob = float(probs.bull_prob)
+        bear_prob = float(probs.bear_prob)
+        avg_up = self._clip_float(float(avg_change) / 3.0, 0.0, 1.0)
+        avg_down = self._clip_float(-float(avg_change) / 2.0, 0.0, 1.0)
+        heat = self._clip_float(
+            0.28 * bull_prob
+            + 0.24 * advancer_ratio
+            + 0.20 * avg_up
+            + 0.16 * leader_density
+            + 0.12 * elite_density
+            - 0.22 * bear_prob
+            - 0.16 * float(decliner_ratio),
+            0.0,
+            1.0,
+        )
+        caution = self._clip_float(
+            0.34 * bear_prob
+            + 0.28 * float(decliner_ratio)
+            + 0.20 * shock
+            + 0.18 * avg_down,
+            0.0,
+            1.0,
+        )
+        overheat = self._clip_float(
+            0.42 * self._clip_float(vs_open_p90 / 18.0, 0.0, 1.0)
+            + 0.22 * elite_density
+            + 0.20 * avg_up
+            + 0.16 * self._clip_float(accel_p70 / 0.60, 0.0, 1.0),
+            0.0,
+            1.0,
+        )
+        self._adaptive_market_state = {
+            "quote_count": float(quote_count),
+            "avg_change": round(float(avg_change), 6),
+            "decliner_ratio": round(float(decliner_ratio), 6),
+            "advancer_ratio": round(advancer_ratio, 6),
+            "bull_prob": round(bull_prob, 6),
+            "bear_prob": round(bear_prob, 6),
+            "leader_density": round(leader_density, 6),
+            "elite_leader_density": round(elite_density, 6),
+            "vs_open_p90": round(vs_open_p90, 6),
+            "accel_p70": round(accel_p70, 6),
+            "shock_confidence": round(shock, 6),
+            "tape_heat": round(heat, 6),
+            "tape_caution": round(caution, 6),
+            "overheat": round(overheat, 6),
+        }
+
+    def _adaptive_market_entry_thresholds(self) -> Dict[str, float]:
+        state = dict(getattr(self, "_adaptive_market_state", {}) or {})
+        quote_count = float(state.get("quote_count", 0.0) or 0.0)
+        if (
+            not bool(getattr(self.config, "enable_adaptive_market_thresholds", True))
+            or quote_count < float(getattr(self.config, "adaptive_market_min_quote_count", 8) or 8)
+        ):
+            return {
+                "adaptive_enabled": 0.0,
+                "heat": 0.0,
+                "caution": 0.0,
+                "overheat": 0.0,
+                "leader_percentile_delta": 0.0,
+                "effective_score_delta": 0.0,
+                "recent_accel_delta": 0.0,
+                "volume_delta": 0.0,
+                "vs_open_ceiling_delta": 0.0,
+                "discount_scale": 1.0,
+                "rebound_scale": 1.0,
+                "negative_ev_floor_scale": 1.0,
+                "math_queue_percentile_delta": 0.0,
+                "vs_open_p90": 0.0,
+            }
+        heat = self._clip_float(float(state.get("tape_heat", 0.0) or 0.0), 0.0, 1.0)
+        caution = self._clip_float(float(state.get("tape_caution", 0.0) or 0.0), 0.0, 1.0)
+        overheat = self._clip_float(float(state.get("overheat", 0.0) or 0.0), 0.0, 1.0)
+        hot_overextension = max(0.0, overheat - heat)
+        return {
+            "adaptive_enabled": 1.0,
+            "heat": heat,
+            "caution": caution,
+            "overheat": overheat,
+            "leader_percentile_delta": -0.055 * heat + 0.060 * caution + 0.030 * hot_overextension,
+            "effective_score_delta": -0.180 * heat + 0.220 * caution + 0.100 * hot_overextension,
+            "recent_accel_delta": -0.040 * heat + 0.075 * caution + 0.030 * hot_overextension,
+            "volume_delta": -0.110 * heat + 0.130 * caution,
+            "vs_open_ceiling_delta": 4.5 * heat - 3.4 * caution - 1.8 * hot_overextension,
+            "discount_scale": self._clip_float(1.0 - 0.34 * heat + 0.48 * caution + 0.25 * hot_overextension, 0.55, 1.80),
+            "rebound_scale": self._clip_float(1.0 - 0.26 * heat + 0.36 * caution + 0.16 * hot_overextension, 0.60, 1.65),
+            "negative_ev_floor_scale": self._clip_float(1.0 + 0.34 * heat - 0.30 * caution - 0.16 * hot_overextension, 0.65, 1.45),
+            "math_queue_percentile_delta": -0.090 * heat + 0.075 * caution + 0.030 * hot_overextension,
+            "vs_open_p90": float(state.get("vs_open_p90", 0.0) or 0.0),
+        }
+
+    def _adaptive_math_queue_percentile_floor(self, base_floor: float) -> float:
+        adaptive = self._adaptive_market_entry_thresholds()
+        floor = float(base_floor) + float(adaptive.get("math_queue_percentile_delta", 0.0) or 0.0)
+        return round(self._clip_float(floor, 0.62, 0.94), 6)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def _conviction_tier(self, estimate: ExpectedValueEstimate) -> str:
+        if str(estimate.confidence) in {"none", "low"}:
+            return "low_confidence"
+        if int(estimate.closed_trades) < int(self.config.ev_min_samples):
+            return "low_confidence"
+        return "confirmed"
+
+
+
+
+
+
+
+
+
+
+
+
+    def _build_entry_metadata(
+        self,
+        symbol: str,
+        setup_name: str,
+        payload: str,
+        *,
+        strategy_name: str,
+        quote: Optional[Quote] = None,
+    ) -> Dict[str, Any]:
+        actual_quote = quote or self._quotes_cache.get(symbol)
+        if actual_quote is None:
+            raise KeyError(symbol)
+        leader = self._leader_signal_for_quote(actual_quote)
+        regime_label = self._resolve_regime_profile_name()
+        estimate = self._entry_ev_for_context(
+            strategy_name=strategy_name,
+            regime_label=regime_label,
+            entry_grade_math=leader.entry_grade,
+        )
+        queue_source = self._queue_source_for_symbol(symbol)
+        meta = {
+            "symbol": symbol,
+            "strategy_name": strategy_name,
+            "setup_name": setup_name,
+            "entry_reason": setup_name,
+            "payload": payload,
+            "regime_label": regime_label,
+            "bear_score": int(self._bear_score),
+            "planned_risk_stage": self._current_bull_risk_mode(),
+            "entry_grade": leader.entry_grade,
+            "entry_grade_math": leader.entry_grade,
+            "leader_score": float(leader.leader_score),
+            "effective_leader_score": float(leader.effective_leader_score or leader.leader_score),
+            "leader_percentile": float(leader.leader_percentile),
+            "leader_pct": float(leader.leader_percentile),
+            "recent_accel": float(leader.recent_acceleration_pct),
+            "vs_open_pct": float(leader.vs_open_pct),
+            "high_proximity": float(leader.high_proximity),
+            "volume_vs_avg": float(leader.volume_vs_avg),
+            "entry_ev": float(estimate.entry_ev),
+            "entry_ev_confidence": str(estimate.confidence),
+            "entry_ev_conf": str(estimate.confidence),
+            "entry_ev_closed_trades": int(estimate.closed_trades),
+            "entry_ev_trades": int(estimate.closed_trades),
+            "bull_prob": float(self._latest_regime_probabilities.bull_prob),
+            "neutral_prob": float(self._latest_regime_probabilities.neutral_prob),
+            "soft_bear_prob": float(self._latest_regime_probabilities.soft_bear_prob),
+            "bear_prob": float(self._latest_regime_probabilities.bear_prob),
+            "candidate_class": "",
+            "execution_mode": "rejected",
+            "live_route": strategy_name,
+            "queue_source": queue_source,
+            "size_multiplier": 1.0,
+            "conviction_score": 0.0,
+            "conviction_rank": 0,
+            "conviction_tier": self._conviction_tier(estimate),
+            "bull_risk_mode": self._current_bull_risk_mode(),
+            "post_loss_admission_class": "general",
+            "shock_score": float(self._latest_market_shock_signal.shock_score),
+            "shock_confidence": float(self._latest_market_shock_signal.shock_confidence),
+            "market_heat": float(self._adaptive_market_state.get("tape_heat", 0.0) or 0.0),
+            "market_caution": float(self._adaptive_market_state.get("tape_caution", 0.0) or 0.0),
+            "market_overheat": float(self._adaptive_market_state.get("overheat", 0.0) or 0.0),
+            "market_avg_change": float(self._adaptive_market_state.get("avg_change", 0.0) or 0.0),
+            "market_decliner_ratio": float(self._adaptive_market_state.get("decliner_ratio", 0.5) or 0.5),
+            "market_vs_open_p90": float(self._adaptive_market_state.get("vs_open_p90", 0.0) or 0.0),
+        }
+        meta.update(symbol_micro_edge_metrics(self, actual_quote, leader=leader))
+        return meta
+
+
+    def _long_entry_shortlist(self, incoming_quotes: Sequence[Quote]) -> List[Quote]:
+        candidates: List[Quote] = []
+        seen = set()
+        available_budget = min(
+            self._remaining_long_exposure_budget([]),
+            self._remaining_long_seed_exposure_budget([]),
+        )
+        for quote in self._fresh_market_state_quotes(incoming_quotes):
+            if (
+                quote.symbol in seen
+                or quote.symbol in self.positions
+                or not self._is_supported_long_symbol(quote.symbol)
+                or self._is_symbol_order_unavailable(quote.symbol)
+                or not self._long_ev_strategy_name_for_quote(quote)
+                or int(quote.current_price or 0) <= 0
+                or int(quote.current_price or 0) > available_budget
             ):
                 continue
-            candidates.append((float(signal.leader_score), quote))
+            seen.add(quote.symbol)
+            candidates.append(quote)
+        return sorted(candidates, key=lambda quote: quote.symbol)
 
-        candidates.sort(
-            key=lambda item: (
-                item[0],
-                self._leader_signal_for_quote(item[1]).leader_percentile,
-                self._quote_trade_amount(item[1]),
-                item[1].symbol,
+
+    def _refresh_runtime_math_candidate_queue(self, quotes: Sequence[Quote]):
+        quotes = [
+            quote
+            for quote in quotes
+            if self._is_supported_long_symbol(quote.symbol)
+        ]
+        previous_signature = (
+            tuple(self._latest_math_queue_symbols),
+            tuple(self._latest_math_backfill_symbols),
+            tuple(sorted(self._latest_opening_fast_symbols)),
+            tuple(sorted(self._latest_opening_hot_symbols)),
+            tuple(sorted(self._latest_math_queue_source.items())),
+        )
+        if not quotes:
+            self._latest_math_queue_symbols = []
+            self._latest_math_backfill_symbols = []
+            if previous_signature != (
+                tuple(self._latest_math_queue_symbols),
+                tuple(self._latest_math_backfill_symbols),
+                tuple(sorted(self._latest_opening_fast_symbols)),
+                tuple(sorted(self._latest_opening_hot_symbols)),
+                tuple(sorted(self._latest_math_queue_source.items())),
+            ):
+                self._save_daily_state_if_due(min_interval_seconds=20)
+            return
+
+        new_signals = build_leader_signals(
+            quotes,
+            avg_volumes=self._avg_volumes,
+            recent_quotes_by_symbol=self._recent_quotes,
+            regime_score=int(self._bear_score),
+        )
+        self._latest_math_leader_signals.update(new_signals)
+
+        math_queue_floor = self._adaptive_math_queue_percentile_floor(float(self.config.math_queue_percentile_floor))
+        ranked = sorted(
+            (
+                (signal.effective_leader_score or signal.leader_score, signal.leader_percentile, symbol)
+                for symbol, signal in new_signals.items()
+                if signal.leader_percentile >= math_queue_floor
             ),
             reverse=True,
         )
-        return candidates[: max(1, int(self.cfg.math_queue_top_n) + int(self.cfg.math_queue_backfill_slots))]
+        top_n = max(1, int(self.config.math_queue_top_n))
+        backfill_n = max(0, int(self.config.math_queue_backfill_slots))
+        new_queue = [symbol for _, _, symbol in ranked[:top_n]]
+        new_backfill = [symbol for _, _, symbol in ranked[top_n : top_n + backfill_n]]
 
-    def _required_volume_spike_ratio(self, quote: Quote, score: float) -> float:
-        required_ratio = self._regime_volume_spike_ratio()
-        ratio_floor = self._regime_volume_spike_ratio_min()
-        if self._is_bullish_regime():
-            required_ratio -= self.cfg.bullish_volume_spike_ratio_adjustment
+        opening_fast: set[str] = set()
+        opening_hot: set[str] = set()
+        if self._opening_fast_window_active():
+            fast_ranked = sorted(
+                (
+                    (float(signal.effective_leader_score or signal.leader_score), symbol)
+                    for symbol, signal in new_signals.items()
+                ),
+                reverse=True,
+            )
+            opening_fast = {symbol for _, symbol in fast_ranked[: max(1, int(self.config.opening_fast_live_top_n))]}
+        if self._opening_candidate_window_active():
+            opening_hot_floor = self._adaptive_math_queue_percentile_floor(float(self.config.opening_hot_percentile_floor))
+            hot_ranked = sorted(
+                (
+                    (float(signal.leader_percentile), float(signal.effective_leader_score or signal.leader_score), symbol)
+                    for symbol, signal in new_signals.items()
+                    if float(signal.leader_percentile) >= opening_hot_floor
+                ),
+                reverse=True,
+            )
+            opening_hot = {symbol for _, _, symbol in hot_ranked[: max(1, int(self.config.opening_hot_top_n))]}
 
-        # 강한 모멘텀/급등 구간은 스파이크 임계치를 완화해 기회를 살린다.
-        if score >= 4.5:
-            required_ratio -= 0.60
-        elif score >= 4.0:
-            required_ratio -= 0.45
-        elif score >= 3.5:
-            required_ratio -= 0.25
+        preserve_opening_sources = self._opening_candidate_window_active()
+        preserved = {
+            symbol: source
+            for symbol, source in self._latest_math_queue_source.items()
+            if preserve_opening_sources
+            and symbol in new_signals
+            and source in {"opening_fast_queue", "opening_hot_queue"}
+        }
+        updated_source = dict(preserved)
+        for symbol in new_queue:
+            updated_source[symbol] = "math_queue"
+        for symbol in new_backfill:
+            updated_source[symbol] = "math_backfill"
+        for symbol in opening_hot:
+            updated_source[symbol] = "opening_hot_queue"
+        for symbol in opening_fast:
+            updated_source[symbol] = "opening_fast_queue"
 
-        if quote.change_rate >= 2.0:
-            required_ratio -= 0.15
-        if quote.change_rate >= 3.0:
-            required_ratio -= 0.10
-
-        if quote.symbol in self._inverse_symbols:
-            required_ratio -= self.cfg.inverse_volume_spike_ratio_offset
-            if self._bear_score >= max(self.cfg.bearish_threshold, self.cfg.inverse_min_bear_score):
-                required_ratio -= 0.10
-            ratio_floor = max(0.9, ratio_floor * 0.9)
-
-        if required_ratio < ratio_floor:
-            required_ratio = ratio_floor
-
-        return max(0.0, required_ratio)
-
-    def _update_tick_volume_state(self, quote: Quote):
-        if quote.volume <= 0:
-            self._latest_tick_volumes[quote.symbol] = 0
-            return
-
-        prev = self._last_cumulative_volumes.get(quote.symbol)
-        if prev is None:
-            # 초깃값은 누적량 기준으로부터의 실제 체결량이 아니므로 기준선 오염을 막기 위해 보류.
-            self._last_cumulative_volumes[quote.symbol] = quote.volume
-            self._latest_tick_volumes[quote.symbol] = 0
-            return
-
-        delta = quote.volume - prev
-        if delta < 0:
-            # 거래량 누적이 리셋되었거나 롤오버된 구간이면 기준선을 재동기화.
-            self._latest_tick_volumes[quote.symbol] = 0
-            self._last_cumulative_volumes[quote.symbol] = quote.volume
-            return
-
-        self._last_cumulative_volumes[quote.symbol] = quote.volume
-        self._latest_tick_volumes[quote.symbol] = delta
-        if delta <= 0:
-            return
-
-        dq = self._recent_tick_volumes.setdefault(
-            quote.symbol,
-            deque(maxlen=max(self.cfg.volume_spike_min_history * 3, 12)),
+        self._latest_math_queue_symbols = new_queue
+        self._latest_math_backfill_symbols = new_backfill
+        self._latest_opening_fast_symbols = opening_fast
+        self._latest_opening_hot_symbols = opening_hot
+        self._latest_math_queue_source = updated_source
+        current_signature = (
+            tuple(self._latest_math_queue_symbols),
+            tuple(self._latest_math_backfill_symbols),
+            tuple(sorted(self._latest_opening_fast_symbols)),
+            tuple(sorted(self._latest_opening_hot_symbols)),
+            tuple(sorted(self._latest_math_queue_source.items())),
         )
-        dq.append(delta)
+        if current_signature != previous_signature:
+            self._save_daily_state_if_due(min_interval_seconds=20)
 
-    def _is_volume_spike(self, quote: Quote, score: Optional[float] = None) -> bool:
-        if not self.cfg.enable_volume_spike_filter:
-            return True
 
-        if quote.volume <= 0:
-            logger.debug("거래량 스파이크 탈락: %s 누적거래량 없음", quote.symbol)
-            return False
+    def _long_ev_strategy_name_for_quote(self, quote: Quote) -> str:
+        if not self._is_supported_long_symbol(quote.symbol):
+            return ""
+        source = self._queue_source_for_symbol(quote.symbol)
+        if self._opening_conviction_window_active() and source in OPENING_LONG_QUEUE_SOURCES:
+            return OPENING_STRATEGY
+        if self._intraday_conviction_window_active() and (
+            source in LIVE_LONG_QUEUE_SOURCES or source in INTRADAY_BASE_QUEUE_SOURCES
+        ):
+            return INTRADAY_STRATEGY
+        return ""
 
-        current_delta = self._latest_tick_volumes.get(quote.symbol, 0)
-        abs_min = self._regime_volume_spike_abs_min()
-        if self._is_bullish_regime():
-            abs_min = int(max(1, abs_min * self.cfg.bullish_volume_spike_abs_min_ratio))
-        if quote.symbol in self._inverse_symbols:
-            abs_min = int(max(1, abs_min * self.cfg.inverse_volume_spike_abs_min_ratio))
-        if current_delta < abs_min:
-            logger.debug(
-                "거래량 스파이크 탈락(절대량 부족): %s 현재 %d < %d",
-                quote.symbol,
-                current_delta,
-                abs_min,
-            )
-            return False
-
-        history = self._recent_tick_volumes.get(quote.symbol, deque())
-        if len(history) < self.cfg.volume_spike_min_history:
-            return True
-
-        if score is None:
-            score = self._calc_momentum_score(quote)
-        required_ratio = self._required_volume_spike_ratio(quote=quote, score=score)
-        if required_ratio <= 0:
-            return True
-
-        prev_deltas = list(history)[:-1]
-        if not prev_deltas:
-            return True
-
-        prev_deltas.sort()
-        mid_idx = len(prev_deltas) // 2
-        if len(prev_deltas) % 2:
-            baseline = prev_deltas[mid_idx]
-        else:
-            baseline = (prev_deltas[mid_idx - 1] + prev_deltas[mid_idx]) / 2
-        if baseline <= 0:
-            return True
-        ratio = current_delta / baseline
-        if ratio < required_ratio:
-            logger.info(
-                "거래량 스파이크 탈락: %s 현재=%d, 기준=%d, 비율=%.2f (임계 %.2f)",
-                quote.symbol,
-                current_delta,
-                int(baseline),
-                ratio,
-                required_ratio,
-            )
-            return False
-        return True
-
-    def _can_open_new_long(
+    # ------------------------------------------------------------------
+    # 진입 허용 / 수량
+    # ------------------------------------------------------------------
+    def _long_ev_precheck_reject_reason(
         self,
         quote: Quote,
-        pending_orders: Optional[List[Order]] = None,
-        score: Optional[float] = None,
-        now: Optional[datetime] = None,
-    ) -> bool:
-        if now is None:
-            now = self._now()
-        profile_name = self._resolve_regime_profile_name()
-
-        if self._is_new_entry_window_blocked(now):
-            return False
-
-        if any(
-            o.side == OrderSide.BUY and o.symbol == quote.symbol
-            for o in pending_orders or []
-        ):
-            return False
-
-        strategy_name = self._current_profile_entry_strategy_name(is_inverse=False)
-        if strategy_name and not self._is_strategy_gate_enabled(strategy_name):
-            override_ok, override_meta = self._can_math_live_override_strategy_gate(
-                quote,
-                strategy_name=strategy_name,
-                regime_label=profile_name,
-                is_inverse=False,
-            )
-            if override_ok:
-                logger.info(
-                    "수학 live gate 우회 허용: %s (%s) leader_pct=%.4f bull_prob=%.4f neutral_prob=%.4f entry_ev=%.2f",
-                    quote.symbol,
-                    strategy_name,
-                    float(override_meta.get("leader_percentile", 0.0) or 0.0),
-                    float(override_meta.get("bull_prob", 0.0) or 0.0),
-                    float(override_meta.get("neutral_prob", 0.0) or 0.0),
-                    float(override_meta.get("entry_ev", 0.0) or 0.0),
-                )
-            else:
-                self._log_setup_reject(
-                    quote,
-                    "strategy_gate_disabled",
-                    "전략 자동 게이트 비활성화: %s (%s)",
-                    quote.symbol,
-                    strategy_name,
-                )
-                return False
-
-        symbol_cooldown_until = self._symbol_cooldown_remaining(quote.symbol, now)
-        if symbol_cooldown_until is not None:
-            self._log_setup_reject(
-                quote,
-                "symbol_loss_cooldown",
-                "종목 손실 쿨다운 중입니다: %s (재허용 %s)",
-                quote.symbol,
-                symbol_cooldown_until.strftime("%H:%M:%S"),
-            )
-            return False
-
-        strategy_cooldown_until = self._strategy_cooldown_remaining(strategy_name, now)
-        if strategy_cooldown_until is not None:
-            self._log_setup_reject(
-                quote,
-                "strategy_loss_cooldown",
-                "전략 손실 쿨다운 중입니다: %s (%s, 재허용 %s)",
-                quote.symbol,
-                strategy_name,
-                strategy_cooldown_until.strftime("%H:%M:%S"),
-            )
-            return False
-
-        soft_bear_leader_lane = profile_name == "soft_bear" and self._is_soft_bear_strong_leader_long_candidate(
-            quote,
-            score=score,
+        *,
+        pending_orders: Sequence[Order],
+        strategy_name_override: str = "",
+        entry_meta: Optional[Dict[str, Any]] = None,
+        skip_capacity: bool = False,
+    ) -> str:
+        _ = entry_meta
+        if not self._is_supported_long_symbol(quote.symbol):
+            return "unsupported_long_symbol"
+        strategy_name = strategy_name_override or self._long_ev_strategy_name_for_quote(quote)
+        if not strategy_name:
+            return "ev_route_disabled"
+        if self._halted:
+            return "daily_halt"
+        if self._is_symbol_order_unavailable(quote.symbol):
+            return "symbol_order_unavailable"
+        if self._symbol_entry_cooldown_remaining(quote.symbol) > 0:
+            return "symbol_recent_loss_cooldown"
+        if self._client_rate_limit_cooldown() > 0:
+            return "api_rate_limit_cooldown"
+        quote_symbol = str(quote.symbol or "").strip()
+        if any(order.side == OrderSide.BUY and str(order.symbol or "").strip() == quote_symbol for order in pending_orders):
+            return "duplicate_pending_order"
+        if quote_symbol in self._pending_entry_meta and quote_symbol not in self.positions:
+            return "duplicate_pending_order"
+        if self._has_unresolved_pending_long_entry(pending_orders, exclude_symbol=quote_symbol):
+            return "pending_long_entry_unresolved"
+        open_longs = len(self._long_position_symbols())
+        pending_longs = sum(
+            1
+            for order in pending_orders
+            if order.side == OrderSide.BUY
         )
-        if profile_name == "bear":
-            self._log_setup_reject(
-                quote,
-                "long_disabled",
-                "%s 레짐에서는 신규 롱을 열지 않습니다: %s",
-                profile_name,
-                quote.symbol,
-            )
-            return False
-        if profile_name == "soft_bear" and not soft_bear_leader_lane:
-            self._log_setup_reject(
-                quote,
-                "long_disabled",
-                "%s 레짐에서는 강한 리더만 예외적으로 신규 롱을 평가합니다: %s",
-                profile_name,
-                quote.symbol,
-            )
-            return False
+        if not skip_capacity and open_longs + pending_longs >= self._max_long_positions_allowed():
+            return "long_precheck_capacity"
+        if not skip_capacity and self._remaining_long_exposure_budget(pending_orders) <= 0:
+            return "long_total_exposure_cap"
+        return ""
 
-        if profile_name == "neutral" and strategy_name == "neutral_pullback_strategy":
-            neutral_loss_limit = self._neutral_loss_limit()
-            if self._neutral_loss_count_today > neutral_loss_limit:
-                self._track_shadow_blocked_candidate(quote, "neutral_loss_limit_block")
-                self._log_setup_reject(
-                    quote,
-                    "neutral_loss_limit_block",
-                    "중립장 손실 한도 초과로 신규 롱을 차단합니다: %s (손실 %d/%d회)",
-                    quote.symbol,
-                    self._neutral_loss_count_today,
-                    neutral_loss_limit,
-                )
-                return False
-            if self._neutral_loss_count_today == neutral_loss_limit:
-                cooldown_until = self._neutral_post_loss_cooldown_until()
-                if cooldown_until is None:
-                    self._track_shadow_blocked_candidate(quote, "neutral_loss_limit_block")
-                    self._log_setup_reject(
-                        quote,
-                        "neutral_loss_limit_block",
-                        "중립장 손실 기준은 찼지만 손실 시각 정보가 없어 신규 롱을 차단합니다: %s",
-                        quote.symbol,
-                    )
-                    return False
-                if cooldown_until and now < cooldown_until:
-                    self._log_setup_reject(
-                        quote,
-                        "neutral_loss_cooldown",
-                        "중립장 손실 후 쿨다운 중입니다: %s (재허용 %s)",
-                        quote.symbol,
-                        cooldown_until.strftime("%H:%M:%S"),
-                    )
-                    return False
-                if self._neutral_post_loss_reentries_today >= int(self.cfg.neutral_post_loss_reentry_limit):
-                    self._track_shadow_blocked_candidate(quote, "neutral_loss_limit_block")
-                    self._log_setup_reject(
-                        quote,
-                        "neutral_loss_limit_block",
-                        "중립장 손실 후 재도전 한도를 모두 사용했습니다: %s (%d/%d회)",
-                        quote.symbol,
-                        self._neutral_post_loss_reentries_today,
-                        int(self.cfg.neutral_post_loss_reentry_limit),
-                    )
-                    return False
-                retry_thresholds = self._neutral_retry_thresholds()
-                if score is not None and score < retry_thresholds["min_score"]:
-                    self._log_setup_reject(
-                        quote,
-                        "neutral_post_loss_quality_block",
-                        "중립장 재도전 A급 점수 미달: %s (점수 %.2f < %.2f)",
-                        quote.symbol,
-                        score,
-                        retry_thresholds["min_score"],
-                    )
-                    return False
-                if quote.change_rate < retry_thresholds["min_change_rate"]:
-                    self._log_setup_reject(
-                        quote,
-                        "neutral_post_loss_quality_block",
-                        "중립장 재도전 A급 등락률 미달: %s (등락률 %.2f%% < %.2f%%)",
-                        quote.symbol,
-                        quote.change_rate,
-                        retry_thresholds["min_change_rate"],
-                    )
-                    return False
 
-        if self._is_loss_stage_active() and strategy_name == "neutral_pullback_strategy":
-            stage1_score_floor = self._regime_min_momentum_score() + float(self.cfg.stage1_neutral_score_bonus)
-            stage1_change_floor = self._regime_min_change_rate() + float(self.cfg.stage1_neutral_change_rate_bonus)
-            total_net = self._current_total_net_pnl()
-            if score is not None and score < stage1_score_floor:
-                self._log_setup_reject(
-                    quote,
-                    "risk_stage1_quality_block",
-                    "손실 1단계에서는 A급 중립장 롱만 허용합니다: %s (점수 %.2f < %.2f, 총손익 %s원)",
-                    quote.symbol,
-                    score,
-                    stage1_score_floor,
-                    f"{total_net:,}",
-                )
-                return False
-            if quote.change_rate < stage1_change_floor:
-                self._log_setup_reject(
-                    quote,
-                    "risk_stage1_quality_block",
-                    "손실 1단계에서는 A급 중립장 롱만 허용합니다: %s (등락률 %.2f%% < %.2f%%, 총손익 %s원)",
-                    quote.symbol,
-                    quote.change_rate,
-                    stage1_change_floor,
-                    f"{total_net:,}",
-                )
-                return False
 
-        if self._bear_market and self.cfg.bear_market_mode == "B":
-            logger.info("신규롱 차단: 약세 모드 B")
-            return False
 
-        if self._bear_market and self.cfg.bear_market_mode == "A":
-            min_bear_score = self._regime_bear_score_for_new_long()
-            if self._bear_score >= min_bear_score:
-                if score is not None and score >= self._regime_bear_market_entry_score():
-                    logger.info(
-                        "약세 모드 예외 통과: %s (레짐점수=%d, 모멘텀점수=%.1f, 임계=%.1f)",
-                        quote.symbol,
-                        self._bear_score,
-                        score,
-                        self._regime_bear_market_entry_score(),
-                    )
-                    return True
-                logger.info("신규롱 차단: 약세점수 높음 (%d >= %d)",
-                            self._bear_score, min_bear_score)
-                return False
 
-        if (
-            self.cfg.enable_pool_persistence_gate
-            and not self._is_math_queue_symbol(quote.symbol)
-            and quote.symbol not in self._latest_direct_dynamic_symbols
-            and not self._is_pool_persistent(quote.symbol)
-        ):
-            logger.debug("신규롱 차단: 동적 풀 지속성 미충족 (%s)", quote.symbol)
-            return False
+    def _long_total_exposure_cap(self) -> int:
+        profile = self._resolve_regime_profile_name()
+        pct = {
+            "bull": self.config.bull_capital_utilization_pct,
+            "neutral": self.config.neutral_capital_utilization_pct,
+            "soft_bear": self.config.soft_bear_capital_utilization_pct,
+            "bear": self.config.bear_capital_utilization_pct,
+        }.get(profile)
+        if pct is None:
+            pct = self.config.capital_utilization_pct
+        return max(0, int(int(self.config.seed_money) * float(pct or 0.0)))
 
-        return True
+    def _current_long_exposure_amount(self) -> int:
+        total = 0
+        for symbol, pos in self.positions.items():
+            invested = int(getattr(pos, "invested_amount", 0) or 0)
+            if invested <= 0:
+                invested = int(getattr(pos, "buy_price", 0) or 0) * int(getattr(pos, "quantity", 0) or 0)
+            total += max(0, invested)
+        return total
 
-    def _can_confirm_entry(
-        self,
-        quote: Quote,
-        score: float,
-        is_scale_in: bool,
-        now: datetime,
-    ) -> bool:
-        if not self.cfg.enable_entry_confirmation:
-            return True
+    @staticmethod
+    def _coerce_pending_meta_int(meta: Dict[str, Any], *keys: str) -> int:
+        for key in keys:
+            value = meta.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                coerced = int(round(float(value)))
+            except (TypeError, ValueError):
+                continue
+            if coerced > 0:
+                return coerced
+        return 0
 
-        required_ticks = (
-            self.cfg.scale_in_confirmation_ticks
-            if is_scale_in
-            else self.cfg.entry_confirmation_ticks
-        )
-        profile_name = self._resolve_regime_profile_name()
-        if (
-            self._is_bullish_regime()
-            and not is_scale_in
-            and self._is_early_session_guard_active()
-        ):
-            required_ticks = max(required_ticks, self.cfg.early_session_entry_confirmation_ticks)
-        if (
-            not is_scale_in
-            and self._is_bullish_regime()
-            and not self._is_early_session_guard_active()
-            and required_ticks > 1
-        ):
-            fast_entry_min_score = (
-                self._regime_bullish_min_momentum_score()
-                + self.cfg.bullish_fast_entry_score_bonus
-            )
-            fast_entry_min_change = (
-                self._regime_bullish_min_change_rate()
-                + self.cfg.bullish_fast_entry_change_rate_bonus
-            )
-            if score >= fast_entry_min_score and quote.change_rate >= fast_entry_min_change:
-                required_ticks = 1
-        if (
-            not is_scale_in
-            and profile_name == "neutral"
-        ):
-            required_ticks = max(required_ticks, int(self.cfg.neutral_entry_confirmation_ticks))
-        if required_ticks <= 1:
-            self._entry_signals.pop(quote.symbol, None)
-            return True
-
-        if not quote.current_price:
-            self._entry_signals.pop(quote.symbol, None)
-            return False
-
-        signal = self._entry_signals.get(quote.symbol)
-        if not signal:
-            self._entry_signals[quote.symbol] = MomentumEntrySignal(
-                streak=1,
-                first_price=quote.current_price,
-                best_score=score,
-                started_at=now,
-                last_seen_at=now,
-            )
-            return False
-
-        ttl = max(1, self.cfg.entry_confirmation_window_seconds)
-        if (now - signal.last_seen_at).total_seconds() > ttl:
-            self._entry_signals[quote.symbol] = MomentumEntrySignal(
-                streak=1,
-                first_price=quote.current_price,
-                best_score=score,
-                started_at=now,
-                last_seen_at=now,
-            )
-            return False
-
-        max_pullback_pct = self.cfg.entry_confirmation_max_pullback_pct
-        score_tolerance = self.cfg.entry_confirmation_min_score_tolerance
-        if profile_name == "neutral":
-            max_pullback_pct = min(max_pullback_pct, -0.8)
-            score_tolerance = max(score_tolerance, 0.55)
-        elif profile_name == "soft_bear":
-            max_pullback_pct = min(max_pullback_pct, -1.0)
-            score_tolerance = max(score_tolerance, 0.65)
-
-        pullback_pct = (quote.current_price - signal.first_price) / signal.first_price * 100
-        if pullback_pct < max_pullback_pct:
-            self._entry_signals[quote.symbol] = MomentumEntrySignal(
-                streak=1,
-                first_price=quote.current_price,
-                best_score=score,
-                started_at=now,
-                last_seen_at=now,
-            )
-            logger.debug(
-                "진입 재확인 리셋(과도한 되돌림): %s %.2f%% < %.2f%%",
-                quote.symbol,
-                pullback_pct,
-                max_pullback_pct,
-            )
-            return False
-
-        if score + score_tolerance < signal.best_score:
-            self._entry_signals[quote.symbol] = MomentumEntrySignal(
-                streak=1,
-                first_price=quote.current_price,
-                best_score=score,
-                started_at=now,
-                last_seen_at=now,
-            )
-            return False
-
-        signal.streak += 1
-        signal.best_score = max(signal.best_score, score)
-        signal.last_seen_at = now
-        return signal.streak >= required_ticks
-
-    def _estimate_market_from_quotes(self, quotes: List[Quote]) -> Optional[tuple[int, float, float]]:
-        """배치 시세에서 약세 점수를 추정한다 (백테스트용).
-
-        인버스 ETF를 제외한 일반 종목의 등락률로 판단.
-        """
-        regular_quotes = [q for q in quotes if q.symbol not in self._inverse_symbols]
-        if not regular_quotes:
-            return None
-
-        total = len(regular_quotes)
-        avg_change = sum(q.change_rate for q in regular_quotes) / total
-        declining = sum(1 for q in regular_quotes if q.change_rate < 0)
-        decline_ratio = declining / total if total else 0.0
-
-        score = 0
-        if avg_change < -0.35:
-            score += 1
-        if avg_change < -0.9:
-            score += 1
-        if avg_change < -1.4:
-            score += 1
-
-        # 평균 등락률 < -0.5%
-        if avg_change < -2.0:
-            score += 1
-
-        # 하락 종목 비율 > 70%
-        if decline_ratio > 0.6:
-            score += 1
-        if decline_ratio > 0.78:
-            score += 1
-
-        return score, avg_change, decline_ratio
-
-    def _passes_pullback_entry_filter(self, quote: Quote, is_scale_in: bool) -> bool:
-        if is_scale_in or not self.cfg.enable_pullback_entry_filter:
-            return True
-        if quote.current_price <= 0 or quote.open_price <= 0 or quote.high_price <= 0:
-            return True
-        profile_name = self._resolve_regime_profile_name()
-        activation_change_rate = self.cfg.pullback_activation_change_rate
-        required_min_drop_pct = self.cfg.pullback_required_min_drop_pct
-        allowed_max_drop_pct = self.cfg.pullback_allowed_max_drop_pct
-        min_vs_open_pct = self.cfg.pullback_min_vs_open_pct
-        if profile_name == "neutral":
-            activation_change_rate = max(activation_change_rate, 2.3)
-            required_min_drop_pct = min(required_min_drop_pct, 0.12)
-            allowed_max_drop_pct = max(allowed_max_drop_pct, 1.6)
-            min_vs_open_pct = min(min_vs_open_pct, 0.18)
-        elif profile_name == "soft_bear":
-            activation_change_rate = max(activation_change_rate, 2.6)
-            required_min_drop_pct = min(required_min_drop_pct, 0.10)
-            allowed_max_drop_pct = max(allowed_max_drop_pct, 1.8)
-            min_vs_open_pct = min(min_vs_open_pct, 0.12)
-
-        if quote.change_rate < activation_change_rate:
-            return True
-
-        pullback_drop_pct = (quote.high_price - quote.current_price) / quote.high_price * 100
-        if pullback_drop_pct < required_min_drop_pct:
-            self._log_entry_filter_once_per_minute(
-                quote.symbol,
-                "pullback_wait",
-                "눌림목 대기: %s 고점대비 조정 %.2f%% < 최소 %.2f%%",
-                quote.symbol,
-                pullback_drop_pct,
-                required_min_drop_pct,
-            )
-            return False
-        if pullback_drop_pct > allowed_max_drop_pct:
-            self._log_entry_filter_once_per_minute(
-                quote.symbol,
-                "pullback_broken",
-                "눌림목 이탈: %s 고점대비 조정 %.2f%% > 최대 %.2f%%",
-                quote.symbol,
-                pullback_drop_pct,
-                allowed_max_drop_pct,
-            )
-            return False
-
-        vs_open = (quote.current_price - quote.open_price) / quote.open_price * 100
-        if vs_open < min_vs_open_pct:
-            self._log_entry_filter_once_per_minute(
-                quote.symbol,
-                "pullback_vs_open",
-                "눌림목 취소: %s 시가대비 %.2f%% < 최소 %.2f%%",
-                quote.symbol,
-                vs_open,
-                min_vs_open_pct,
-            )
-            return False
-        return True
-
-    def _evaluate_buy(
-        self,
-        quote: Quote,
-        pending_orders: Optional[List[Order]] = None,
-        score_hint: Optional[float] = None,
-    ) -> Optional[Order]:
-        """모멘텀 점수 기반 매수 판단 (일반 주식)."""
-        # 인버스 ETF는 별도 로직
-        if quote.symbol in self._inverse_symbols:
-            return None
-
-        now = self._now()
-        is_opening_guard = self._is_early_session_guard_active()
-
-        if quote.current_price <= 0 or quote.open_price <= 0:
-            return None
-        if quote.current_price < self.cfg.min_price:
-            return None
-        min_change_rate = self._regime_min_change_rate()
-        if self._is_bullish_regime():
-            min_change_rate = self._regime_bullish_min_change_rate()
-        if is_opening_guard and self._is_bullish_regime():
-            min_change_rate += self.cfg.early_session_min_change_rate_boost
-        if quote.change_rate < min_change_rate:
-            return None
-
-        # 쿨다운 체크
-        last_sold = self._sell_cooldown.get(quote.symbol)
-        if last_sold:
-            elapsed = (self._now() - last_sold).total_seconds()
-            if elapsed < self._regime_cooldown_seconds():
-                return None
-
-        if any(
-            o.side == OrderSide.BUY and o.symbol == quote.symbol
-            for o in pending_orders or []
-        ):
-            return None
-
-        position = self.positions.get(quote.symbol)
-        is_scale_in = position is not None
-
-        score = self._calc_momentum_score(quote) if score_hint is None else score_hint
-        entry_reason = ""
-        strategy_name = ""
-        setup_name = ""
-        entry_meta: dict = {}
-        if is_scale_in:
-            if not self._is_volume_spike(quote, score=score):
-                return None
-            if not self.cfg.enable_pyramiding:
-                return None
-            pnl_pct = (quote.current_price - position.buy_price) / position.buy_price * 100
-            if pnl_pct < self.cfg.scale_in_min_profit_pct:
-                return None
-            scale_threshold = (
-                self._regime_min_momentum_score() + self.cfg.scale_in_score_bonus
-            )
-            if self._is_bullish_regime():
-                scale_threshold = (
-                    self._regime_bullish_min_momentum_score() + self.cfg.scale_in_score_bonus
-            )
-            if score < scale_threshold:
-                return None
-            strategy_name = str(getattr(position, "entry_strategy_name", "") or self._current_profile_entry_strategy_name(is_inverse=False))
-            setup_name = str(getattr(position, "entry_setup_name", "") or "scale_in")
-            entry_meta = self._build_entry_metadata(
-                quote.symbol,
-                setup_name,
-                f"setup_name={setup_name} entry_reason=scale_in",
-                strategy_name=strategy_name,
-                quote=quote,
-            )
-            entry_meta["math_admission"] = "passed"
-        else:
-            if not self._can_open_new_long(
-                quote,
-                pending_orders=pending_orders,
-                score=score,
-                now=now,
+    def _pending_long_entry_meta_items(self, pending_orders: Sequence[Order]) -> List[Tuple[str, Dict[str, Any]]]:
+        pending_order_symbols = {
+            str(order.symbol or "").strip()
+            for order in pending_orders
+            if order.side == OrderSide.BUY and str(order.symbol or "").strip()
+        }
+        items: List[Tuple[str, Dict[str, Any]]] = []
+        for raw_symbol, raw_meta in (self._pending_entry_meta or {}).items():
+            symbol = str(raw_symbol or "").strip()
+            if (
+                not symbol
+                or symbol in self.positions
+                or symbol in pending_order_symbols
             ):
-                return None
-            if self.market_data is None and self.cfg.enable_backtest_score_entry_fallback:
-                fallback_min_score = self._regime_min_momentum_score()
-                if self._is_bullish_regime():
-                    fallback_min_score = self._regime_bullish_min_momentum_score()
-                if score < fallback_min_score:
-                    return None
-                if not self._is_volume_spike(quote, score=score):
-                    return None
-                strategy_name = "backtest_score_fallback_strategy"
-                setup_name = "backtest_score_entry"
-                fallback_payload = (
-                    "setup_name=backtest_score_entry "
-                    "entry_reason=score_fallback"
-                )
-                entry_meta = self._build_entry_metadata(
-                    quote.symbol,
-                    setup_name,
-                    fallback_payload,
-                    strategy_name=strategy_name,
-                    quote=quote,
-                )
-                gate_ok, gate_reason = self._passes_math_live_entry_gate(
-                    quote,
-                    strategy_name=strategy_name,
-                    entry_meta=entry_meta,
-                    is_inverse=False,
-                )
-                if not gate_ok:
-                    self._record_leader_tape(
-                        "entry_eval",
-                        [
-                            {
-                                "symbol": quote.symbol,
-                                "name": quote.name,
-                                "strategy_name": strategy_name,
-                                "setup_name": setup_name or "backtest_score_entry",
-                                "score": round(score, 4),
-                                "leader_score": float(entry_meta.get("leader_score", 0.0)),
-                                "leader_percentile": float(entry_meta.get("leader_percentile", 0.0)),
-                                "entry_grade_math": entry_meta.get("entry_grade_math", ""),
-                                "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
-                                "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
-                                "queue_source": entry_meta.get("math_queue_source", ""),
-                                "math_admission": "blocked",
-                                "math_admission_reason": gate_reason,
-                                "allowed": False,
-                            }
-                        ],
-                    )
-                    self._log_setup_reject(
-                        quote,
-                        gate_reason,
-                        "%s (%s)",
-                        quote.symbol,
-                        gate_reason,
-                    )
-                    return None
-                entry_reason = self._append_entry_context(fallback_payload, entry_meta)
-            else:
-                decision = self._regime_router.evaluate_long_entry(self, quote, score)
-                if not decision.allowed:
-                    self._entry_signals.pop(quote.symbol, None)
-                    if decision.reject_reason:
-                        self._log_setup_reject(
-                            quote,
-                            decision.reject_reason,
-                            "%s (%s)",
-                            quote.symbol,
-                            decision.reject_reason,
-                        )
-                    return None
-                strategy_name = decision.strategy_name
-                setup_name = decision.setup_name
-                entry_meta = self._build_entry_metadata(
-                    quote.symbol,
-                    setup_name,
-                    decision.payload,
-                    strategy_name=strategy_name,
-                    quote=quote,
-                )
-                gate_ok, gate_reason = self._passes_math_live_entry_gate(
-                    quote,
-                    strategy_name=strategy_name,
-                    entry_meta=entry_meta,
-                    is_inverse=False,
-                )
-                if not gate_ok:
-                    self._entry_signals.pop(quote.symbol, None)
-                    self._record_leader_tape(
-                        "entry_eval",
-                        [
-                            {
-                                "symbol": quote.symbol,
-                                "name": quote.name,
-                                "strategy_name": strategy_name,
-                                "setup_name": setup_name,
-                                "score": round(score, 4),
-                                "leader_score": float(entry_meta.get("leader_score", 0.0)),
-                                "leader_percentile": float(entry_meta.get("leader_percentile", 0.0)),
-                                "entry_grade_math": entry_meta.get("entry_grade_math", ""),
-                                "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
-                                "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
-                                "queue_source": entry_meta.get("math_queue_source", ""),
-                                "math_admission": "blocked",
-                                "math_admission_reason": gate_reason,
-                                "allowed": False,
-                            }
-                        ],
-                    )
-                    self._log_setup_reject(
-                        quote,
-                        gate_reason,
-                        "%s (%s)",
-                        quote.symbol,
-                        gate_reason,
-                    )
-                    return None
-                if self._resolve_regime_profile_name() == "neutral" and self._is_neutral_post_loss_retry_available(now):
-                    entry_meta["neutral_post_loss_retry"] = True
-                entry_meta["math_admission"] = "passed"
-                entry_reason = self._append_entry_context(decision.payload, entry_meta)
+                continue
+            if not isinstance(raw_meta, dict):
+                continue
+            items.append((symbol, raw_meta))
+        return items
 
-        math_size_multiplier = self._math_size_multiplier(
-            strategy_name=strategy_name or "unknown_strategy",
-            entry_meta=entry_meta,
-            is_inverse=False,
-        )
-        entry_meta["size_multiplier"] = round(math_size_multiplier, 4)
-        logger.info(
-            "수학 admission 통과: %s (%s) leader_pct=%.4f entry_ev=%.2f queue=%s size_mul=%.4f",
-            quote.symbol,
-            strategy_name or "unknown_strategy",
-            float(entry_meta.get("leader_percentile", 0.0) or 0.0),
-            float(entry_meta.get("entry_ev", 0.0) or 0.0),
-            entry_meta.get("math_queue_source", "") or "none",
-            math_size_multiplier,
-        )
-        entry_reason = self._append_math_shadow_context(entry_reason, {"size_multiplier": entry_meta.get("size_multiplier", 1.0)})
+    def _has_unresolved_pending_long_entry(self, pending_orders: Sequence[Order], *, exclude_symbol: str = "") -> bool:
+        excluded = str(exclude_symbol or "").strip()
+        for order in pending_orders:
+            symbol = str(order.symbol or "").strip()
+            if (
+                order.side == OrderSide.BUY
+                and symbol
+                and symbol != excluded
+            ):
+                return True
+        for raw_symbol, position in (self.positions or {}).items():
+            symbol = str(raw_symbol or getattr(position, "symbol", "") or "").strip()
+            if symbol and symbol != excluded and getattr(position, "pending_entry_started_at", None) is not None:
+                return True
+        for symbol, _meta in self._pending_long_entry_meta_items(pending_orders):
+            if symbol != excluded:
+                return True
+        return False
 
-        if quote.change_rate >= self.cfg.overheated_jump_change_pct:
-            retrace_anchor = quote.open_price * (
-                1
-                + (self.cfg.overheated_jump_change_pct / 100)
-                * self.cfg.overheated_retrace_ratio
-            )
-            if quote.current_price < retrace_anchor:
-                logger.info(
-                    "과열 회피: %s %s%% 급등 후 되돌림 %.2f%% < %.2f%%",
-                    quote.symbol,
-                    f"{quote.change_rate:.2f}",
-                    (quote.current_price - quote.open_price) / quote.open_price * 100,
-                    (retrace_anchor / quote.open_price - 1) * 100,
-                )
-                self._entry_signals.pop(quote.symbol, None)
-                return None
-
-        if is_scale_in and not self._can_confirm_entry(
-            quote=quote,
-            score=score,
-            is_scale_in=is_scale_in,
-            now=now,
-        ):
-            return None
-
-        entry_grade = str(entry_meta.get("entry_grade", "") or "").upper()
-        turnover_rank = int(entry_meta.get("turnover_rank", 0) or 0)
-        bull_priority_entry = (
-            not is_scale_in
-            and strategy_name == "bull_breakout_strategy"
-            and entry_grade == "A"
-            and 0 < turnover_rank <= max(1, int(self.cfg.bull_priority_turnover_rank_max))
-        )
-
-        alloc = self._compute_buy_allocation(
-            symbol=quote.symbol,
-            current_price=quote.current_price,
-            pending_orders=pending_orders,
-            allow_expensive_single_share_override=(
-                not is_scale_in
-                and strategy_name == "bull_breakout_strategy"
-                and entry_grade == "A"
-            ),
-            per_stock_amount_multiplier=(
-                float(self.cfg.bull_priority_per_stock_amount_multiplier) * math_size_multiplier
-                if bull_priority_entry
-                else math_size_multiplier
-            ),
-            max_per_stock_amount_multiplier=(
-                float(self.cfg.bull_priority_max_per_stock_amount_multiplier) * math_size_multiplier
-                if bull_priority_entry
-                else math_size_multiplier
-            ),
-            max_single_position_pct_override=(
-                float(self.cfg.bull_priority_max_single_position_pct) * max(1.0, math_size_multiplier)
-                if bull_priority_entry
-                else None
-            ),
-            side_slot_override=(
-                int(self.cfg.bull_priority_effective_slots)
-                if bull_priority_entry
-                else None
-            ),
-        )
-        if (
-            not is_scale_in
-            and strategy_name == "bull_breakout_strategy"
-            and entry_grade == "A"
-        ):
-            initial_scale = (
-                float(self.cfg.bull_priority_initial_entry_scale)
-                if bull_priority_entry
-                else float(self.cfg.bull_breakout_initial_entry_scale)
-            )
-            initial_scale = min(1.0, max(0.1, initial_scale))
-            alloc = min(alloc, max(quote.current_price, int(alloc * initial_scale)))
-        quantity = alloc // quote.current_price
-
-        if quantity <= 0:
-            return None
-        if not self._passes_expected_net_filter(
-            symbol=quote.symbol,
-            quantity=quantity,
-            entry_price=quote.current_price,
-        ):
-            return None
-
-        self._record_leader_tape(
-            "entry_eval",
-            [
-                {
-                    "symbol": quote.symbol,
-                    "name": quote.name,
-                    "strategy_name": strategy_name,
-                    "setup_name": setup_name,
-                    "score": round(score, 4),
-                    "entry_grade": entry_grade,
-                    "leader_score": float(entry_meta.get("leader_score", 0.0)),
-                    "leader_percentile": float(entry_meta.get("leader_percentile", 0.0)),
-                    "entry_grade_math": entry_meta.get("entry_grade_math", ""),
-                    "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
-                    "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
-                    "queue_source": entry_meta.get("math_queue_source", ""),
-                    "math_admission": entry_meta.get("math_admission", "passed"),
-                    "bull_prob": float(entry_meta.get("bull_prob", 0.0)),
-                    "neutral_prob": float(entry_meta.get("neutral_prob", 0.0)),
-                    "soft_bear_prob": float(entry_meta.get("soft_bear_prob", 0.0)),
-                    "bear_prob": float(entry_meta.get("bear_prob", 0.0)),
-                    "size_multiplier": float(entry_meta.get("size_multiplier", 1.0)),
-                    "allowed": True,
-                }
-            ],
-        )
-
-        if is_scale_in:
-            logger.info(
-                "추가매수 신호: %s(%s) 점수=%.1f, %d주 @ %s원 (할당 %s원)",
-                quote.name,
-                quote.symbol,
-                score,
-                quantity,
-                f"{quote.current_price:,}",
-                f"{alloc:,}",
-            )
-        else:
-            self._pending_entry_meta[quote.symbol] = dict(entry_meta)
-            logger.info(
-                "매수 신호: %s(%s) 점수=%.1f, %d주 @ %s원 (할당 %s원, %s)",
-                quote.name,
-                quote.symbol,
-                score,
-                quantity,
-                f"{quote.current_price:,}",
-                f"{alloc:,}",
-                entry_reason,
-            )
-
-        self._entry_signals.pop(quote.symbol, None)
-
-        return Order(
-            symbol=quote.symbol,
-            side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            quantity=quantity,
-            price=0,
-        )
-
-    def _evaluate_inverse_buy(self, quote: Quote, pending_orders: Optional[List[Order]] = None) -> Optional[Order]:
-        """인버스 ETF 매수 판단.
-
-        약세 점수 >= bearish_threshold일 때만 진입.
-        인버스 ETF는 시장 하락 시 상승하므로 모멘텀 점수가 자연스럽게 높아진다.
-        """
-        now = self._now()
-        profile_name = self._resolve_regime_profile_name()
-        if self._is_new_entry_window_blocked(now):
-            return None
-        if quote.current_price <= 0 or quote.open_price <= 0:
-            return None
-        required_bear_score = max(self.cfg.bearish_threshold, self._regime_inverse_min_bear_score())
-        if self._bear_score < required_bear_score:
-            return None
-
-        # 쿨다운 체크
-        last_sold = self._sell_cooldown.get(quote.symbol)
-        if last_sold:
-            elapsed = (now - last_sold).total_seconds()
-            if elapsed < self._regime_cooldown_seconds():
-                return None
-
-        strategy_name = self._current_profile_entry_strategy_name(is_inverse=True)
-        if strategy_name and not self._is_strategy_gate_enabled(strategy_name):
-            override_ok, override_meta = self._can_math_live_override_strategy_gate(
-                quote,
-                strategy_name=strategy_name,
-                regime_label=profile_name,
-                is_inverse=True,
-            )
-            if override_ok:
-                logger.info(
-                    "수학 live gate 우회 허용: %s (%s) soft_bear_prob=%.4f bear_prob=%.4f entry_ev=%.2f",
-                    quote.symbol,
-                    strategy_name,
-                    float(override_meta.get("soft_bear_prob", 0.0) or 0.0),
-                    float(override_meta.get("bear_prob", 0.0) or 0.0),
-                    float(override_meta.get("entry_ev", 0.0) or 0.0),
-                )
-            else:
-                self._log_setup_reject(
-                    quote,
-                    "strategy_gate_disabled",
-                    "%s (%s)",
-                    quote.symbol,
-                    strategy_name,
-                )
-                return None
-
-        symbol_cooldown_until = self._symbol_cooldown_remaining(quote.symbol, now)
-        if symbol_cooldown_until is not None:
-            self._log_setup_reject(
-                quote,
-                "symbol_loss_cooldown",
-                "%s (재허용 %s)",
-                quote.symbol,
-                symbol_cooldown_until.strftime("%H:%M:%S"),
-            )
-            return None
-
-        strategy_cooldown_until = self._strategy_cooldown_remaining(strategy_name, now)
-        if strategy_cooldown_until is not None:
-            self._log_setup_reject(
-                quote,
-                "strategy_loss_cooldown",
-                "%s (%s, 재허용 %s)",
-                quote.symbol,
-                strategy_name,
-                strategy_cooldown_until.strftime("%H:%M:%S"),
-            )
-            return None
-
-        score = self._calc_momentum_score(quote)
-        decision = self._regime_router.evaluate_inverse_entry(self, quote, score)
-        if not decision.allowed:
-            if decision.reject_reason:
-                self._log_setup_reject(
-                    quote,
-                    decision.reject_reason,
-                    "%s (%s)",
-                    quote.symbol,
-                    decision.reject_reason,
-                )
-            return None
-
-        entry_meta = self._build_entry_metadata(
-            quote.symbol,
-            decision.setup_name,
-            decision.payload,
-            strategy_name=decision.strategy_name,
-            quote=quote,
-        )
-        gate_ok, gate_reason = self._passes_math_live_entry_gate(
-            quote,
-            strategy_name=decision.strategy_name,
-            entry_meta=entry_meta,
-            is_inverse=True,
-        )
-        if not gate_ok:
-            self._record_leader_tape(
-                "entry_eval",
-                [
-                    {
-                        "symbol": quote.symbol,
-                        "name": quote.name,
-                        "strategy_name": decision.strategy_name,
-                        "setup_name": decision.setup_name,
-                        "score": round(score, 4),
-                        "entry_grade_math": entry_meta.get("entry_grade_math", ""),
-                        "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
-                        "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
-                        "queue_source": entry_meta.get("math_queue_source", ""),
-                        "math_admission": "blocked",
-                        "math_admission_reason": gate_reason,
-                        "allowed": False,
-                    }
-                ],
-            )
-            self._log_setup_reject(
-                quote,
-                gate_reason,
-                "%s (%s)",
-                quote.symbol,
-                gate_reason,
-            )
-            return None
-        entry_meta["math_admission"] = "passed"
-        entry_reason = self._append_entry_context(decision.payload, entry_meta)
-        math_size_multiplier = self._math_size_multiplier(
-            strategy_name=decision.strategy_name,
-            entry_meta=entry_meta,
-            is_inverse=True,
-        )
-        entry_meta["size_multiplier"] = round(math_size_multiplier, 4)
-        logger.info(
-            "수학 admission 통과: %s (%s) leader_pct=%.4f entry_ev=%.2f queue=%s size_mul=%.4f",
-            quote.symbol,
-            decision.strategy_name,
-            float(entry_meta.get("leader_percentile", 0.0) or 0.0),
-            float(entry_meta.get("entry_ev", 0.0) or 0.0),
-            entry_meta.get("math_queue_source", "") or "none",
-            math_size_multiplier,
-        )
-        entry_reason = self._append_math_shadow_context(entry_reason, {"size_multiplier": entry_meta.get("size_multiplier", 1.0)})
-
-        alloc = self._compute_buy_allocation(
-            symbol=quote.symbol,
-            current_price=quote.current_price,
-            pending_orders=pending_orders,
-            per_stock_amount_multiplier=math_size_multiplier,
-            max_per_stock_amount_multiplier=math_size_multiplier,
-        )
-        quantity = alloc // quote.current_price
-        if quantity <= 0:
-            return None
-        if not self._passes_expected_net_filter(
-            symbol=quote.symbol,
-            quantity=quantity,
-            entry_price=quote.current_price,
-        ):
-            return None
-
-        self._record_leader_tape(
-            "entry_eval",
-            [
-                {
-                    "symbol": quote.symbol,
-                    "name": quote.name,
-                    "strategy_name": decision.strategy_name,
-                    "setup_name": decision.setup_name,
-                    "score": round(score, 4),
-                    "entry_grade_math": entry_meta.get("entry_grade_math", ""),
-                    "entry_ev": float(entry_meta.get("entry_ev", 0.0)),
-                    "entry_ev_confidence": entry_meta.get("entry_ev_confidence", ""),
-                    "queue_source": entry_meta.get("math_queue_source", ""),
-                    "math_admission": entry_meta.get("math_admission", "passed"),
-                    "bull_prob": float(entry_meta.get("bull_prob", 0.0)),
-                    "neutral_prob": float(entry_meta.get("neutral_prob", 0.0)),
-                    "soft_bear_prob": float(entry_meta.get("soft_bear_prob", 0.0)),
-                    "bear_prob": float(entry_meta.get("bear_prob", 0.0)),
-                    "size_multiplier": float(entry_meta.get("size_multiplier", 1.0)),
-                    "allowed": True,
-                }
-            ],
-        )
-
-        self._pending_entry_meta[quote.symbol] = dict(entry_meta)
-        logger.info(
-            "[INV] 매수 신호: %s 약세점수=%d, 모멘텀=%.1f, %d주 @ %s원 (%s)",
-            quote.symbol,
-            self._bear_score,
-            score,
-            quantity,
-            f"{quote.current_price:,}",
-            entry_reason,
-        )
-
-        return Order(
-            symbol=quote.symbol,
-            side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            quantity=quantity,
-            price=0,
-        )
-
-    def _compute_buy_allocation(
-        self,
-        symbol: str,
-        current_price: int,
-        pending_orders: Optional[List[Order]] = None,
-        allow_expensive_single_share_override: bool = False,
-        per_stock_amount_multiplier: float = 1.0,
-        max_per_stock_amount_multiplier: float = 1.0,
-        max_single_position_pct_override: Optional[float] = None,
-        side_slot_override: Optional[int] = None,
-    ) -> int:
-        is_inverse = symbol in self._inverse_symbols
-        capital_base = self._allocation_capital_base()
-        target_total_exposure = self._regime_target_total_exposure_amount()
-        total_exposure = self._get_total_exposure()
-        stock_exposure = self._get_stock_exposure(symbol)
-        side_exposure = sum(
-            pos.buy_price * pos.quantity
-            for sym, pos in self.positions.items()
-            if (sym in self._inverse_symbols) == is_inverse
-        )
-
-        pending_total = 0
-        pending_stock = 0
-        pending_side = 0
-        pending_side_count = 0
-        for order in pending_orders or []:
+    def _pending_long_exposure_amount(self, pending_orders: Sequence[Order]) -> int:
+        total = 0
+        for order in pending_orders:
             if order.side != OrderSide.BUY:
                 continue
-            q = self._quotes_cache.get(order.symbol)
-            if q is None or q.current_price <= 0:
-                continue
-            amount = q.current_price * order.quantity
-            pending_total += amount
-            if order.symbol == symbol:
-                pending_stock += amount
-            if (order.symbol in self._inverse_symbols) == is_inverse:
-                pending_side += amount
-                if order.symbol not in self.positions:
-                    pending_side_count += 1
-
-        if current_price <= 0:
-            return 0
-
-        total_room = min(
-            capital_base - (total_exposure + pending_total),
-            target_total_exposure - (total_exposure + pending_total),
-        )
-        per_stock_amount = int(
-            self.cfg.per_stock_amount
-            * self._regime_per_stock_alloc_scale()
-            * max(0.1, float(per_stock_amount_multiplier))
-        )
-        max_stock_amount = int(
-            self.cfg.max_per_stock_amount
-            * self._regime_max_stock_alloc_scale()
-            * max(0.1, float(max_per_stock_amount_multiplier))
-        )
-        if max_single_position_pct_override is None:
-            max_stock_amount = min(max_stock_amount, self._regime_max_single_position_amount())
-        else:
-            override_cap = int(
-                capital_base
-                * max(0.0, float(max_single_position_pct_override))
-                * self._risk_exposure_scale()
+            quote = self._quotes_cache.get(order.symbol)
+            price = int(order.price or getattr(order, "reference_price", 0) or 0)
+            if price <= 0 and quote is not None:
+                price = int(quote.current_price or 0)
+            total += max(0, price) * max(0, int(order.quantity or 0))
+        for symbol, meta in self._pending_long_entry_meta_items(pending_orders):
+            qty = self._coerce_pending_meta_int(
+                meta,
+                "pending_order_quantity",
+                "entry_ev_live_model_quantity",
             )
-            max_stock_amount = min(max_stock_amount, override_cap)
-        stock_room = max_stock_amount - (stock_exposure + pending_stock)
+            if qty <= 0:
+                continue
+            price = self._coerce_pending_meta_int(
+                meta,
+                "pending_order_reference_price",
+                "entry_signal_price",
+                "price_prediction_signal_price",
+            )
+            if price <= 0:
+                quote = self._quotes_cache.get(symbol)
+                if quote is not None:
+                    price = int(getattr(quote, "current_price", 0) or 0)
+            total += max(0, price) * qty
+        return total
 
-        side_slot_limit = (
-            self._regime_inverse_max_positions()
-            if is_inverse
-            else self._effective_max_position_count()
+    def _remaining_long_exposure_budget(self, pending_orders: Sequence[Order]) -> int:
+        cap = self._long_total_exposure_cap()
+        used = self._current_long_exposure_amount() + self._pending_long_exposure_amount(pending_orders)
+        return max(0, cap - used)
+
+    def _remaining_long_seed_exposure_budget(self, pending_orders: Sequence[Order]) -> int:
+        cap = max(0, int(getattr(self.config, "seed_money", 0) or 0))
+        used = self._current_long_exposure_amount() + self._pending_long_exposure_amount(pending_orders)
+        return max(0, cap - used)
+
+
+
+
+    def _daily_target_remaining_net(self) -> int:
+        target = max(0, int(getattr(self.config, "daily_profit_target", 0) or 0))
+        if target <= 0:
+            return 0
+        realized = int(self._realized_net_pnl_for_daily_breaker())
+        return max(0, target - realized)
+
+
+
+
+    def _target_net_for_take_profit_pct(
+        self,
+        quote: Quote,
+        *,
+        quantity: int,
+        take_profit_pct: float,
+        entry_slippage_rate: Optional[float] = None,
+    ) -> int:
+        qty = max(0, int(quantity or 0))
+        if qty <= 0:
+            return 0
+        current_price = max(1, int(quote.current_price or 0))
+        entry_rate = (
+            float(self.config.entry_market_slippage_rate)
+            if entry_slippage_rate is None
+            else max(0.0, float(entry_slippage_rate))
         )
-        if side_slot_limit <= 0:
-            return 0
-
-        open_side_count = sum(
-            1 for sym in self.positions if (sym in self._inverse_symbols) == is_inverse
+        entry_price = max(
+            1,
+            int(round(current_price * (1.0 + entry_rate))),
         )
-        remaining_side_slots = max(1, side_slot_limit - open_side_count - pending_side_count)
-        if side_slot_override is not None:
-            remaining_side_slots = max(1, min(remaining_side_slots, int(side_slot_override)))
-        side_room_target = target_total_exposure - (side_exposure + pending_side)
-        if side_room_target <= 0:
-            return 0
-        side_budget_target = max(
-            per_stock_amount,
-            int(side_room_target / remaining_side_slots),
+        projected_exit_price = max(
+            1,
+            int(round(entry_price * (1.0 + (float(take_profit_pct) / 100.0) - float(self.config.exit_market_slippage_rate)))),
+        )
+        return self._estimate_trade_net_pnl_from_prices(
+            entry_price=entry_price,
+            exit_price=projected_exit_price,
+            quantity=qty,
         )
 
-        alloc = min(side_budget_target, total_room, stock_room)
-        expensive_single_share_allowed = (
-            allow_expensive_single_share_override
-            and self.cfg.allow_expensive_single_share_override
-            and current_price >= int(self.cfg.expensive_single_share_min_price)
-            and total_room >= current_price
-            and (stock_exposure + pending_stock) <= 0
-            and current_price <= int(max_stock_amount * float(self.cfg.expensive_single_share_cap_multiplier))
-        )
-        if alloc <= 0:
-            if expensive_single_share_allowed:
-                return current_price
-            return 0
 
-        # 비싼 종목(할당액 < 현재가)도 1주라도 살 수 있으면 최소 1주 주문을 허용한다.
-        if alloc < current_price:
-            if expensive_single_share_allowed:
-                return current_price
-            if total_room >= current_price and stock_room >= current_price:
-                return current_price
-            return 0
-
-        return alloc
-
-    def _get_total_exposure(self) -> int:
-        return sum(pos.buy_price * pos.quantity for pos in self.positions.values())
-
-    def _get_stock_exposure(self, symbol: str) -> int:
-        pos = self.positions.get(symbol)
-        if pos is None:
-            return 0
-        return pos.buy_price * pos.quantity
-
-    def _default_long_exit(self, quote: Quote) -> Optional[Order]:
-        """익절/손절/추적손절 판단 (일반 주식)."""
-        pos = self.positions.get(quote.symbol)
-        if not pos:
-            return None
-
-        pnl_pct = (quote.current_price - pos.buy_price) / pos.buy_price * 100
-        pnl_amount = (quote.current_price - pos.buy_price) * pos.quantity
-        stop_amount = self._long_stop_loss_amount(pos)
-
-        holding_minutes = (self._now() - pos.buy_time).total_seconds() / 60
-        if holding_minutes >= self._regime_max_holding_minutes() and not pos.is_restored:
-            logger.info("보유시간 초과 청산: %s (%.1f분)",
-                        quote.symbol, holding_minutes)
-            return self._make_sell_order(pos)
-
-        # 익절
-        if pnl_pct >= self._regime_take_profit_pct():
+    def _take_profit_pct_for_net_target(
+        self,
+        quote: Quote,
+        *,
+        quantity: int,
+        target_net: int,
+        return_hint_pct: float = 0.0,
+        entry_slippage_rate: Optional[float] = None,
+    ) -> float:
+        qty = max(0, int(quantity or 0))
+        target = max(1, int(target_net or 0))
+        if qty <= 0:
+            return 0.0
+        low = 0.01
+        high = max(low, float(return_hint_pct or 0.0), float(self.config.take_profit_pct or 0.0))
+        for _ in range(10):
             if (
-                pos.entry_strategy_name == "bull_breakout_strategy"
-                and pos.entry_grade == "A"
-                and not pos.partial_exit_done
-                and pos.quantity >= 2
+                self._target_net_for_take_profit_pct(
+                    quote,
+                    quantity=qty,
+                    take_profit_pct=high,
+                    entry_slippage_rate=entry_slippage_rate,
+                )
+                >= target
             ):
-                partial_ratio = min(0.9, max(0.1, float(self.cfg.bull_partial_exit_ratio)))
-                partial_qty = max(1, int(pos.quantity * partial_ratio))
-                if partial_qty >= pos.quantity:
-                    partial_qty = pos.quantity - 1
-                if partial_qty > 0:
-                    logger.info(
-                        "bull A급 부분익절: %s %.2f%% (%s원) %d/%d주",
-                        quote.symbol,
-                        pnl_pct,
-                        f"{pnl_amount:,}",
-                        partial_qty,
-                        pos.quantity,
+                break
+            high *= 1.5
+            if high >= 8.0:
+                high = 8.0
+                break
+        if (
+            self._target_net_for_take_profit_pct(
+                quote,
+                quantity=qty,
+                take_profit_pct=high,
+                entry_slippage_rate=entry_slippage_rate,
+            )
+            < target
+        ):
+            return 0.0
+        for _ in range(24):
+            mid = (low + high) / 2.0
+            if (
+                self._target_net_for_take_profit_pct(
+                    quote,
+                    quantity=qty,
+                    take_profit_pct=mid,
+                    entry_slippage_rate=entry_slippage_rate,
+                )
+                >= target
+            ):
+                high = mid
+            else:
+                low = mid
+        return round(high, 4)
+
+    def _net_for_return_pct(
+        self,
+        quote: Quote,
+        *,
+        quantity: int,
+        return_pct: float,
+        entry_slippage_rate: Optional[float] = None,
+    ) -> int:
+        qty = max(0, int(quantity or 0))
+        if qty <= 0:
+            return 0
+        current_price = max(1, int(quote.current_price or 0))
+        entry_rate = (
+            float(self.config.entry_market_slippage_rate)
+            if entry_slippage_rate is None
+            else max(0.0, float(entry_slippage_rate))
+        )
+        entry_price = max(
+            1,
+            int(round(current_price * (1.0 + entry_rate))),
+        )
+        projected_exit_price = max(
+            1,
+            int(round(current_price * (1.0 + (float(return_pct) / 100.0) - float(self.config.exit_market_slippage_rate)))),
+        )
+        return self._estimate_trade_net_pnl_from_prices(
+            entry_price=entry_price,
+            exit_price=projected_exit_price,
+            quantity=qty,
+        )
+
+    def _entry_execution_slippage_rate(
+        self,
+        prediction: Optional[ShortHorizonPrediction],
+        entry_meta: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        _ = prediction, entry_meta
+        return max(0.0, float(self.config.entry_market_slippage_rate))
+
+    def _round_trip_execution_cost_pct(self) -> float:
+        return 100.0 * (
+            2.0 * float(self.config.commission_rate)
+            + float(self.config.tax_slippage_rate)
+            + float(self.config.entry_market_slippage_rate)
+            + float(self.config.exit_market_slippage_rate)
+        )
+
+    def _pending_long_planned_loss_risk(self, pending_orders: Sequence[Order]) -> int:
+        total = 0
+        for order in pending_orders:
+            if order.side != OrderSide.BUY:
+                continue
+            meta = self._pending_entry_meta.get(order.symbol, {})
+            planned = int(meta.get("planned_risk_net_loss_abs", meta.get("planned_stop_net_loss_abs", 0)) or 0)
+            if planned > 0:
+                total += planned
+                continue
+            qty = max(0, int(order.quantity or 0))
+            if qty <= 0:
+                continue
+            quote = self._quotes_cache.get(order.symbol)
+            price = int(order.price or getattr(order, "reference_price", 0) or 0)
+            if price <= 0 and quote is not None:
+                price = int(getattr(quote, "current_price", 0) or 0)
+            if price <= 0:
+                continue
+            entry_price = max(1, int(round(price * (1.0 + float(self.config.entry_market_slippage_rate)))))
+            fallback = min(
+                int(self.config.long_stop_loss_cap_amount),
+                int(entry_price * qty * float(self.config.long_stop_loss_notional_pct)),
+            )
+            total += max(0, fallback)
+        for symbol, meta in self._pending_long_entry_meta_items(pending_orders):
+            planned = self._coerce_pending_meta_int(
+                meta,
+                "planned_risk_net_loss_abs",
+                "planned_stop_net_loss_abs",
+            )
+            if planned > 0:
+                total += planned
+                continue
+            qty = self._coerce_pending_meta_int(
+                meta,
+                "pending_order_quantity",
+                "entry_ev_live_model_quantity",
+            )
+            price = self._coerce_pending_meta_int(
+                meta,
+                "pending_order_reference_price",
+                "entry_signal_price",
+                "price_prediction_signal_price",
+            )
+            if price <= 0:
+                quote = self._quotes_cache.get(symbol)
+                if quote is not None:
+                    price = int(getattr(quote, "current_price", 0) or 0)
+            if qty <= 0 or price <= 0:
+                continue
+            entry_price = max(1, int(round(price * (1.0 + float(self.config.entry_market_slippage_rate)))))
+            fallback = min(
+                int(self.config.long_stop_loss_cap_amount),
+                int(entry_price * qty * float(self.config.long_stop_loss_notional_pct)),
+            )
+            total += max(0, fallback)
+        return max(0, total)
+
+    def _open_long_planned_loss_risk(self) -> int:
+        total = 0
+        for raw_symbol, position in list((self.positions or {}).items()):
+            symbol = str(raw_symbol or getattr(position, "symbol", "") or "").strip()
+            if not symbol:
+                continue
+            qty = max(0, int(getattr(position, "quantity", 0) or 0))
+            if qty <= 0:
+                continue
+            planned = int(getattr(position, "planned_risk_net_loss_abs", 0) or 0)
+            if planned <= 0:
+                planned = int(getattr(position, "planned_stop_net_loss_abs", 0) or 0)
+            if planned <= 0:
+                invested = int(getattr(position, "invested_amount", 0) or 0)
+                if invested <= 0:
+                    invested = int(getattr(position, "buy_price", 0) or 0) * qty
+                if invested <= 0:
+                    continue
+                planned = min(
+                    int(self.config.long_stop_loss_cap_amount),
+                    int(invested * float(self.config.long_stop_loss_notional_pct)),
+                )
+            total += max(0, planned)
+        return max(0, total)
+
+    def _walk_forward_calibrated_prediction(
+        self,
+        prediction: ShortHorizonPrediction,
+        *,
+        strategy_name: str,
+    ) -> Tuple[ShortHorizonPrediction, float]:
+        confidence = self._clip_float(
+            float(getattr(prediction, "confidence", 0.0) or 0.0),
+            0.0,
+            1.0,
+        )
+        direction = self._clip_float(
+            float(getattr(prediction, "direction_score", 0.0) or 0.0),
+            0.0,
+            1.0,
+        )
+        raw_win_probability = self._clip_float(
+            0.50 + (direction - 0.50) * confidence,
+            0.0,
+            1.0,
+        )
+        raw_return = float(getattr(prediction, "predicted_return_pct", 0.0) or 0.0)
+        calibration = self._forecast_outcomes.calibrate(
+            as_of=self._now(),
+            raw_win_probability=raw_win_probability,
+            raw_return_pct=raw_return,
+            horizon_seconds=int(prediction.horizon_seconds),
+            round_trip_cost_pct=self._round_trip_execution_cost_pct(),
+            strategy_name=strategy_name,
+        )
+        shift = float(calibration.return_shift_pct)
+        features = dict(getattr(prediction, "features", {}) or {})
+        features.update(
+            {
+                "raw_predicted_return_pct": raw_return,
+                "raw_lower_bound_return_pct": float(prediction.lower_bound_return_pct),
+                "raw_upper_bound_return_pct": float(prediction.upper_bound_return_pct),
+                "raw_win_probability": raw_win_probability,
+                "calibrated_win_probability": float(calibration.calibrated_win_probability),
+                "walk_forward_sample_count": float(calibration.sample_count),
+                "walk_forward_effective_sample_size": float(calibration.effective_sample_size),
+                "walk_forward_return_shift_pct": shift,
+            }
+        )
+        calibrated_prediction = replace(
+            prediction,
+            predicted_return_pct=self._clip_float(
+                float(calibration.calibrated_return_pct),
+                -5.0,
+                5.0,
+            ),
+            lower_bound_return_pct=self._clip_float(
+                float(prediction.lower_bound_return_pct) + shift,
+                -5.0,
+                5.0,
+            ),
+            upper_bound_return_pct=self._clip_float(
+                float(prediction.upper_bound_return_pct) + shift,
+                -5.0,
+                5.0,
+            ),
+            features=features,
+        )
+        return calibrated_prediction, float(calibration.calibrated_win_probability)
+
+    def _build_expected_value_trade_plan(
+        self,
+        quote: Quote,
+        entry_meta: Dict[str, Any],
+        *,
+        pending_orders: Sequence[Order],
+    ) -> ExpectedValueTradePlan:
+        current_price = max(0, int(quote.current_price or 0))
+        if current_price <= 0:
+            return ExpectedValueTradePlan(False, "ev_invalid_price")
+
+        prediction = self._price_prediction_for_entry(
+            quote,
+            entry_meta,
+            min_samples=max(3, int(getattr(self.config, "price_prediction_min_samples", 5) or 5)),
+        )
+        if not bool(getattr(prediction, "ready", False)):
+            return ExpectedValueTradePlan(False, "ev_prediction_not_ready", prediction=prediction)
+        prediction, win_probability = self._walk_forward_calibrated_prediction(
+            prediction,
+            strategy_name=str(entry_meta.get("strategy_name") or ""),
+        )
+
+        total_budget = min(
+            self._remaining_long_exposure_budget(pending_orders),
+            self._remaining_long_seed_exposure_budget(pending_orders),
+        )
+        if total_budget < current_price:
+            return ExpectedValueTradePlan(
+                False,
+                "ev_budget_too_small",
+                budget=max(0, int(total_budget)),
+                win_probability=float(win_probability),
+                prediction=prediction,
+            )
+        max_quantity = max(0, int(total_budget // current_price))
+        if max_quantity <= 0:
+            return ExpectedValueTradePlan(
+                False,
+                "ev_quantity_zero",
+                budget=max(0, int(total_budget)),
+                win_probability=float(win_probability),
+                prediction=prediction,
+            )
+
+        pending_long_risk = self._pending_long_planned_loss_risk(pending_orders)
+        open_long_risk = self._open_long_planned_loss_risk()
+        committed_long_risk = int(pending_long_risk) + int(open_long_risk)
+        if open_long_risk > 0:
+            entry_meta["open_long_planned_loss_risk"] = int(open_long_risk)
+        if committed_long_risk > 0:
+            entry_meta["committed_long_planned_loss_risk"] = int(committed_long_risk)
+
+        remaining_loss_room = max(0, int(self._daily_loss_room()) - committed_long_risk)
+        execution_reserve = max(0, int(getattr(self.config, "daily_loss_near_stop_buffer", 0) or 0))
+        usable_loss_room = max(0, remaining_loss_room - execution_reserve)
+        if usable_loss_room <= 0:
+            return ExpectedValueTradePlan(
+                False,
+                "ev_daily_loss_room_exhausted",
+                budget=max(0, int(total_budget)),
+                win_probability=float(win_probability),
+                prediction=prediction,
+            )
+
+        predicted_return = float(getattr(prediction, "predicted_return_pct", 0.0) or 0.0)
+        if predicted_return <= 0.0:
+            return ExpectedValueTradePlan(
+                False,
+                "ev_prediction_non_positive",
+                budget=max(0, int(total_budget)),
+                win_probability=float(win_probability),
+                prediction=prediction,
+            )
+
+        lower_return = float(getattr(prediction, "lower_bound_return_pct", 0.0) or 0.0)
+        upper_return = float(getattr(prediction, "upper_bound_return_pct", 0.0) or 0.0)
+        entry_slippage_rate = self._entry_execution_slippage_rate(prediction)
+        entry_price = max(1, int(round(current_price * (1.0 + entry_slippage_rate))))
+        predicted_exit_price = max(
+            1,
+            int(
+                round(
+                    current_price
+                    * (
+                        1.0
+                        + (predicted_return / 100.0)
+                        - float(self.config.exit_market_slippage_rate)
                     )
-                    return self._make_sell_order(pos, quantity=partial_qty)
-            elif (
-                pos.entry_strategy_name == "bull_breakout_strategy"
-                and pos.entry_grade == "A"
-                and pos.partial_exit_done
-            ):
-                pass
-            elif not self._should_defer_profit_exit(
-                pos=pos,
-                exit_price=quote.current_price,
-                reason="익절",
-            ):
-                logger.info("익절: %s %.2f%% (%s원)",
-                            quote.symbol, pnl_pct, f"{pnl_amount:,}")
-                return self._make_sell_order(pos)
+                )
+            ),
+        )
+        lower_exit_price = max(
+            1,
+            int(
+                round(
+                    current_price
+                    * (
+                        1.0
+                        + (lower_return / 100.0)
+                        - float(self.config.exit_market_slippage_rate)
+                    )
+                )
+            ),
+        )
+        zero_return_exit_price = max(
+            1,
+            int(
+                round(
+                    current_price
+                    * (1.0 - float(self.config.exit_market_slippage_rate))
+                )
+            ),
+        )
+        remaining_target = max(0, int(self._daily_target_remaining_net()))
+        target_room = remaining_target if remaining_target > 0 else max(1, int(total_budget))
 
-        # 개별 포지션 손절 (포지션 노출 연동 금액 기준)
-        if pnl_amount <= stop_amount:
-            logger.info("개별손절: %s %s원 (한도 %s원)",
-                        quote.symbol, f"{pnl_amount:,}",
-                        f"{stop_amount:,}")
-            return self._make_sell_order(pos)
+        best: Optional[ExpectedValueTradePlan] = None
+        best_key: Tuple[float, float, int, int] = (-float("inf"), -float("inf"), 0, 0)
+        best_rejected: Optional[ExpectedValueTradePlan] = None
+        best_rejected_key: Tuple[float, int, int] = (-float("inf"), 0, 0)
 
-        # 추적손절 (고점 대비)
-        if pos.high_since_buy > pos.buy_price:
-            drop_from_high = (quote.current_price - pos.high_since_buy) / pos.high_since_buy * 100
-            gain_from_entry = (pos.high_since_buy - pos.buy_price) / pos.buy_price * 100
-            if (
-                gain_from_entry >= self._regime_trailing_stop_activation_gain_pct()
-                and drop_from_high <= self._regime_trailing_stop_pct()
-            ):
-                if self._should_defer_profit_exit(
-                    pos=pos,
-                    exit_price=quote.current_price,
-                    reason="추적손절",
-                ):
-                    return None
-                logger.info("추적손절: %s 고점 %s → 현재 %s (%.2f%%)",
-                            quote.symbol, f"{pos.high_since_buy:,}",
-                            f"{quote.current_price:,}", drop_from_high)
-                return self._make_sell_order(pos)
+        def remember_rejected(
+            detail: str,
+            *,
+            quantity: int,
+            predicted_net: int = 0,
+            lower_net: int = 0,
+            upper_net: int = 0,
+            expected_net: float = 0.0,
+            break_even_probability: float = 1.0,
+            planned_target: int = 0,
+            planned_stop: int = 0,
+            planned_risk: int = 0,
+        ) -> None:
+            nonlocal best_rejected, best_rejected_key
+            key = (float(expected_net), int(predicted_net), -int(planned_risk))
+            if key <= best_rejected_key:
+                return
+            best_rejected_key = key
+            quantity = max(0, int(quantity))
+            best_rejected = ExpectedValueTradePlan(
+                allowed=False,
+                reject_reason="ev_no_positive_quantity",
+                quantity=quantity,
+                budget=min(int(total_budget), quantity * current_price),
+                expected_net=float(expected_net),
+                predicted_net=int(predicted_net),
+                lower_net=int(lower_net),
+                upper_net=int(upper_net),
+                win_probability=float(win_probability),
+                break_even_probability=float(break_even_probability),
+                planned_target_net=int(planned_target),
+                planned_stop_net_loss_abs=int(planned_stop),
+                planned_risk_net_loss_abs=int(planned_risk),
+                prediction=prediction,
+                reject_detail=str(detail),
+            )
 
-        return None
+        for quantity in range(1, max_quantity + 1):
+            predicted_net = self._net_for_return_pct(
+                quote,
+                quantity=quantity,
+                return_pct=predicted_return,
+                entry_slippage_rate=entry_slippage_rate,
+            )
+            if predicted_net <= 0:
+                remember_rejected(
+                    "predicted_net_non_positive",
+                    quantity=quantity,
+                    predicted_net=int(predicted_net),
+                )
+                continue
 
-    def _evaluate_sell(self, quote: Quote) -> Optional[Order]:
-        return self._regime_router.evaluate_long_exit(self, quote)
+            predicted_net_unrounded = estimate_trade_net_pnl_unrounded(
+                entry_price=entry_price,
+                exit_price=predicted_exit_price,
+                quantity=quantity,
+                commission_rate=float(self.config.commission_rate),
+                tax_slippage_rate=float(self.config.tax_slippage_rate),
+            )
+            if predicted_net_unrounded <= 0.0:
+                remember_rejected(
+                    "predicted_net_non_positive",
+                    quantity=quantity,
+                    predicted_net=int(predicted_net),
+                )
+                continue
 
-    def _effective_realized_net_for_breaker(self) -> int:
-        """일일 브레이커 판단에 사용할 순실현손익을 반환한다."""
-        return int(self.daily_pnl.realized_net_pnl - self._daily_breaker_pnl_offset)
+            lower_net = self._net_for_return_pct(
+                quote,
+                quantity=quantity,
+                return_pct=lower_return,
+                entry_slippage_rate=entry_slippage_rate,
+            )
+            upper_net = self._net_for_return_pct(
+                quote,
+                quantity=quantity,
+                return_pct=upper_return,
+                entry_slippage_rate=entry_slippage_rate,
+            )
+            zero_return_net = self._net_for_return_pct(
+                quote,
+                quantity=quantity,
+                return_pct=0.0,
+                entry_slippage_rate=entry_slippage_rate,
+            )
+            lower_net_unrounded = estimate_trade_net_pnl_unrounded(
+                entry_price=entry_price,
+                exit_price=lower_exit_price,
+                quantity=quantity,
+                commission_rate=float(self.config.commission_rate),
+                tax_slippage_rate=float(self.config.tax_slippage_rate),
+            )
+            zero_return_net_unrounded = estimate_trade_net_pnl_unrounded(
+                entry_price=entry_price,
+                exit_price=zero_return_exit_price,
+                quantity=quantity,
+                commission_rate=float(self.config.commission_rate),
+                tax_slippage_rate=float(self.config.tax_slippage_rate),
+            )
+            cost_floor = abs(min(0, int(zero_return_net))) + 1
+            cost_floor_unrounded = abs(min(0.0, float(zero_return_net_unrounded)))
+            configured_stop = max(
+                1,
+                min(
+                    int(self.config.long_stop_loss_cap_amount),
+                    int(entry_price * quantity * float(self.config.long_stop_loss_notional_pct)),
+                ),
+            )
+            model_loss = abs(min(0, int(lower_net)))
+            configured_stop_unrounded = max(
+                1.0,
+                min(
+                    float(self.config.long_stop_loss_cap_amount),
+                    float(entry_price * quantity)
+                    * float(self.config.long_stop_loss_notional_pct),
+                ),
+            )
+            model_loss_unrounded = abs(min(0.0, float(lower_net_unrounded)))
+            planned_stop = max(
+                cost_floor,
+                min(configured_stop, model_loss if model_loss > 0 else configured_stop),
+            )
+            planned_stop_unrounded = max(
+                cost_floor_unrounded,
+                min(
+                    configured_stop_unrounded,
+                    model_loss_unrounded if model_loss_unrounded > 0.0 else configured_stop_unrounded,
+                ),
+            )
+            execution_buffer = max(
+                1,
+                int(
+                    round(
+                        float(cost_floor) * 0.10
+                        + float(entry_price * quantity)
+                        * max(0.0, float(self.config.exit_market_slippage_rate))
+                        * 0.25
+                    )
+                ),
+            )
+            execution_buffer_unrounded = max(
+                1.0,
+                cost_floor_unrounded * 0.10
+                + float(entry_price * quantity)
+                * max(0.0, float(self.config.exit_market_slippage_rate))
+                * 0.25,
+            )
+            planned_risk = max(planned_stop, model_loss) + execution_buffer
+            planned_risk_unrounded = (
+                max(planned_stop_unrounded, model_loss_unrounded)
+                + execution_buffer_unrounded
+            )
+            planned_stop = max(planned_stop, int(ceil(planned_stop_unrounded)))
+            execution_buffer = max(execution_buffer, int(ceil(execution_buffer_unrounded)))
+            planned_risk = max(
+                max(planned_stop, model_loss) + execution_buffer,
+                planned_risk,
+                int(ceil(planned_risk_unrounded)),
+            )
+            planned_target = max(1, min(int(predicted_net), int(target_room)))
+            break_even_probability = float(planned_risk_unrounded) / max(
+                1.0,
+                float(predicted_net_unrounded + planned_risk_unrounded),
+            )
+            # predicted_return_pct is the calibrated expected return, not a
+            # conditional win payoff. Multiplying its net value by the win
+            # probability again would discount the same uncertainty twice.
+            expected_net = float(predicted_net_unrounded)
 
-    def _default_inverse_exit(self, quote: Quote) -> Optional[Order]:
-        """인버스 ETF 매도 판단 (타이트한 리스크 관리).
+            if planned_risk > usable_loss_room:
+                remember_rejected(
+                    f"risk_room_exceeded:need={planned_risk} room={usable_loss_room}",
+                    quantity=quantity,
+                    predicted_net=int(predicted_net),
+                    lower_net=int(lower_net),
+                    upper_net=int(upper_net),
+                    expected_net=float(expected_net),
+                    break_even_probability=float(break_even_probability),
+                    planned_target=int(planned_target),
+                    planned_stop=int(planned_stop),
+                    planned_risk=int(planned_risk),
+                )
+                continue
+            if expected_net <= 0.0:
+                remember_rejected(
+                    f"expected_net_non_positive:be={break_even_probability:.3f}",
+                    quantity=quantity,
+                    predicted_net=int(predicted_net),
+                    lower_net=int(lower_net),
+                    upper_net=int(upper_net),
+                    expected_net=float(expected_net),
+                    break_even_probability=float(break_even_probability),
+                    planned_target=int(planned_target),
+                    planned_stop=int(planned_stop),
+                    planned_risk=int(planned_risk),
+                )
+                continue
 
-        인버스 ETF는 음의 복리 위험이 있으므로:
-        - 익절/손절 기준이 일반보다 타이트
-        - 시간 기반 강제 청산 (최대 2시간)
-        - 시장 반등 시(약세 점수 하락) 즉시 청산
-        """
-        pos = self.positions.get(quote.symbol)
-        if not pos:
+            planned_take_profit = self._take_profit_pct_for_net_target(
+                quote,
+                quantity=quantity,
+                target_net=planned_target,
+                return_hint_pct=max(predicted_return, float(self.config.take_profit_pct or 0.0)),
+                entry_slippage_rate=entry_slippage_rate,
+            )
+            if planned_take_profit <= 0.0:
+                planned_take_profit = max(0.01, predicted_return)
+            planned_stop_loss_pct = (
+                float(planned_stop) / max(1.0, float(entry_price * quantity))
+            ) * 100.0
+            plan = ExpectedValueTradePlan(
+                allowed=True,
+                quantity=quantity,
+                budget=min(int(total_budget), quantity * current_price),
+                expected_net=float(expected_net),
+                predicted_net=int(predicted_net),
+                lower_net=int(lower_net),
+                upper_net=int(upper_net),
+                win_probability=float(win_probability),
+                break_even_probability=float(break_even_probability),
+                planned_target_net=int(planned_target),
+                planned_stop_net_loss_abs=int(planned_stop),
+                planned_risk_net_loss_abs=int(planned_risk),
+                planned_take_profit_pct=float(planned_take_profit),
+                planned_stop_loss_pct=float(planned_stop_loss_pct),
+                prediction=prediction,
+            )
+            key = (
+                float(plan.expected_net),
+                float(plan.expected_net) / max(1.0, float(plan.planned_risk_net_loss_abs)),
+                int(plan.predicted_net),
+                int(plan.quantity),
+            )
+            if key > best_key:
+                best_key = key
+                best = plan
+
+        if best is not None:
+            return best
+        if best_rejected is not None:
+            entry_meta["ev_reject_detail"] = str(best_rejected.reject_detail)
+            entry_meta["ev_reject_best_quantity"] = int(best_rejected.quantity)
+            entry_meta["ev_reject_best_expected_net"] = round(float(best_rejected.expected_net), 2)
+            return best_rejected
+        return ExpectedValueTradePlan(
+            False,
+            "ev_no_positive_quantity",
+            budget=max(0, int(total_budget)),
+            win_probability=float(win_probability),
+            prediction=prediction,
+        )
+    def _apply_expected_value_trade_plan_metadata(
+        self,
+        entry_meta: Dict[str, Any],
+        plan: ExpectedValueTradePlan,
+    ) -> None:
+        prediction = plan.prediction
+        entry_meta.update(
+            {
+                "execution_mode": "live",
+                "entry_reason": "expected_value",
+                "entry_ev_decision": 1.0,
+                "historical_entry_ev": float(entry_meta.get("entry_ev", 0.0) or 0.0),
+                "historical_entry_ev_confidence": str(entry_meta.get("entry_ev_confidence", "")),
+                "historical_entry_ev_closed_trades": int(entry_meta.get("entry_ev_closed_trades", 0) or 0),
+                "entry_ev": round(float(plan.expected_net), 2),
+                "entry_ev_confidence": "live_plan",
+                "entry_expected_net_pnl": round(float(plan.expected_net), 2),
+                "entry_prediction_net_pnl": int(plan.predicted_net),
+                "entry_prediction_lower_net_pnl": int(plan.lower_net),
+                "entry_prediction_win_probability": round(float(plan.win_probability), 6),
+                "entry_prediction_break_even_probability": round(float(plan.break_even_probability), 6),
+                "planned_target_net_pnl": int(plan.planned_target_net),
+                "planned_stop_net_loss_abs": int(plan.planned_stop_net_loss_abs),
+                "planned_risk_net_loss_abs": int(plan.planned_risk_net_loss_abs),
+                "planned_take_profit_pct": float(plan.planned_take_profit_pct),
+                "planned_stop_loss_pct": float(plan.planned_stop_loss_pct),
+                "adaptive_take_profit_pct": float(plan.planned_take_profit_pct),
+                "adaptive_stop_loss_pct": -abs(float(plan.planned_stop_loss_pct)),
+                "price_prediction_net_pnl": int(plan.predicted_net),
+                "price_prediction_lower_net_pnl": int(plan.lower_net),
+                "price_prediction_upper_net_pnl": int(plan.upper_net),
+            }
+        )
+        if prediction is None:
+            return
+        entry_meta.update(
+            {
+                "price_prediction_ready": 1.0 if bool(prediction.ready) else 0.0,
+                "price_prediction_reason": str(prediction.reason),
+                "price_prediction_horizon_seconds": int(prediction.horizon_seconds),
+                "price_prediction_sample_count": int(prediction.sample_count),
+                "price_prediction_return_pct": float(prediction.predicted_return_pct),
+                "price_prediction_lower_pct": float(prediction.lower_bound_return_pct),
+                "price_prediction_upper_pct": float(prediction.upper_bound_return_pct),
+                "price_prediction_confidence": float(prediction.confidence),
+                "price_prediction_direction_score": float(prediction.direction_score),
+                "price_prediction_volatility_pct": float(prediction.volatility_pct),
+            }
+        )
+        for key, value in dict(getattr(prediction, "features", {}) or {}).items():
+            if isinstance(value, (int, float)):
+                entry_meta[f"price_prediction_{key}"] = float(value)
+
+
+
+
+
+
+
+
+
+
+
+    def _estimate_trade_net_pnl_from_prices(
+        self,
+        *,
+        entry_price: int,
+        exit_price: int,
+        quantity: int,
+    ) -> int:
+        return estimate_trade_net_pnl_from_prices(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            commission_rate=float(self.config.commission_rate),
+            tax_slippage_rate=float(self.config.tax_slippage_rate),
+        )
+
+
+    def _price_prediction_for_entry(
+        self,
+        quote: Quote,
+        entry_meta: Dict[str, Any],
+        *,
+        horizon_seconds: Optional[int] = None,
+        min_samples: Optional[int] = None,
+    ) -> ShortHorizonPrediction:
+        leader = self._leader_signal_for_quote(quote)
+        if entry_meta:
+            leader = LeaderSignal(
+                symbol=str(getattr(quote, "symbol", "") or ""),
+                leader_score=float(entry_meta.get("leader_score", leader.leader_score) or 0.0),
+                leader_percentile=float(entry_meta.get("leader_percentile", leader.leader_percentile) or 0.0),
+                entry_grade=str(entry_meta.get("entry_grade", leader.entry_grade) or "C"),
+                change_rate=float(getattr(quote, "change_rate", 0.0) or 0.0),
+                trade_amount=int(getattr(quote, "trade_amount", 0) or 0),
+                vs_open_pct=float(entry_meta.get("vs_open_pct", leader.vs_open_pct) or 0.0),
+                high_proximity=float(entry_meta.get("high_proximity", leader.high_proximity) or 0.0),
+                volume_vs_avg=float(entry_meta.get("volume_vs_avg", leader.volume_vs_avg) or 0.0),
+                reclaim_speed_ticks=int(getattr(leader, "reclaim_speed_ticks", 99) or 99),
+                recent_acceleration_pct=float(entry_meta.get("recent_accel", leader.recent_acceleration_pct) or 0.0),
+                effective_leader_score=float(
+                    entry_meta.get("effective_leader_score", leader.effective_leader_score or leader.leader_score) or 0.0
+                ),
+            )
+        return predict_short_horizon_return(
+            quote,
+            recent_quotes=list(self._recent_quotes.get(quote.symbol, [])),
+            leader=leader,
+            market_state=dict(getattr(self, "_adaptive_market_state", {}) or {}),
+            horizon_seconds=int(
+                horizon_seconds
+                if horizon_seconds is not None
+                else getattr(self.config, "price_prediction_horizon_seconds", 180) or 180
+            ),
+            min_samples=int(
+                min_samples
+                if min_samples is not None
+                else getattr(self.config, "price_prediction_min_samples", 5) or 5
+            ),
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # ------------------------------------------------------------------
+    # 실전 주문 평가
+    # ------------------------------------------------------------------
+
+
+
+    def _log_ev_reject(
+        self,
+        quote: Quote,
+        strategy_name: str,
+        reason: str,
+        meta: Dict[str, Any],
+        plan: Optional[ExpectedValueTradePlan] = None,
+    ) -> None:
+        prediction = plan.prediction if plan is not None else None
+        reject_detail = ""
+        if plan is not None:
+            raw_detail = str(getattr(plan, "reject_detail", "") or "").strip()
+            if raw_detail:
+                reject_detail = f" detail={raw_detail[:160]}"
+        logger.info(
+            "EV 진입 거부[%s]: %s route=%s source=%s rank=%s score=%.4f "
+            "price=%d vs_open=%.2f hp=%.3f pred=%.3f lower=%.3f conf=%.3f "
+            "win=%.3f exp=%.1f pnet=%s lnet=%s qty=%s target=%s stop=%s risk=%s model=%s%s",
+            reason,
+            quote.symbol,
+            strategy_name,
+            meta.get("queue_source", ""),
+            int(meta.get("conviction_rank", 0) or 0),
+            float(meta.get("conviction_score", 0.0) or 0.0),
+            int(quote.current_price or 0),
+            float(meta.get("vs_open_pct", 0.0) or 0.0),
+            float(meta.get("high_proximity", 0.0) or 0.0),
+            float(getattr(prediction, "predicted_return_pct", 0.0) or 0.0),
+            float(getattr(prediction, "lower_bound_return_pct", 0.0) or 0.0),
+            float(getattr(prediction, "confidence", 0.0) or 0.0),
+            float(getattr(plan, "win_probability", 0.0) or 0.0),
+            float(getattr(plan, "expected_net", 0.0) or 0.0),
+            int(getattr(plan, "predicted_net", 0) or 0) if plan is not None else "-",
+            int(getattr(plan, "lower_net", 0) or 0) if plan is not None else "-",
+            int(getattr(plan, "quantity", 0) or 0) if plan is not None else "-",
+            int(getattr(plan, "planned_target_net", 0) or 0) if plan is not None else "-",
+            int(getattr(plan, "planned_stop_net_loss_abs", 0) or 0) if plan is not None else "-",
+            int(getattr(plan, "planned_risk_net_loss_abs", 0) or 0) if plan is not None else "-",
+            str(getattr(prediction, "reason", "-") or "-"),
+            reject_detail,
+        )
+
+    def _log_ev_buy_signal(self, quote: Quote, plan: ExpectedValueTradePlan, meta: Dict[str, Any]) -> None:
+        prediction = plan.prediction
+        logger.info(
+            "EV 매수 신호: %s %d주 @ %d원 budget=%s route=%s source=%s rank=%s score=%.4f "
+            "pred=%.3f lower=%.3f conf=%.3f win=%.3f exp=%.1f pnet=%d lnet=%d target=%d stop=%d risk=%d model=%s",
+            quote.symbol,
+            int(plan.quantity),
+            int(quote.current_price or 0),
+            f"{int(plan.budget):,}",
+            meta.get("strategy_name", ""),
+            meta.get("queue_source", ""),
+            int(meta.get("conviction_rank", 0) or 0),
+            float(meta.get("conviction_score", 0.0) or 0.0),
+            float(getattr(prediction, "predicted_return_pct", 0.0) or 0.0),
+            float(getattr(prediction, "lower_bound_return_pct", 0.0) or 0.0),
+            float(getattr(prediction, "confidence", 0.0) or 0.0),
+            float(plan.win_probability),
+            float(plan.expected_net),
+            int(plan.predicted_net),
+            int(plan.lower_net),
+            int(plan.planned_target_net),
+            int(plan.planned_stop_net_loss_abs),
+            int(plan.planned_risk_net_loss_abs),
+            str(getattr(prediction, "reason", "-") or "-"),
+        )
+
+    def _build_expected_value_candidate(
+        self,
+        quote: Quote,
+        *,
+        pending_orders: Sequence[Order],
+    ) -> Optional[ExpectedValueCandidate]:
+        strategy_name = self._long_ev_strategy_name_for_quote(quote)
+        if not strategy_name:
             return None
+        leader_signal = self._leader_signal_for_quote(quote)
+        meta = self._build_entry_metadata(
+            quote.symbol,
+            "expected_value",
+            "entry_reason=expected_value",
+            strategy_name=strategy_name,
+            quote=quote,
+        )
+        meta.update(
+            {
+                "candidate_class": (
+                    "opening_conviction"
+                    if strategy_name == OPENING_STRATEGY
+                    else "intraday_conviction"
+                ),
+                "execution_mode": "evaluated",
+                "live_route": strategy_name,
+                "entry_style": "expected_value",
+                "conviction_score": float(
+                    leader_signal.effective_leader_score or leader_signal.leader_score
+                ),
+                "recent_accel": float(leader_signal.recent_acceleration_pct),
+            }
+        )
+        meta["setup_name"] = "expected_value"
+        meta["entry_reason"] = "expected_value"
+        meta["payload"] = "entry_reason=expected_value"
+        meta["size_multiplier"] = 1.0
+        plan = self._build_expected_value_trade_plan(quote, meta, pending_orders=pending_orders)
+        if plan.allowed:
+            operational_reject_reason = self._long_ev_precheck_reject_reason(
+                quote,
+                pending_orders=pending_orders,
+                strategy_name_override=strategy_name,
+                entry_meta=meta,
+            )
+            if operational_reject_reason:
+                plan = replace(
+                    plan,
+                    allowed=False,
+                    reject_reason=operational_reject_reason,
+                    reject_detail="operational_constraint",
+                )
+        return ExpectedValueCandidate(
+            quote=quote,
+            strategy_name=strategy_name,
+            metadata=meta,
+            plan=plan,
+        )
 
-        pnl_pct = (quote.current_price - pos.buy_price) / pos.buy_price * 100
-        pnl_amount = (quote.current_price - pos.buy_price) * pos.quantity
-        stop_amount = self._inverse_stop_loss_amount(pos)
+    @staticmethod
+    def _expected_value_candidate_sort_key(
+        candidate: ExpectedValueCandidate,
+    ) -> Tuple[float, float, int, str]:
+        plan = candidate.plan
+        risk_adjusted_ev = float(plan.expected_net) / max(
+            1.0,
+            float(plan.planned_risk_net_loss_abs),
+        )
+        return (
+            -float(plan.expected_net),
+            -risk_adjusted_ev,
+            -int(plan.predicted_net),
+            candidate.quote.symbol,
+        )
 
-        # 1. 익절
-        if pnl_pct >= self._regime_inverse_take_profit_pct():
-            if self._should_defer_profit_exit(
-                pos=pos,
-                exit_price=quote.current_price,
-                reason="[INV] 익절",
-            ):
-                return None
-            logger.info("[INV] 익절: %s %.2f%%", quote.symbol, pnl_pct)
-            return self._make_sell_order(pos)
+    def _rank_expected_value_candidates(
+        self,
+        candidates: Sequence[ExpectedValueCandidate],
+    ) -> List[ExpectedValueCandidate]:
+        ranked = sorted(candidates, key=self._expected_value_candidate_sort_key)
+        for rank, candidate in enumerate(ranked, start=1):
+            candidate.metadata["conviction_rank"] = rank
+            candidate.metadata["ev_rank"] = rank
+        return ranked
 
-        # 2. 손절 (포지션 노출 연동 금액 기준)
-        if pnl_amount <= stop_amount:
-            logger.info("[INV] 손절: %s %s원 (한도 %s원)", quote.symbol, f"{pnl_amount:,}", f"{stop_amount:,}")
-            return self._make_sell_order(pos)
+    def _record_expected_value_forecast(
+        self,
+        candidate: ExpectedValueCandidate,
+        *,
+        selected: bool,
+    ) -> None:
+        prediction = candidate.plan.prediction
+        if prediction is None or not bool(prediction.ready):
+            return
+        features = dict(getattr(prediction, "features", {}) or {})
+        signal_at = getattr(candidate.quote, "timestamp", None) or self._now()
+        round_trip_cost_pct = self._round_trip_execution_cost_pct()
+        payload = {
+            "symbol": candidate.quote.symbol,
+            "signal_timestamp": signal_at.isoformat(timespec="seconds"),
+            "signal_price": int(candidate.quote.current_price or 0),
+            "horizon_seconds": int(prediction.horizon_seconds),
+            "round_trip_cost_pct": round(round_trip_cost_pct, 6),
+            "strategy_name": candidate.strategy_name,
+            "queue_source": str(candidate.metadata.get("queue_source", "") or ""),
+            "rank": int(candidate.metadata.get("ev_rank", 0) or 0),
+            "allowed": bool(candidate.plan.allowed),
+            "reject_reason": str(candidate.plan.reject_reason or ""),
+            "quantity": int(candidate.plan.quantity),
+            "expected_net": round(float(candidate.plan.expected_net), 6),
+            "predicted_net": int(candidate.plan.predicted_net),
+            "planned_risk_net_loss_abs": int(candidate.plan.planned_risk_net_loss_abs),
+            "raw_predicted_return_pct": float(
+                features.get("raw_predicted_return_pct", prediction.predicted_return_pct)
+            ),
+            "calibrated_predicted_return_pct": float(prediction.predicted_return_pct),
+            "lower_bound_return_pct": float(prediction.lower_bound_return_pct),
+            "upper_bound_return_pct": float(prediction.upper_bound_return_pct),
+            "confidence": float(prediction.confidence),
+            "raw_win_probability": float(
+                features.get("raw_win_probability", candidate.plan.win_probability)
+            ),
+            "calibrated_win_probability": float(candidate.plan.win_probability),
+            "walk_forward_sample_count": int(
+                features.get("walk_forward_sample_count", 0) or 0
+            ),
+            "walk_forward_effective_sample_size": float(
+                features.get("walk_forward_effective_sample_size", 0.0) or 0.0
+            ),
+            "raw_lower_bound_return_pct": float(
+                features.get("raw_lower_bound_return_pct", prediction.lower_bound_return_pct)
+            ),
+            "raw_upper_bound_return_pct": float(
+                features.get("raw_upper_bound_return_pct", prediction.upper_bound_return_pct)
+            ),
+            "prediction_features": {
+                key: float(features[key])
+                for key in (
+                    "short_return_pct",
+                    "full_return_pct",
+                    "positive_move_support",
+                    "tail_positive_support",
+                    "single_tick_impulse_risk",
+                    "late_extension_risk",
+                    "flow_confirmation",
+                    "quote_gap_risk",
+                    "rejection_risk_score",
+                    "deceleration_pressure",
+                    "confirmed_high_hold_continuation_score",
+                    "confirmed_opening_launch_score",
+                    "directional_evidence_pct",
+                    "directional_reversal_penalty_pct",
+                )
+                if key in features
+            },
+        }
+        try:
+            self._forecast_outcomes.record(payload, now=self._now(), selected=selected)
+        except OSError as exc:
+            logger.warning("예측 결과 원장 기록 실패: %s", exc)
 
-        # 3. 시간 초과 청산 (음의 복리 방지, 실거래 모드만)
-        if self.market_data is not None:
-            hold_minutes = (self._now() - pos.buy_time).total_seconds() / 60
-            if hold_minutes >= self._regime_inverse_max_hold_minutes() and not pos.is_restored:
-                logger.info("[INV] 시간초과 청산: %s (%.0f분 보유)", quote.symbol, hold_minutes)
-                return self._make_sell_order(pos)
+    def _order_from_expected_value_candidate(
+        self,
+        candidate: ExpectedValueCandidate,
+    ) -> Order:
+        quote = candidate.quote
+        plan = candidate.plan
+        meta = candidate.metadata
+        self._apply_expected_value_trade_plan_metadata(meta, plan)
 
-        # 4. 시장 반등 청산 (약세 점수가 임계 미만으로 떨어지면)
-        if self._bear_score < self.cfg.bearish_threshold:
-            logger.info("[INV] 시장반등 청산: %s (약세점수: %d)", quote.symbol, self._bear_score)
-            return self._make_sell_order(pos)
+        quantity = int(plan.quantity)
+        budget = int(plan.budget)
+        meta["entry_signal_price"] = int(quote.current_price or 0)
+        meta["entry_signal_timestamp"] = self._now().isoformat(timespec="seconds")
+        meta["pending_order_quantity"] = quantity
+        meta["pending_order_reference_price"] = int(quote.current_price or 0)
+        meta["pending_order_budget"] = budget
+        meta["pending_order_created_at"] = meta["entry_signal_timestamp"]
+        self._pending_entry_meta[quote.symbol] = meta
+        self._log_ev_buy_signal(quote, plan, meta)
+        return Order(
+            symbol=quote.symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=quantity,
+            price=0,
+            reference_price=max(0, int(quote.current_price or 0)),
+            requested_reason="expected_value",
+        )
 
-        # 5. 추적손절 (고점 -0.3%, 일반 -0.7%보다 타이트)
-        if pos.high_since_buy > pos.buy_price:
-            drop_from_high = (quote.current_price - pos.high_since_buy) / pos.high_since_buy * 100
-            gain_from_entry = (pos.high_since_buy - pos.buy_price) / pos.buy_price * 100
-            if (
-                gain_from_entry >= self._regime_inverse_trailing_stop_activation_gain_pct()
-                and drop_from_high <= self._regime_inverse_trailing_stop_pct()
-            ):
-                if self._should_defer_profit_exit(
-                    pos=pos,
-                    exit_price=quote.current_price,
-                    reason="[INV] 추적손절",
-                ):
-                    return None
-                logger.info("[INV] 추적손절: %s 고점 %s → 현재 %s (%.2f%%)",
-                            quote.symbol, f"{pos.high_since_buy:,}",
-                            f"{quote.current_price:,}", drop_from_high)
-                return self._make_sell_order(pos)
 
-        return None
+    # ------------------------------------------------------------------
+    # 청산
+    # ------------------------------------------------------------------
+    def _estimated_exit_net_pnl(
+        self,
+        pos: PositionState,
+        quote: Quote,
+        *,
+        quantity: Optional[int] = None,
+    ) -> int:
+        sell_qty = max(0, min(int(quantity or pos.quantity or 0), int(pos.quantity or 0)))
+        if sell_qty <= 0:
+            return 0
+        current_price = max(0, int(getattr(quote, "current_price", 0) or 0))
+        buy_price = max(0, int(getattr(pos, "buy_price", 0) or 0))
+        return estimate_trade_net_pnl_from_prices(
+            entry_price=buy_price,
+            exit_price=current_price,
+            quantity=sell_qty,
+            commission_rate=float(self.config.commission_rate),
+            tax_slippage_rate=float(self.config.tax_slippage_rate),
+        )
 
-    def _evaluate_inverse_sell(self, quote: Quote) -> Optional[Order]:
-        return self._regime_router.evaluate_inverse_exit(self, quote)
+    def _paper_mode_active(self) -> bool:
+        client = getattr(self.market_data, "client", None)
+        cfg = getattr(client, "config", None)
+        return bool(getattr(cfg, "is_paper", False))
 
-    def _calc_momentum_score(self, quote: Quote) -> float:
-        """모멘텀 점수를 계산한다 (0~5)."""
-        score = 0.0
-
-        # 1. 시가 대비 상승폭 (0~1.5)
-        if quote.open_price > 0:
-            vs_open = (quote.current_price - quote.open_price) / quote.open_price * 100
-            if vs_open >= 2.0:
-                score += 1.5
-            elif vs_open >= 1.0:
-                score += 1.0
-            elif vs_open >= 0.5:
-                score += 0.5
-
-        # 2. 전일 대비 등락률 (0~1.0)
-        if quote.change_rate >= 2.0:
-            score += 1.0
-        elif quote.change_rate >= 1.0:
-            score += 0.6
-        elif quote.change_rate >= 0.5:
-            score += 0.3
-
-        # 3. 고가 근접도 (0~1.0)
-        price_range = quote.high_price - quote.low_price
-        if price_range > 0 and self._is_bullish_regime():
-            proximity = (quote.current_price - quote.low_price) / price_range
-            if proximity >= 0.9:
-                score += 1.0
-            elif proximity >= 0.7:
-                score += 0.5
-
-        # 4. 거래량 폭발 (0~1.5) — 5일 평균 대비
-        avg_vol = self._avg_volumes.get(quote.symbol)
-        if avg_vol and avg_vol > 0:
-            vol_ratio = quote.volume / avg_vol
-            if vol_ratio >= 3.0:
-                score += 1.5
-            elif vol_ratio >= 2.0:
-                score += 1.0
-            elif vol_ratio >= 1.5:
-                score += 0.5
-
-        return score
-
-    def _make_sell_order(self, pos: PositionState, quantity: Optional[int] = None) -> Order:
+    def _make_sell_order(
+        self,
+        pos: PositionState,
+        quantity: int,
+        *,
+        reason: str,
+        reference_price: int = 0,
+    ) -> Optional[Order]:
+        requested_quantity = max(0, min(int(quantity or 0), int(pos.quantity or 0)))
+        reserved_quantity = 0
+        if self._position_pending_exit_reconcile_pending(pos):
+            reserved_quantity = min(
+                int(pos.quantity or 0),
+                max(0, int(getattr(pos, "pending_exit_quantity", 0) or 0)),
+            )
+        sell_quantity = min(requested_quantity, max(0, int(pos.quantity or 0) - reserved_quantity))
+        if sell_quantity <= 0:
+            return None
+        stop_cap_amount = int(self.config.long_stop_loss_cap_amount)
+        protective_exit_mode = "" if self._paper_mode_active() else "limit_then_market"
+        protective_limit_price = 0
+        protective_fallback_polls = 0
+        if protective_exit_mode == "limit_then_market":
+            protective_limit_price = max(1, int(pos.high_since_buy or pos.buy_price))
+            protective_fallback_polls = max(1, int(self.config.protective_stop_fallback_ticks))
+        order_reference_price = max(0, int(reference_price or 0))
+        if order_reference_price <= 0:
+            quote = self._quotes_cache.get(pos.symbol)
+            if quote is None:
+                recent_quotes = list(self._recent_quotes.get(pos.symbol, []))
+                quote = recent_quotes[-1] if recent_quotes else None
+            if quote is not None:
+                order_reference_price = max(0, int(getattr(quote, "current_price", 0) or 0))
+        if order_reference_price <= 0:
+            order_reference_price = max(0, int(pos.buy_price or 0))
         return Order(
             symbol=pos.symbol,
             side=OrderSide.SELL,
             order_type=OrderType.MARKET,
-            quantity=max(1, int(quantity if quantity is not None else pos.quantity)),
+            quantity=sell_quantity,
             price=0,
+            reference_price=order_reference_price,
+            protective_exit_mode=protective_exit_mode,
+            protective_limit_price=protective_limit_price,
+            protective_fallback_polls=protective_fallback_polls,
+            stop_reference_amount_krw=max(0, stop_cap_amount),
+            requested_reason=reason,
         )
 
-    def _calc_commission_cost(self, notional: int) -> int:
-        if notional <= 0:
-            return 0
-        return int(round(notional * self.cfg.commission_rate))
 
-    def _calc_sell_tax_slippage_cost(self, sell_notional: int) -> int:
-        if sell_notional <= 0:
-            return 0
-        return int(round(sell_notional * self.cfg.tax_slippage_rate))
 
-    def _estimate_round_trip_net_pnl(self, pos: PositionState, exit_price: int) -> int:
-        if exit_price <= 0 or pos.quantity <= 0:
-            return 0
-        gross = (exit_price - pos.buy_price) * pos.quantity
-        buy_notional = max(0, int(pos.invested_amount))
-        sell_notional = exit_price * pos.quantity
-        buy_fee = self._calc_commission_cost(buy_notional)
-        sell_fee = self._calc_commission_cost(sell_notional)
-        sell_tax_slippage = self._calc_sell_tax_slippage_cost(sell_notional)
-        return gross - buy_fee - sell_fee - sell_tax_slippage
 
-    def _should_defer_profit_exit(
+
+    def _paper_exit_grace_active(self, pos: PositionState) -> bool:
+        client = getattr(self.market_data, "client", None)
+        cfg = getattr(client, "config", None)
+        if not bool(getattr(cfg, "is_paper", False)):
+            return False
+        grace = max(0, int(self.config.paper_position_exit_grace_seconds))
+        if grace <= 0:
+            return False
+        return (self._now() - pos.buy_time).total_seconds() < grace
+
+    def _resolve_fill_price_with_quote_fallback(
         self,
-        pos: PositionState,
-        exit_price: int,
-        reason: str,
-    ) -> bool:
-        if not self.cfg.enable_cost_aware_profit_exit:
-            return False
+        symbol: str,
+        *,
+        broker_price: int,
+        requested_price: int = 0,
+        reference_price: int = 0,
+        position: Optional[PositionState] = None,
+    ) -> int:
+        price = max(0, int(broker_price or 0))
+        if price > 0:
+            return price
 
-        estimated_net = self._estimate_round_trip_net_pnl(pos, exit_price)
-        min_net = int(self.cfg.min_profit_exit_net_pnl)
-        if estimated_net >= min_net:
-            return False
+        requested = max(0, int(requested_price or 0))
+        if requested > 0:
+            logger.debug("체결가가 비어 있어 요청가로 대체합니다: %s @ %d원", symbol, requested)
+            return requested
 
-        self._log_entry_filter_once_per_minute(
-            pos.symbol,
-            f"profit-exit:{reason}",
-            "%s 보류: %s 예상왕복순익 %s원 < 최소 %s원 (현재가 %s원)",
-            reason,
-            pos.symbol,
-            f"{estimated_net:,}",
-            f"{min_net:,}",
-            f"{exit_price:,}",
-        )
-        return True
+        reference = max(0, int(reference_price or 0))
+        if reference > 0:
+            logger.debug("체결가가 비어 있어 주문 기준가로 대체합니다: %s @ %d원", symbol, reference)
+            return reference
 
-    def _passes_expected_net_filter(self, symbol: str, quantity: int, entry_price: int) -> bool:
-        if not self.cfg.enable_expected_net_filter:
-            return True
-        if quantity <= 0 or entry_price <= 0:
-            return False
+        cached_quote = self._quotes_cache.get(symbol)
+        cached_quote_price = max(0, int(getattr(cached_quote, "current_price", 0) or 0))
+        if cached_quote_price > 0:
+            logger.debug("체결가가 비어 있어 최근 캐시 시세로 대체합니다: %s @ %d원", symbol, cached_quote_price)
+            return cached_quote_price
 
-        entry_price_with_slip = int(round(entry_price * (1 + self.cfg.entry_market_slippage_rate)))
-        if entry_price_with_slip <= 0:
-            return False
+        recent_quotes = list(self._recent_quotes.get(symbol, []))
+        if recent_quotes:
+            fallback_quote_price = max(0, int(getattr(recent_quotes[-1], "current_price", 0) or 0))
+            if fallback_quote_price > 0:
+                logger.debug("체결가가 비어 있어 최근 시세로 대체합니다: %s @ %d원", symbol, fallback_quote_price)
+                return fallback_quote_price
 
-        buy_notional = entry_price_with_slip * quantity
-        expected_exit_price = int(
-            round(entry_price * (1 + self._regime_expected_move_pct() / 100))
-        )
-        if expected_exit_price <= 0:
-            return False
-        expected_exit_after_slip = int(
-            round(expected_exit_price * (1 - self.cfg.exit_market_slippage_rate))
-        )
-        if expected_exit_after_slip <= 0:
-            return False
+        if position is not None:
+            position_price = max(0, int(getattr(position, "buy_price", 0) or 0))
+            if position_price > 0:
+                logger.debug("체결가가 비어 있어 보유 평균단가로 대체합니다: %s @ %d원", symbol, position_price)
+                return position_price
 
-        sell_notional = expected_exit_after_slip * quantity
-        gross_expected = (expected_exit_after_slip - entry_price_with_slip) * quantity
-        buy_fee = self._calc_commission_cost(buy_notional)
-        sell_fee = self._calc_commission_cost(sell_notional)
-        sell_tax_slippage = self._calc_sell_tax_slippage_cost(sell_notional)
-        expected_net = gross_expected - buy_fee - sell_fee - sell_tax_slippage
+        return 0
 
-        risk_amount = max(1, self._entry_stop_risk_amount(symbol, quantity, entry_price_with_slip))
-        rr_ratio = expected_net / risk_amount
-        passes = (
-            expected_net >= self._regime_min_expected_net_profit()
-            and rr_ratio >= self._regime_min_expected_rr_ratio()
-        )
-        if not passes:
-            logger.info(
-                "진입 필터 탈락: %s 기대순익 %s원, RR %.2f (기준: %s원 / %.2f), "
-                "매입가=%s원, 매수예상=%s원, 매도예상=%s원, 수수료=%s원, 세금+슬리피지=%s원",
-                symbol,
-                f"{expected_net:,}",
-                rr_ratio,
-                f"{self._regime_min_expected_net_profit():,}",
-                self._regime_min_expected_rr_ratio(),
-                f"{entry_price:,}",
-                f"{entry_price_with_slip:,}",
-                f"{expected_exit_after_slip:,}",
-                f"{(buy_fee + sell_fee):,}",
-                f"{sell_tax_slippage:,}",
+    def _default_long_exit(self, quote: Quote) -> Optional[Order]:
+        pos = self.positions.get(quote.symbol)
+        if pos is None:
+            return None
+        pos.high_since_buy = max(int(pos.high_since_buy or 0), int(quote.current_price or 0))
+        estimated_net_pnl = self._estimated_exit_net_pnl(pos, quote)
+        planned_stop = int(getattr(pos, "planned_stop_net_loss_abs", 0) or 0)
+        if planned_stop > 0 and estimated_net_pnl <= -planned_stop:
+            return self._make_sell_order(
+                pos,
+                int(pos.quantity or 0),
+                reason="ev_planned_stop_net",
+                reference_price=int(quote.current_price or 0),
             )
-        return passes
-
-    def _estimate_unrealized_net_pnl(self) -> int:
-        total = 0
-        for sym, pos in self.positions.items():
-            q = self._quotes_cache.get(sym)
-            if not q or q.current_price <= 0:
-                continue
-            gross = (q.current_price - pos.buy_price) * pos.quantity
-            sell_notional = q.current_price * pos.quantity
-            exit_cost = (
-                self._calc_commission_cost(sell_notional) +
-                self._calc_sell_tax_slippage_cost(sell_notional)
+        if getattr(pos, "pending_entry_started_at", None) is not None:
+            return None
+        if self._paper_exit_grace_active(pos):
+            return None
+        if pos.is_restored and pos.restored_at is not None:
+            grace = int(self.config.restored_position_grace_seconds)
+            if (self._now() - pos.restored_at).total_seconds() < grace:
+                return None
+        held_seconds = max(0.0, (self._now() - pos.buy_time).total_seconds())
+        held_minutes = held_seconds / 60.0
+        gain_pct = ((int(quote.current_price or 0) - int(pos.buy_price or 0)) / max(1, int(pos.buy_price or 0))) * 100.0
+        trail_drawdown = (
+            ((int(quote.current_price or 0) - int(pos.high_since_buy or pos.buy_price)) / max(1, int(pos.high_since_buy or pos.buy_price))) * 100.0
+        )
+        stop_amount = min(
+            int(self.config.long_stop_loss_cap_amount),
+            int(pos.invested_amount * float(self.config.long_stop_loss_notional_pct)),
+        )
+        net_stop_amount = max(1, stop_amount)
+        planned_target = int(getattr(pos, "planned_target_net_pnl", 0) or 0)
+        if planned_target > 0 and estimated_net_pnl >= planned_target:
+            return self._make_sell_order(
+                pos,
+                int(pos.quantity or 0),
+                reason="ev_planned_target_net",
+                reference_price=int(quote.current_price or 0),
             )
-            total += (gross - exit_cost)
-        return total
+        take_profit = float(pos.adaptive_take_profit_pct or self.config.take_profit_pct)
+        adaptive_target = float(pos.adaptive_take_profit_pct or 0.0) > 0.0
+        hold_profile = long_exit_hold_profile(
+            self,
+            pos,
+            quote,
+            estimated_net_pnl=estimated_net_pnl,
+            gain_pct=gain_pct,
+            take_profit_pct=take_profit,
+        )
+        max_hold_minutes = max(1.0, float(hold_profile.get("max_hold_minutes", self.config.max_position_holding_minutes)))
+        min_trailing_seconds = max(0.0, float(hold_profile.get("min_trailing_seconds", 0.0)))
+        trailing_activation = float(pos.adaptive_trailing_activation_pct or self.config.trailing_stop_activation_gain_pct)
+        trailing_stop = -abs(float(pos.adaptive_trailing_stop_pct or self.config.trailing_stop_pct))
+        exit_decision = decide_long_exit(
+            LongExitSnapshot(
+                quantity=int(pos.quantity or 0),
+                held_minutes=held_minutes,
+                held_seconds=held_seconds,
+                gain_pct=gain_pct,
+                trail_drawdown_pct=trail_drawdown,
+                unrealized_pnl=int((int(quote.current_price or 0) - int(pos.buy_price or 0)) * int(pos.quantity or 0)),
+                estimated_net_pnl=estimated_net_pnl,
+                net_stop_amount=net_stop_amount,
+                take_profit_pct=take_profit,
+                adaptive_target=adaptive_target,
+                max_hold_minutes=max_hold_minutes,
+                min_trailing_seconds=min_trailing_seconds,
+                trailing_activation_pct=trailing_activation,
+                trailing_stop_pct=trailing_stop,
+                adaptive_stop_loss_pct=float(getattr(pos, "adaptive_stop_loss_pct", 0.0) or 0.0),
+            ),
+            partial_exit_done=bool(pos.partial_exit_done),
+            partial_exit_ratio=float(self.config.bull_partial_exit_ratio),
+        )
+        if not exit_decision.should_exit:
+            return None
+        return self._make_sell_order(
+            pos,
+            exit_decision.quantity,
+            reason=exit_decision.reason,
+            reference_price=int(quote.current_price or 0),
+        )
 
     def _liquidate_all(self) -> List[Order]:
-        """전 포지션 청산 (일반 + 인버스 모두)."""
-        orders = []
-        for pos in self.positions.values():
-            orders.append(self._make_sell_order(pos))
+        orders: List[Order] = []
+        for pos in list(self.positions.values()):
+            order = self._make_sell_order(pos, pos.quantity, reason="liquidate_all")
+            if order is not None:
+                orders.append(order)
         return orders
 
-    def load_avg_volumes(self, avg_volumes: Dict[str, int]):
-        """5일 평균 거래량을 외부에서 주입한다 (백테스트/초기화 시)."""
-        self._avg_volumes = avg_volumes
+    def _fresh_market_state_quotes(self, incoming_quotes: Sequence[Quote], *, max_age_seconds: float = 75.0) -> List[Quote]:
+        ordered_symbols: List[str] = [quote.symbol for quote in incoming_quotes if getattr(quote, "symbol", "")]
+        ordered_symbols.extend(self._latest_math_queue_symbols)
+        ordered_symbols.extend(self._latest_math_backfill_symbols)
+        ordered_symbols.extend(sorted(self._latest_opening_fast_symbols))
+        ordered_symbols.extend(sorted(self._latest_opening_hot_symbols))
+        ordered_symbols.extend(self._pool)
+        ordered_symbols.extend(self.get_watchlist())
+        ordered_symbols.extend(list(self.positions.keys()))
+
+        now = self._now()
+        seen = set()
+        fresh_quotes: List[Quote] = []
+        for symbol in ordered_symbols:
+            normalized = str(symbol or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            quote = self._quotes_cache.get(normalized)
+            if quote is None:
+                continue
+            quote_ts = getattr(quote, "timestamp", None)
+            if quote_ts is not None:
+                age_seconds = max(0.0, (now - quote_ts).total_seconds())
+                if age_seconds > max_age_seconds:
+                    continue
+            fresh_quotes.append(quote)
+        return fresh_quotes
+
+    # ------------------------------------------------------------------
+    # 이벤트 루프
+    # ------------------------------------------------------------------
+    def on_tick(self, quote: Quote) -> List[Order]:
+        return self.on_batch_tick([quote])
+
+    def _update_market_state(self, quotes: Sequence[Quote]):
+        if not quotes:
+            return
+        market_quotes = self._fresh_market_state_quotes(quotes)
+        if not market_quotes:
+            return
+        long_universe = [
+            quote
+            for quote in market_quotes
+            if self._is_supported_long_symbol(quote.symbol)
+        ]
+        if not long_universe:
+            return
+        market_basis = [quote for quote in long_universe if quote.symbol not in self._inverse_symbols] or long_universe
+        avg_change = mean(float(quote.change_rate or 0.0) for quote in market_basis)
+        decliner_ratio = sum(1 for quote in market_basis if float(quote.change_rate or 0.0) < 0.0) / max(1, len(market_basis))
+
+        leader_signals = build_leader_signals(
+            long_universe,
+            avg_volumes=self._avg_volumes,
+            recent_quotes_by_symbol=self._recent_quotes,
+            regime_score=int(self._bear_score),
+        )
+        self._latest_math_leader_signals.update(leader_signals)
+        market_basis_signals = {
+            quote.symbol: leader_signals[quote.symbol]
+            for quote in market_basis
+            if quote.symbol in leader_signals
+        }
+        strong_leaders = [
+            signal
+            for signal in market_basis_signals.values()
+            if float(signal.effective_leader_score or signal.leader_score) >= float(self.config.strong_leader_min_change_rate) / 4.0
+        ]
+        strong_leader_avg = mean(
+            float(signal.effective_leader_score or signal.leader_score) for signal in strong_leaders
+        ) if strong_leaders else 0.0
+
+        probs = compute_regime_probabilities(
+            index_gap_ma20_pct=avg_change,
+            index_gap_ma5_pct=avg_change * 0.6,
+            avg_change=avg_change,
+            decliner_ratio=decliner_ratio,
+            strong_leader_count=len(strong_leaders),
+            strong_leader_avg_score=strong_leader_avg,
+        )
+        self._latest_regime_probabilities = probs
+        if probs.bear_prob >= max(probs.bull_prob, probs.neutral_prob, probs.soft_bear_prob):
+            self._bear_score = 3
+        elif probs.soft_bear_prob >= max(probs.bull_prob, probs.neutral_prob):
+            self._bear_score = 2
+        elif probs.bull_prob >= 0.45:
+            self._bear_score = 0
+        else:
+            self._bear_score = 1
+        self._strong_bull_override_active = probs.bull_prob >= 0.60
+        if self._resolve_regime_profile_name() == "bull":
+            self._bull_market_context = "fragile_bull" if (self._bear_score > 0 or probs.bull_prob < 0.70) else "broad_bull"
+        else:
+            self._bull_market_context = self._resolve_regime_profile_name()
+
+        inverse_quotes = [quote for quote in market_quotes if quote.symbol in self._inverse_symbols]
+        inverse_leader_count = sum(1 for quote in inverse_quotes if float(quote.change_rate or 0.0) > 0.0)
+        self._latest_market_shock_signal = compute_market_shock_signal(
+            minutes_since_open=self._minutes_since_market_open(),
+            crash_window_minutes=int(self.config.market_shock_window_minutes_after_open),
+            index_gap_open_pct=avg_change,
+            index_gap_ma5_pct=avg_change * 0.7,
+            index_gap_ma20_pct=avg_change * 1.1,
+            avg_change=avg_change,
+            decliner_ratio=decliner_ratio,
+            falling_speed_pct=max(0.0, -avg_change),
+            inverse_leader_count=inverse_leader_count,
+        )
+        self._refresh_adaptive_market_state(
+            market_basis,
+            market_basis_signals,
+            avg_change=avg_change,
+            decliner_ratio=decliner_ratio,
+            probs=probs,
+        )
+
+        self._refresh_runtime_math_candidate_queue(long_universe)
+
+    def on_batch_tick(self, quotes: List[Quote]) -> List[Order]:
+        if not quotes:
+            return []
+        now = max((quote.timestamp for quote in quotes), default=self._now())
+        self.set_simulated_now(now)
+        if self._active_day != self._today() or self._session_start_at is None:
+            self.initialize()
+
+        for quote in quotes:
+            self._quotes_cache[quote.symbol] = quote
+            window = self._ensure_recent_quote_window(quote.symbol)
+            window.append(quote)
+
+        try:
+            settled_forecasts = self._forecast_outcomes.settle(quotes, now=self._now())
+        except OSError as exc:
+            settled_forecasts = []
+            logger.warning("예측 결과 원장 정산 실패: %s", exc)
+        if settled_forecasts:
+            profitable_count = sum(
+                1 for item in settled_forecasts if bool(item.get("profitable"))
+            )
+            logger.info(
+                "180초 예측 정산: total=%d profitable=%d",
+                len(settled_forecasts),
+                profitable_count,
+            )
+
+        self._update_market_state(quotes)
+        self._update_daily_breakers()
+        self._last_long_shortlist_symbols = []
+        if self._halted:
+            return self._liquidate_all()
+
+        orders: List[Order] = []
+        entry_quotes = self._fresh_market_state_quotes(quotes)
+        quote_by_symbol = {quote.symbol: quote for quote in quotes}
+
+        # 보유 포지션 청산 우선
+        for symbol, pos in list(self.positions.items()):
+            quote = quote_by_symbol.get(symbol)
+            if quote is None:
+                continue
+            exit_order = self._regime_router.evaluate_long_exit(self, quote)
+            if exit_order is not None:
+                orders.append(exit_order)
+        if orders:
+            return orders
+
+        if self._profit_halt_confirmation_pending():
+            return []
+
+        long_shortlist = self._long_entry_shortlist(entry_quotes)
+        self._last_long_shortlist_symbols = [quote.symbol for quote in long_shortlist]
+        candidates = [
+            candidate
+            for candidate in (
+                self._build_expected_value_candidate(quote, pending_orders=[])
+                for quote in long_shortlist
+            )
+            if candidate is not None
+        ]
+        ranked = self._rank_expected_value_candidates(candidates)
+        selected = next(
+            (candidate for candidate in ranked if candidate.plan.allowed),
+            None,
+        )
+        for candidate in ranked:
+            self._record_expected_value_forecast(
+                candidate,
+                selected=candidate is selected,
+            )
+        if selected is None:
+            if ranked:
+                top = ranked[0]
+                self._log_ev_reject(
+                    top.quote,
+                    top.strategy_name,
+                    top.plan.reject_reason,
+                    top.metadata,
+                    top.plan,
+                )
+            return []
+
+        logger.info(
+            "EV 후보 선택: symbol=%s evaluated=%d viable=%d rank=%d exp=%.1f risk=%d",
+            selected.quote.symbol,
+            len(ranked),
+            sum(1 for candidate in ranked if candidate.plan.allowed),
+            int(selected.metadata.get("ev_rank", 0) or 0),
+            float(selected.plan.expected_net),
+            int(selected.plan.planned_risk_net_loss_abs),
+        )
+        return [self._order_from_expected_value_candidate(selected)]
+
+    # ------------------------------------------------------------------
+    # 체결 처리
+    # ------------------------------------------------------------------
+    def _position_counts_for_daily_breaker(self, pos: Optional[PositionState]) -> bool:
+        if pos is None:
+            return True
+        if bool(self.config.use_restored_pnl_for_daily_breaker):
+            return True
+        if bool(getattr(pos, "is_restored", False)):
+            return False
+        if str(getattr(pos, "entry_setup_name", "") or "") == "restored_position":
+            return False
+        if str(getattr(pos, "queue_source", "") or "") == "account_restore":
+            return False
+        return True
+
+    def _position_realized_counts_for_daily_breaker(self, pos: Optional[PositionState]) -> bool:
+        if pos is None:
+            return True
+        return True
+
+    def _position_counts_for_strategy_stats(self, pos: Optional[PositionState]) -> bool:
+        return self._position_counts_for_daily_breaker(pos)
+
+    def _normalize_sell_fill_breaker_flags(self) -> None:
+        for entry in self._sell_fill_ledger or []:
+            if not isinstance(entry, dict):
+                continue
+            if not bool(entry.get("counts_for_daily_breaker", True)):
+                entry["counts_for_daily_breaker"] = True
+                entry["daily_breaker_flag_migrated"] = "realized_sell_fill"
+
+    def _realized_net_pnl_for_daily_breaker(self) -> int:
+        realized = int(self.daily_pnl.realized_net_pnl)
+        if not bool(self.config.use_restored_pnl_for_daily_breaker):
+            realized -= int(self._breaker_excluded_realized_net_pnl)
+        return realized
+
+    def _daily_loss_floor(self) -> int:
+        return int(
+            self.config.daily_total_loss_limit
+            if self.config.daily_total_loss_limit is not None
+            else self.config.daily_loss_limit
+        )
+
+    def _daily_loss_room(self, realized_net_pnl: Optional[int] = None) -> int:
+        realized = self._realized_net_pnl_for_daily_breaker() if realized_net_pnl is None else int(realized_net_pnl)
+        return max(0, realized - self._daily_loss_floor())
+
+    def _total_net_pnl_for_daily_breaker(self, realized_net_pnl: Optional[int] = None) -> int:
+        total = self._realized_net_pnl_for_daily_breaker() if realized_net_pnl is None else int(realized_net_pnl)
+        if bool(self.config.enable_unrealized_loss_guard):
+            total += self._unrealized_net_pnl_for_daily_breaker()
+        return int(total)
+
+    def _restored_loss_halt_is_stale(self) -> bool:
+        reason = str(getattr(self, "_halt_reason", "") or "")
+        if not self._halted or reason not in {"daily_loss_limit", "daily_loss_near_limit", "daily_total_loss_limit"}:
+            return False
+        realized_net_pnl = self._realized_net_pnl_for_daily_breaker()
+        if realized_net_pnl <= int(self.config.daily_loss_limit):
+            return False
+
+        near_stop_buffer = max(0, int(getattr(self.config, "daily_loss_near_stop_buffer", 0) or 0))
+        near_stop_floor = int(self.config.daily_loss_limit) + near_stop_buffer
+        if (
+            reason == "daily_loss_near_limit"
+            and near_stop_buffer > 0
+            and realized_net_pnl < 0
+            and realized_net_pnl <= near_stop_floor
+            and not self.positions
+        ):
+            return False
+
+        total_limit = self.config.daily_total_loss_limit
+        if total_limit is not None and self._total_net_pnl_for_daily_breaker(realized_net_pnl) <= int(total_limit):
+            return False
+        return True
+
+
+    def _daily_profit_lock_reached(self, realized_net_pnl: Optional[int] = None) -> bool:
+        target = max(0, int(self.config.daily_profit_target))
+        if target <= 0:
+            return False
+        realized = self._realized_net_pnl_for_daily_breaker() if realized_net_pnl is None else int(realized_net_pnl)
+        protect_threshold = max(0, int(self.config.profit_protect_threshold))
+        lock_buffer = max(0, int(getattr(self.config, "daily_profit_lock_buffer", 0) or 0))
+        if lock_buffer <= 0:
+            return False
+        lock_threshold = max(protect_threshold, target - lock_buffer)
+        return realized >= lock_threshold
+
+    def _has_unconfirmed_daily_breaker_sell_fills(self) -> bool:
+        for entry in self._sell_fill_ledger:
+            if not bool(entry.get("price_estimated")):
+                continue
+            if bool(entry.get("counts_for_daily_breaker", True)):
+                return True
+        return False
+
+
+    def _profit_halt_confirmation_pending(self, realized_net_pnl: Optional[int] = None) -> bool:
+        if not self._has_unconfirmed_daily_breaker_sell_fills():
+            return False
+        realized = self._realized_net_pnl_for_daily_breaker() if realized_net_pnl is None else int(realized_net_pnl)
+        if realized >= int(self.config.daily_profit_target):
+            return True
+        return self._daily_profit_lock_reached(realized)
+
+
+
+
+
+    def _unrealized_net_pnl_for_daily_breaker(self) -> int:
+        total = 0
+        for pos in self.positions.values():
+            if not self._position_counts_for_daily_breaker(pos):
+                continue
+            quantity = max(0, int(pos.quantity or 0))
+            if self._position_pending_exit_reconcile_pending(pos):
+                quantity -= min(
+                    quantity,
+                    max(0, int(getattr(pos, "pending_exit_quantity", 0) or 0)),
+                )
+            if quantity <= 0:
+                continue
+            quote = self._quotes_cache.get(pos.symbol)
+            if quote is None:
+                recent_quotes = list(self._recent_quotes.get(pos.symbol, []))
+                quote = recent_quotes[-1] if recent_quotes else None
+            exit_price = int(getattr(quote, "current_price", 0) or 0) if quote is not None else 0
+            if exit_price <= 0:
+                continue
+            pnl = calculate_trade_pnl_from_prices(
+                entry_price=int(pos.buy_price or 0),
+                exit_price=int(exit_price),
+                quantity=quantity,
+                commission_rate=float(self.config.commission_rate),
+                tax_slippage_rate=float(self.config.tax_slippage_rate),
+            )
+            total += int(pnl.net_pnl)
+        return int(total)
+
+    def _update_daily_breakers(self):
+        was_halted = bool(self._halted)
+        realized_net_pnl = self._realized_net_pnl_for_daily_breaker()
+        breaker_net_pnl = realized_net_pnl
+        halt_reason = ""
+        if not self.positions and self._restored_loss_halt_is_stale():
+            previous_reason = str(getattr(self, "_halt_reason", "") or "")
+            self._halted = False
+            self._halt_reason = ""
+            was_halted = False
+            logger.warning(
+                "확정 체결손익이 손실한도 안으로 복구되어 당일 하드스탑을 해제합니다: "
+                "previous_reason=%s realized_net_pnl=%d",
+                previous_reason,
+                realized_net_pnl,
+            )
+        if (
+            self._halted
+            and str(getattr(self, "_halt_reason", "") or "") in {"daily_profit_target", "daily_profit_lock"}
+            and realized_net_pnl < int(self.config.daily_profit_target)
+            and not self._daily_profit_lock_reached(realized_net_pnl)
+        ):
+            self._halted = False
+            self._halt_reason = ""
+            was_halted = False
+        if realized_net_pnl <= int(self.config.daily_loss_limit):
+            self._halted = True
+            halt_reason = "daily_loss_limit"
+        near_stop_buffer = max(0, int(getattr(self.config, "daily_loss_near_stop_buffer", 0) or 0))
+        near_stop_floor = int(self.config.daily_loss_limit) + near_stop_buffer
+        if (
+            not self._halted
+            and near_stop_buffer > 0
+            and realized_net_pnl < 0
+            and realized_net_pnl <= near_stop_floor
+            and not self.positions
+        ):
+            self._halted = True
+            halt_reason = "daily_loss_near_limit"
+        total_limit = self.config.daily_total_loss_limit
+        if total_limit is not None:
+            total_net_pnl = self._total_net_pnl_for_daily_breaker(realized_net_pnl)
+            if total_net_pnl <= int(total_limit):
+                self._halted = True
+                halt_reason = "daily_total_loss_limit"
+                breaker_net_pnl = int(total_net_pnl)
+        profit_confirmation_pending = self._profit_halt_confirmation_pending(realized_net_pnl)
+        if (
+            not profit_confirmation_pending
+            and realized_net_pnl >= int(self.config.daily_profit_target)
+        ):
+            self._halted = True
+            halt_reason = "daily_profit_target"
+        elif not profit_confirmation_pending and self._daily_profit_lock_reached(realized_net_pnl):
+            self._halted = True
+            halt_reason = "daily_profit_lock"
+        if self._halted and halt_reason:
+            self._halt_reason = halt_reason
+        if self._halted and not was_halted:
+            if halt_reason == "daily_profit_target":
+                logger.warning("일일 총손익 목표 달성! realized_net_pnl=%d", realized_net_pnl)
+            elif halt_reason == "daily_profit_lock":
+                logger.warning("일일 수익 보호 잠금 도달: realized_net_pnl=%d", realized_net_pnl)
+            elif halt_reason == "daily_loss_near_limit":
+                logger.warning(
+                    "일일 손실한도 근접으로 신규거래를 종료합니다: realized_net_pnl=%d limit=%d buffer=%d",
+                    realized_net_pnl,
+                    int(self.config.daily_loss_limit),
+                    near_stop_buffer,
+                )
+            elif halt_reason in {"daily_loss_limit", "daily_total_loss_limit"}:
+                logger.warning(
+                    "일일 총손익 하드스탑 도달! realized_net_pnl=%d breaker_net_pnl=%d reason=%s",
+                    realized_net_pnl,
+                    breaker_net_pnl,
+                    halt_reason,
+                )
+            self._save_daily_state_if_due(force=True)
+
+    @staticmethod
+    def _is_pending_fill_result(result: OrderResult) -> bool:
+        if result is None or not getattr(result, "success", False):
+            return False
+        fill_mode = str(getattr(result, "fill_mode", "") or "")
+        if fill_mode in {"market_pending", "limit_then_market_pending", "partial_fill_pending"}:
+            return True
+        requested_quantity = max(0, int(getattr(result, "requested_quantity", 0) or 0))
+        if requested_quantity > 0 and int(getattr(result, "quantity", 0) or 0) < requested_quantity:
+            return True
+        return int(getattr(result, "quantity", 0) or 0) <= 0 and getattr(result, "side", None) in {
+            OrderSide.BUY,
+            OrderSide.SELL,
+        }
+
+    @staticmethod
+    def _account_positions_by_symbol(account_positions: List[Position]) -> Dict[str, Position]:
+        mapped: Dict[str, Position] = {}
+        for item in account_positions or []:
+            symbol = str(getattr(item, "symbol", "") or "").strip()
+            if symbol:
+                mapped[symbol] = item
+        return mapped
+
+    def _reconciled_order_result(
+        self,
+        source: OrderResult,
+        *,
+        quantity: int,
+        price: int,
+        fill_mode: str = "account_reconciled",
+    ) -> OrderResult:
+        return OrderResult(
+            success=True,
+            order_no=str(getattr(source, "order_no", "") or ""),
+            message="account_reconciled_pending_fill",
+            symbol=str(getattr(source, "symbol", "") or ""),
+            side=getattr(source, "side", None),
+            quantity=max(0, int(quantity or 0)),
+            price=max(0, int(price or 0)),
+            requested_price=int(getattr(source, "requested_price", 0) or 0),
+            reference_price=int(getattr(source, "reference_price", 0) or 0),
+            fill_mode=str(fill_mode or "account_reconciled"),
+            protective_exit_mode=str(getattr(source, "protective_exit_mode", "") or ""),
+            protective_fallback_used=bool(getattr(source, "protective_fallback_used", False)),
+            stop_reference_amount_krw=max(0, int(getattr(source, "stop_reference_amount_krw", 0) or 0)),
+            requested_reason=str(getattr(source, "requested_reason", "") or ""),
+            timestamp=getattr(source, "timestamp", None) or self._now(),
+            requested_quantity=max(0, int(getattr(source, "requested_quantity", 0) or 0)),
+        )
+
+    def reconcile_pending_fills_from_account(
+        self,
+        results: List[OrderResult],
+        account_positions: List[Position],
+    ) -> List[OrderResult]:
+        """체결조회 제한으로 pending 처리된 주문을 계좌 변화로 확정 보정한다."""
+        if not results:
+            return []
+        account_by_symbol = self._account_positions_by_symbol(account_positions)
+        reconciled: List[OrderResult] = []
+        for result in results:
+            if not self._is_pending_fill_result(result):
+                continue
+            symbol = str(getattr(result, "symbol", "") or "").strip()
+            if not symbol:
+                continue
+            account_pos = account_by_symbol.get(symbol)
+            if result.side == OrderSide.BUY:
+                before_pos = self.positions.get(symbol)
+                before_qty = int(getattr(before_pos, "quantity", 0) or 0) if before_pos is not None else 0
+                after_qty = int(getattr(account_pos, "quantity", 0) or 0) if account_pos is not None else before_qty
+                inferred_qty = max(0, after_qty - before_qty)
+                if inferred_qty <= 0:
+                    if (
+                        str(getattr(result, "fill_mode", "") or "") == "order_result_pending"
+                        and symbol in self._pending_entry_meta
+                        and account_pos is None
+                    ):
+                        meta = self._pending_entry_meta.get(symbol)
+                        if isinstance(meta, dict) and self._pending_entry_meta_in_reconcile_grace(meta):
+                            if not meta.get("pending_order_created_at"):
+                                meta["pending_order_created_at"] = self._serialize_datetime(
+                                    getattr(result, "timestamp", None) or self._now()
+                                )
+                            if not meta.get("pending_order_reference_price"):
+                                reference_price = int(
+                                    getattr(result, "reference_price", 0)
+                                    or getattr(result, "requested_price", 0)
+                                    or 0
+                                )
+                                if reference_price > 0:
+                                    meta["pending_order_reference_price"] = reference_price
+                            logger.warning(
+                                "주문 결과 미확정 매수가 아직 계좌 보유에서 확인되지 않아 pending 진입 메타를 유지합니다: %s",
+                                symbol,
+                            )
+                            self._save_daily_state_if_due(force=True)
+                        else:
+                            self._pending_entry_meta.pop(symbol, None)
+                            logger.warning(
+                                "주문 결과 미확정 매수가 유예시간 이후에도 계좌 보유에서 확인되지 않아 pending 진입 메타를 정리합니다: %s",
+                                symbol,
+                            )
+                            self._save_daily_state_if_due(force=True)
+                    continue
+                account_avg_price = int(round(float(getattr(account_pos, "avg_price", 0) or 0))) if account_pos is not None else 0
+                buy_price = self._resolve_fill_price_with_quote_fallback(
+                    symbol,
+                    broker_price=account_avg_price,
+                    requested_price=int(getattr(result, "requested_price", 0) or 0),
+                    reference_price=int(getattr(result, "reference_price", 0) or 0),
+                )
+                synthetic = self._reconciled_order_result(
+                    result,
+                    quantity=inferred_qty,
+                    price=buy_price,
+                    fill_mode="account_reconciled",
+                )
+                logger.debug(
+                    "pending 매수 체결을 계좌 재동기화로 보정합니다: %s %d주 @ %d원",
+                    symbol,
+                    inferred_qty,
+                    buy_price,
+                )
+                self.on_order_filled(synthetic)
+                reconciled.append(synthetic)
+                continue
+
+            if result.side == OrderSide.SELL:
+                before_pos = self.positions.get(symbol)
+                if before_pos is None:
+                    continue
+                before_qty = int(getattr(before_pos, "quantity", 0) or 0)
+                after_qty = int(getattr(account_pos, "quantity", 0) or 0) if account_pos is not None else 0
+                inferred_qty = max(0, min(before_qty, before_qty - after_qty))
+                if inferred_qty <= 0:
+                    continue
+                sell_price = self._resolve_fill_price_with_quote_fallback(
+                    symbol,
+                    broker_price=int(getattr(result, "price", 0) or 0),
+                    requested_price=int(getattr(result, "requested_price", 0) or 0),
+                    reference_price=int(getattr(result, "reference_price", 0) or 0),
+                    position=before_pos,
+                )
+                synthetic = self._reconciled_order_result(
+                    result,
+                    quantity=inferred_qty,
+                    price=sell_price,
+                    fill_mode="account_reconciled_estimated",
+                )
+                logger.debug(
+                    "pending 매도 체결을 계좌 재동기화로 보정합니다: %s %d주 @ %d원 (계좌수량 %d→%d)",
+                    symbol,
+                    inferred_qty,
+                    sell_price,
+                    before_qty,
+                    after_qty,
+                )
+                self.on_order_filled(synthetic)
+                reconciled.append(synthetic)
+        return reconciled
+
+    def reconcile_no_holding_sell_failures_from_account(
+        self,
+        results: List[OrderResult],
+        account_positions: List[Position],
+    ) -> List[OrderResult]:
+        """매도 무보유 응답이 계좌 무보유와 일치하면 로컬 포지션을 추정 청산으로 보정한다."""
+        if not results:
+            return []
+        account_symbols = set(self._account_positions_by_symbol(account_positions).keys())
+        reconciled: List[OrderResult] = []
+        for result in results:
+            if (
+                getattr(result, "success", False)
+                or getattr(result, "side", None) != OrderSide.SELL
+                or str(getattr(result, "error_category", "") or "") != "no_holding"
+            ):
+                continue
+            symbol = str(getattr(result, "symbol", "") or "").strip()
+            if not symbol or symbol in account_symbols:
+                continue
+            pos = self.positions.get(symbol)
+            if pos is None:
+                continue
+            if self._position_pending_entry_reconcile_pending(pos):
+                logger.warning(
+                    "pending 매수 확정 전 무보유 매도 응답이라 추정청산을 보류합니다: %s %d주 @ %d원 "
+                    "(계좌 확정 전 신규 리스크 계산에 포함)",
+                    symbol,
+                    int(getattr(pos, "quantity", 0) or 0),
+                    int(getattr(pos, "buy_price", 0) or 0),
+                )
+                continue
+            if getattr(pos, "pending_entry_started_at", None) is not None:
+                self.positions.pop(symbol, None)
+                logger.warning(
+                    "유예시간이 지난 pending 매수가 계좌에도 없고 매도 무보유로 확인되어 "
+                    "임시 포지션을 손익 없이 제거합니다: %s %d주 @ %d원",
+                    symbol,
+                    int(getattr(pos, "quantity", 0) or 0),
+                    int(getattr(pos, "buy_price", 0) or 0),
+                )
+                self._save_daily_state_if_due(force=True)
+                continue
+            sell_qty = max(0, int(getattr(pos, "quantity", 0) or 0))
+            sell_price = self._resolve_fill_price_with_quote_fallback(
+                symbol,
+                broker_price=0,
+                requested_price=int(getattr(result, "requested_price", 0) or 0),
+                reference_price=int(getattr(result, "reference_price", 0) or 0),
+                position=pos,
+            )
+            if sell_qty <= 0 or sell_price <= 0:
+                continue
+            synthetic = self._reconciled_order_result(
+                result,
+                quantity=sell_qty,
+                price=sell_price,
+                fill_mode="account_reconciled_estimated",
+            )
+            logger.warning(
+                "매도 무보유 응답과 계좌 무보유가 일치해 로컬 포지션을 추정 청산으로 보정합니다: %s %d주 @ %d원",
+                symbol,
+                sell_qty,
+                sell_price,
+            )
+            self.on_order_filled(synthetic)
+            reconciled.append(synthetic)
+        return reconciled
+
+    def on_order_filled(self, result: OrderResult):
+        return handle_order_filled(self, result)

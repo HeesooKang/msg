@@ -50,6 +50,7 @@ class AlertManager:
     _last_sent: Dict[str, float] = field(default_factory=dict)
     _kakao_access_token: str = ""
     _kakao_access_token_expires_at: float = 0.0
+    _kakao_auth_disabled_reason: str = ""
 
     def send(
         self,
@@ -67,6 +68,13 @@ class AlertManager:
 
         if self.cfg.channel != "kakao":
             logger.warning("지원하지 않는 ALERT_CHANNEL: %s", self.cfg.channel)
+            return False
+
+        if self._kakao_auth_disabled_reason:
+            logger.debug(
+                "카카오 인증이 비활성화되어 알림 전송을 생략합니다: %s",
+                self._kakao_auth_disabled_reason,
+            )
             return False
 
         if not self.cfg.kakao_rest_api_key:
@@ -90,6 +98,8 @@ class AlertManager:
         ok = self._send_kakao(level=level, title=title, message=message)
         if ok:
             self._last_sent[event_key] = now
+        else:
+            logger.warning("알림 전송 실패: event=%s title=%s", event_key, title)
         return ok
 
     def _get_kakao_access_token(self) -> str:
@@ -110,7 +120,22 @@ class AlertManager:
         try:
             res = requests.post(KAKAO_TOKEN_URL, data=payload, timeout=5)
             if not 200 <= res.status_code < 300:
-                logger.warning("카카오 토큰 갱신 실패 HTTP %d: %s", res.status_code, res.text)
+                body_text = str(res.text or "")
+                if (
+                    res.status_code == 400
+                    and (
+                        "invalid_grant" in body_text
+                        or "expired_or_invalid_refresh_token" in body_text
+                        or "KOE322" in body_text
+                    )
+                ):
+                    self._kakao_auth_disabled_reason = "invalid_refresh_token"
+                    logger.error(
+                        "카카오 refresh_token이 만료/무효입니다. 새 KAKAO_REFRESH_TOKEN으로 갱신 후 재시작해야 알림이 재개됩니다: %s",
+                        body_text,
+                    )
+                    return ""
+                logger.warning("카카오 토큰 갱신 실패 HTTP %d: %s", res.status_code, body_text)
                 return ""
 
             body = res.json()

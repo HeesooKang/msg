@@ -56,8 +56,11 @@ _ENTRY_REASON_RE = re.compile(r"entry_reason=([a-zA-Z0-9_]+)")
 _REJECT_REASON_RE = re.compile(r"reject_reason=([a-zA-Z0-9_]+)")
 _REGIME_LABEL_RE = re.compile(r"regime_label=([a-zA-Z0-9_]+)")
 _LONG_SIGNAL_SYMBOL_RE = re.compile(r"매수 신호:\s*.+?\(([0-9A-Z]+)\)")
+_LONG_SIGNAL_SYMBOL_PLAIN_RE = re.compile(r"매수 신호:\s*([0-9A-Z]{5,6})\s+\d+주")
 _INV_SIGNAL_SYMBOL_RE = re.compile(r"\[INV\]\s*매수 신호:\s*([0-9A-Z]+)")
-_SELL_SYMBOL_RE = re.compile(r"(?:\[INV\]\s*)?매도 체결:\s*([0-9A-Z]+)\s")
+_FULL_SELL_SYMBOL_RE = re.compile(r"(?:^|\s)(?:\[INV\]\s*)?매도 체결:\s*([0-9A-Z]+)\s")
+_PARTIAL_SELL_SYMBOL_RE = re.compile(r"(?:^|\s)(?:\[INV\]\s*)?부분매도 체결:\s*([0-9A-Z]+)\s")
+_CORRECTED_SELL_SYMBOL_RE = re.compile(r"(?:^|\s)(?:\[INV\]\s*)?매도 체결 정정:\s*([0-9A-Z]+)\s")
 _SELL_NET_PNL_RE = re.compile(r"순손익:\s*([-\d,]+)원")
 _SELL_PNL_RE = re.compile(r"손익:\s*([-\d,]+)원")
 _RISK_STAGE_RE = re.compile(r"리스크 단계 전환:\s*([a-zA-Z0-9_]+)")
@@ -202,7 +205,7 @@ def build_daily_scorecard(
         },
     }
     scorecard["log_analysis"] = analyze_trading_log(report_date=report_date, log_root=log_root)
-    return scorecard
+    return _reconcile_scorecard_with_log(scorecard)
 
 
 def _scorecard_paths(report_root: Path, report_date: str) -> Dict[str, Path]:
@@ -249,11 +252,24 @@ def _extract_signal_symbol(message: str) -> Optional[str]:
     long_match = _LONG_SIGNAL_SYMBOL_RE.search(message)
     if long_match:
         return long_match.group(1)
+    plain_match = _LONG_SIGNAL_SYMBOL_PLAIN_RE.search(message)
+    if plain_match:
+        return plain_match.group(1)
     return None
 
 
-def _extract_sell_symbol(message: str) -> Optional[str]:
-    match = _SELL_SYMBOL_RE.search(message)
+def _extract_full_sell_symbol(message: str) -> Optional[str]:
+    match = _FULL_SELL_SYMBOL_RE.search(message)
+    return match.group(1) if match else None
+
+
+def _extract_partial_sell_symbol(message: str) -> Optional[str]:
+    match = _PARTIAL_SELL_SYMBOL_RE.search(message)
+    return match.group(1) if match else None
+
+
+def _extract_corrected_sell_symbol(message: str) -> Optional[str]:
+    match = _CORRECTED_SELL_SYMBOL_RE.search(message)
     return match.group(1) if match else None
 
 
@@ -273,6 +289,18 @@ def _extract_context_token(message: str, key: str, default: str = "") -> str:
         if chunk.startswith(marker):
             return chunk[len(marker):].rstrip(",)")
     return default
+
+
+def _extract_context_token_any(message: str, keys: List[str], default: str = "") -> str:
+    for key in keys:
+        value = _extract_context_token(message, key, "")
+        if value:
+            return value
+    return default
+
+
+def _normalize_queue_source(raw: str) -> str:
+    return str(raw or "").strip()
 
 
 def analyze_trading_log(
@@ -333,12 +361,273 @@ def analyze_trading_log(
     math_shadow_gate_counts: Dict[str, int] = defaultdict(int)
     math_shadow_reason_counts: Dict[str, int] = defaultdict(int)
     regime_shadow_disagreements: Dict[str, int] = defaultdict(int)
-    math_queue_counts: Dict[str, int] = defaultdict(int)
-    math_eval_reached_counts: Dict[str, int] = defaultdict(int)
-    math_admission_counts: Dict[str, int] = defaultdict(int)
+    funnel_queue_counts: Dict[str, int] = defaultdict(int)
+    precheck_reached_counts: Dict[str, int] = defaultdict(int)
+    precheck_blocked_counts: Dict[str, int] = defaultdict(int)
+    policy_blocked_counts: Dict[str, int] = defaultdict(int)
+    router_reached_counts: Dict[str, int] = defaultdict(int)
+    router_blocked_counts: Dict[str, int] = defaultdict(int)
+    hard_guard_blocked_counts: Dict[str, int] = defaultdict(int)
+    funnel_admission_counts: Dict[str, int] = defaultdict(int)
+    conviction_tier_pnl: Dict[str, Dict[str, float]] = defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
+    bull_risk_mode_pnl: Dict[str, Dict[str, float]] = defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
+    post_loss_admission_class_pnl: Dict[str, Dict[str, float]] = defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
+    candidate_class_pnl: Dict[str, Dict[str, float]] = defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
+    live_route_pnl: Dict[str, Dict[str, float]] = defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
+    queue_source_pnl: Dict[str, Dict[str, float]] = defaultdict(lambda: {"closed_trades": 0, "net_pnl": 0.0})
+    stop_triggered_count = 0
+    stop_limit_fallback_count = 0
+    stop_overshoots: List[int] = []
     active_entries: Dict[str, Dict[str, str]] = {}
+    partial_sell_net_by_symbol: Dict[str, int] = {}
+    trade_record_index_by_order_no: Dict[str, int] = {}
+    closed_trade_flag_by_order_no: Dict[str, bool] = {}
     daily_hard_stop_triggered = False
     daily_profit_target_triggered = False
+    candidate_reject_reason_outcomes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    def _record_sell_trade(
+        *,
+        symbol: str,
+        entry_meta: Dict[str, str],
+        message: str,
+        line_ts: Optional[datetime],
+        count_as_closed_trade: bool,
+        net_pnl_override: Optional[int] = None,
+        trade_outcome_net_pnl: Optional[int] = None,
+    ) -> None:
+        nonlocal stop_triggered_count, stop_limit_fallback_count
+        strategy_name = entry_meta.get("strategy_name") or _extract_context_token(
+            message,
+            "strategy_name",
+            "unknown_strategy",
+        )
+        setup_name = entry_meta.get("setup_name") or _extract_context_token(message, "setup_name", "unknown")
+        regime_label = entry_meta.get("regime_label") or _extract_context_token(message, "regime_label", "unknown")
+        entry_grade_math = entry_meta.get("entry_grade_math") or _extract_context_token(
+            message,
+            "entry_grade_math",
+            "unknown",
+        )
+        conviction_tier = entry_meta.get("conviction_tier") or _extract_context_token(message, "conviction_tier", "none")
+        bull_risk_mode = entry_meta.get("bull_risk_mode") or _extract_context_token(message, "bull_risk_mode", "normal")
+        post_loss_admission_class = entry_meta.get("post_loss_admission_class") or _extract_context_token(
+            message,
+            "post_loss_admission_class",
+            "general",
+        )
+        candidate_class = entry_meta.get("candidate_class") or entry_meta.get("live_candidate_class") or _extract_context_token(
+            message,
+            "candidate_class",
+            _extract_context_token(message, "live_candidate_class", "unclassified"),
+        )
+        execution_mode = entry_meta.get("execution_mode") or entry_meta.get("route_mode") or _extract_context_token(
+            message,
+            "execution_mode",
+            _extract_context_token(message, "route_mode", "live"),
+        )
+        live_route = entry_meta.get("live_route") or _extract_context_token(
+            message,
+            "live_route",
+            strategy_name,
+        )
+        queue_source = _normalize_queue_source(
+            entry_meta.get("queue_source") or _extract_context_token(message, "queue_source", "")
+        ) or "unknown"
+        protective_exit_mode = _extract_context_token(message, "protective_exit_mode", "")
+        fill_mode = _extract_context_token(message, "fill_mode", "")
+        order_no = _extract_context_token(message, "order_no", "")
+        stop_overshoot_krw = _safe_int(_extract_context_token(message, "stop_overshoot_krw", "0"))
+        net_pnl = _extract_sell_net_pnl(message) if net_pnl_override is None else int(net_pnl_override)
+        outcome_net_pnl = net_pnl if trade_outcome_net_pnl is None else int(trade_outcome_net_pnl)
+        metrics = setup_pnl[setup_name]
+        metrics["net_pnl"] += net_pnl
+        strategy_metrics = strategy_pnl[strategy_name]
+        strategy_metrics["net_pnl"] += net_pnl
+        regime_pnl[regime_label] += net_pnl
+        symbol_pnl[symbol] += net_pnl
+        if count_as_closed_trade:
+            metrics["closed_trades"] += 1
+            strategy_metrics["closed_trades"] += 1
+            if outcome_net_pnl > 0:
+                metrics["wins"] += 1
+                strategy_metrics["wins"] += 1
+            elif outcome_net_pnl < 0:
+                metrics["losses"] += 1
+                strategy_metrics["losses"] += 1
+        if line_ts is not None:
+            hour_key = f"{line_ts.hour:02d}"
+            bucket = strategy_hourly[strategy_name][hour_key]
+            bucket["net_pnl"] += net_pnl
+            if count_as_closed_trade:
+                bucket["closed_trades"] += 1
+        math_grade_metrics = math_grade_pnl[entry_grade_math]
+        math_grade_metrics["net_pnl"] += net_pnl
+        entry_ev = _safe_float(
+            entry_meta.get("entry_ev")
+            or _extract_context_token(message, "entry_ev", "0")
+        )
+        ev_bucket = "positive" if entry_ev > 0 else "negative" if entry_ev < 0 else "zero"
+        math_ev_metrics = math_ev_buckets[ev_bucket]
+        math_ev_metrics["net_pnl"] += net_pnl
+        conviction_metrics = conviction_tier_pnl[conviction_tier or "none"]
+        conviction_metrics["net_pnl"] += net_pnl
+        risk_mode_metrics = bull_risk_mode_pnl[bull_risk_mode or "normal"]
+        risk_mode_metrics["net_pnl"] += net_pnl
+        post_loss_metrics = post_loss_admission_class_pnl[post_loss_admission_class or "general"]
+        post_loss_metrics["net_pnl"] += net_pnl
+        candidate_metrics = candidate_class_pnl[candidate_class or "unclassified"]
+        candidate_metrics["net_pnl"] += net_pnl
+        live_route_metrics = live_route_pnl[live_route or "unknown"]
+        live_route_metrics["net_pnl"] += net_pnl
+        queue_metrics = queue_source_pnl[queue_source or "unknown"]
+        queue_metrics["net_pnl"] += net_pnl
+        if count_as_closed_trade:
+            math_grade_metrics["closed_trades"] += 1
+            math_ev_metrics["closed_trades"] += 1
+            conviction_metrics["closed_trades"] += 1
+            risk_mode_metrics["closed_trades"] += 1
+            post_loss_metrics["closed_trades"] += 1
+            candidate_metrics["closed_trades"] += 1
+            live_route_metrics["closed_trades"] += 1
+            queue_metrics["closed_trades"] += 1
+        if protective_exit_mode:
+            stop_triggered_count += 1
+            if fill_mode == "limit_then_market":
+                stop_limit_fallback_count += 1
+            stop_overshoots.append(max(0, stop_overshoot_krw))
+        trade_records.append(
+            {
+                "symbol": symbol,
+                "strategy_name": strategy_name,
+                "setup_name": setup_name,
+                "regime_label": regime_label,
+                "hour_bucket": f"{line_ts.hour:02d}" if line_ts is not None else "unknown",
+                "entry_grade_math": entry_grade_math,
+                "conviction_tier": conviction_tier or "none",
+                "bull_risk_mode": bull_risk_mode or "normal",
+                "post_loss_admission_class": post_loss_admission_class or "general",
+                "candidate_class": candidate_class or "unclassified",
+                "execution_mode": execution_mode or "unknown",
+                "live_route": live_route or "unknown",
+                "order_no": order_no or "",
+                "volume_gate_threshold_used": _safe_float(entry_meta.get("volume_gate_threshold_used")),
+                "conviction_score": _safe_float(
+                    entry_meta.get("conviction_score", entry_meta.get("opening_conviction_score"))
+                ),
+                "conviction_rank": _safe_int(
+                    entry_meta.get("conviction_rank", entry_meta.get("opening_conviction_rank"))
+                ),
+                "count_as_closed_trade": bool(count_as_closed_trade),
+                "net_pnl": net_pnl,
+                "trade_outcome_net_pnl": outcome_net_pnl,
+                "leader_score": _safe_float(entry_meta.get("leader_score")),
+                "effective_leader_score": _safe_float(entry_meta.get("effective_leader_score")),
+                "leader_pct": _safe_float(entry_meta.get("leader_pct")),
+                "recent_acceleration_pct": _safe_float(entry_meta.get("recent_acceleration_pct")),
+                "entry_ev": entry_ev,
+                "entry_ev_conf": entry_meta.get("entry_ev_conf") or "none",
+                "price_prediction_return_pct": _safe_float(
+                    entry_meta.get("price_prediction_return_pct")
+                ),
+                "price_prediction_lower_pct": _safe_float(
+                    entry_meta.get("price_prediction_lower_pct")
+                ),
+                "price_prediction_confidence": _safe_float(
+                    entry_meta.get("price_prediction_confidence")
+                ),
+                "entry_prediction_win_probability": _safe_float(
+                    entry_meta.get("entry_prediction_win_probability")
+                ),
+                "queue_source": queue_source,
+                "math_dominant_profile": entry_meta.get("math_dominant_profile") or "",
+                "size_multiplier": _safe_float(entry_meta.get("size_multiplier"), 1.0),
+                "protective_exit_mode": protective_exit_mode,
+                "fill_mode": fill_mode,
+                "stop_overshoot_krw": stop_overshoot_krw,
+                "bull_prob": _safe_float(entry_meta.get("bull_prob")),
+                "neutral_prob": _safe_float(entry_meta.get("neutral_prob")),
+                "soft_bear_prob": _safe_float(entry_meta.get("soft_bear_prob")),
+                "bear_prob": _safe_float(entry_meta.get("bear_prob")),
+                "shock_score": _safe_float(entry_meta.get("shock_score")),
+                "shock_confidence": _safe_float(entry_meta.get("shock_confidence")),
+                "adaptive_take_profit_pct": _safe_float(entry_meta.get("adaptive_take_profit_pct")),
+                "adaptive_stop_loss_pct": _safe_float(entry_meta.get("adaptive_stop_loss_pct")),
+                "adaptive_trailing_activation_pct": _safe_float(entry_meta.get("adaptive_trailing_activation_pct")),
+                "adaptive_trailing_stop_pct": _safe_float(entry_meta.get("adaptive_trailing_stop_pct")),
+                "adaptive_max_hold_minutes": _safe_int(entry_meta.get("adaptive_max_hold_minutes")),
+            }
+        )
+        if order_no:
+            trade_record_index_by_order_no[order_no] = len(trade_records) - 1
+            closed_trade_flag_by_order_no[order_no] = bool(count_as_closed_trade)
+
+    def _apply_sell_trade_correction(message: str, line_ts: Optional[datetime]) -> None:
+        symbol = _extract_corrected_sell_symbol(message)
+        order_no = _extract_context_token(message, "order_no", "")
+        if not symbol or not order_no:
+            return
+        record_index = trade_record_index_by_order_no.get(order_no)
+        if record_index is None or record_index >= len(trade_records):
+            return
+        record = trade_records[record_index]
+        previous_net = _safe_int(record.get("net_pnl", 0))
+        previous_outcome_net = _safe_int(record.get("trade_outcome_net_pnl", previous_net))
+        corrected_net = _safe_int(_extract_context_token(message, "corrected_net_pnl", str(previous_net)))
+        delta_net = corrected_net - previous_net
+        if delta_net == 0:
+            record["order_no"] = order_no
+            record["fill_mode"] = "account_reconciled_confirmed"
+            return
+
+        strategy_name = str(record.get("strategy_name", "unknown_strategy") or "unknown_strategy")
+        setup_name = str(record.get("setup_name", "unknown") or "unknown")
+        regime_label = str(record.get("regime_label", "unknown") or "unknown")
+        entry_grade_math = str(record.get("entry_grade_math", "unknown") or "unknown")
+        conviction_tier = str(record.get("conviction_tier", "none") or "none")
+        bull_risk_mode = str(record.get("bull_risk_mode", "normal") or "normal")
+        post_loss_admission_class = str(record.get("post_loss_admission_class", "general") or "general")
+        candidate_class = str(record.get("candidate_class", "unclassified") or "unclassified")
+        live_route = str(record.get("live_route", "unknown") or "unknown")
+        queue_source = _normalize_queue_source(record.get("queue_source", "unknown")) or "unknown"
+        hour_key = str(record.get("hour_bucket", "unknown") or "unknown")
+        entry_ev = _safe_float(record.get("entry_ev"))
+        ev_bucket = "positive" if entry_ev > 0 else "negative" if entry_ev < 0 else "zero"
+        was_closed_trade = bool(closed_trade_flag_by_order_no.get(order_no, False))
+
+        setup_pnl[setup_name]["net_pnl"] += delta_net
+        strategy_pnl[strategy_name]["net_pnl"] += delta_net
+        regime_pnl[regime_label] += delta_net
+        symbol_pnl[symbol] += delta_net
+        if line_ts is not None and hour_key != "unknown":
+            strategy_hourly[strategy_name][hour_key]["net_pnl"] += delta_net
+        math_grade_pnl[entry_grade_math]["net_pnl"] += delta_net
+        math_ev_buckets[ev_bucket]["net_pnl"] += delta_net
+        conviction_tier_pnl[conviction_tier]["net_pnl"] += delta_net
+        bull_risk_mode_pnl[bull_risk_mode]["net_pnl"] += delta_net
+        post_loss_admission_class_pnl[post_loss_admission_class]["net_pnl"] += delta_net
+        candidate_class_pnl[candidate_class]["net_pnl"] += delta_net
+        live_route_pnl[live_route]["net_pnl"] += delta_net
+        queue_source_pnl[queue_source]["net_pnl"] += delta_net
+
+        if was_closed_trade:
+            corrected_outcome_net = previous_outcome_net + delta_net
+            if previous_outcome_net > 0:
+                setup_pnl[setup_name]["wins"] -= 1
+                strategy_pnl[strategy_name]["wins"] -= 1
+            elif previous_outcome_net < 0:
+                setup_pnl[setup_name]["losses"] -= 1
+                strategy_pnl[strategy_name]["losses"] -= 1
+            if corrected_outcome_net > 0:
+                setup_pnl[setup_name]["wins"] += 1
+                strategy_pnl[strategy_name]["wins"] += 1
+            elif corrected_outcome_net < 0:
+                setup_pnl[setup_name]["losses"] += 1
+                strategy_pnl[strategy_name]["losses"] += 1
+            record["trade_outcome_net_pnl"] = corrected_outcome_net
+
+        record["net_pnl"] = corrected_net
+        record["fill_mode"] = "account_reconciled_confirmed"
 
     for raw_line in lines:
         message = _extract_log_message(raw_line)
@@ -356,142 +645,202 @@ def analyze_trading_log(
             daily_profit_target_triggered = True
 
         reject_match = _REJECT_REASON_RE.search(message)
-        if reject_match:
+        if reject_match and not message.startswith("진입 거부 요약:"):
             reject_by_reason[reject_match.group(1)] += 1
-        math_shadow_gate = _extract_context_token(message, "math_shadow_gate", "")
-        math_shadow_reason = _extract_context_token(message, "math_shadow_reason", "")
+        math_shadow_gate = _extract_context_token_any(message, ["shadow_gate", "math_shadow_gate"], "")
+        math_shadow_reason = _extract_context_token_any(message, ["shadow_reason", "math_shadow_reason"], "")
         if math_shadow_gate:
             math_shadow_gate_counts[math_shadow_gate] += 1
         if math_shadow_reason:
             math_shadow_reason_counts[math_shadow_reason] += 1
-        if _extract_context_token(message, "math_regime_shadow_disagreement", "") == "1":
+        if _extract_context_token_any(message, ["regime_shadow_disagreement", "math_regime_shadow_disagreement"], "") == "1":
             discrete_regime = _extract_context_token(message, "discrete_regime", "unknown")
             shadow_regime = _extract_context_token(message, "shadow_regime", "unknown")
             regime_shadow_disagreements[f"{discrete_regime}->{shadow_regime}"] += 1
-        if message.startswith("math leader queue:"):
-            match = _QUEUE_COUNT_RE.search(message)
-            if match:
-                math_queue_counts["math_queue"] += _safe_int(match.group(1))
-        elif message.startswith("math backfill:"):
-            match = _QUEUE_COUNT_RE.search(message)
-            if match:
-                math_queue_counts["math_backfill"] += _safe_int(match.group(1))
-        elif message.startswith("legacy backfill:"):
-            match = _QUEUE_COUNT_RE.search(message)
-            if match:
-                math_queue_counts["legacy_backfill"] += _safe_int(match.group(1))
-        if message.startswith("수학 admission 통과:"):
-            queue_source = _extract_context_token(message, "queue", "unknown")
-            math_admission_counts["passed"] += 1
-            math_eval_reached_counts[queue_source or "unknown"] += 1
-        elif "진입 거부[" in message:
-            queue_source = _extract_context_token(message, "math_queue_source", "")
-            if queue_source:
-                math_eval_reached_counts[queue_source] += 1
-            reject_reason = reject_match.group(1) if reject_match else ""
-            if reject_reason.startswith("math_"):
-                math_admission_counts["blocked"] += 1
+        if message.startswith("후보 평가 요약:"):
+            stage = _extract_context_token(message, "stage", "")
+            tokens = dict(re.findall(r"([A-Za-z0-9_]+)=([^ ]+)", message))
+            queue_payload = {
+                key: _safe_int(value)
+                for key, value in tokens.items()
+                if key not in {"stage", "window_start", "window_end", "total"}
+                and not key.startswith("reason_")
+            }
+            if stage == "queue_entered":
+                for key, value in queue_payload.items():
+                    funnel_queue_counts[_normalize_queue_source(key) or key] += value
+            elif stage == "precheck_reached":
+                for key, value in queue_payload.items():
+                    precheck_reached_counts[_normalize_queue_source(key) or key] += value
+            elif stage == "precheck_blocked":
+                for key, value in queue_payload.items():
+                    precheck_blocked_counts[_normalize_queue_source(key) or key] += value
+            elif stage == "policy_blocked":
+                for key, value in queue_payload.items():
+                    policy_blocked_counts[_normalize_queue_source(key) or key] += value
+            elif stage == "router_reached":
+                for key, value in queue_payload.items():
+                    router_reached_counts[_normalize_queue_source(key) or key] += value
+            elif stage == "router_blocked":
+                for key, value in queue_payload.items():
+                    router_blocked_counts[_normalize_queue_source(key) or key] += value
+            elif stage == "admission_passed":
+                funnel_admission_counts["passed"] += _safe_int(tokens.get("total"))
+            elif stage == "admission_blocked":
+                funnel_admission_counts["blocked"] += _safe_int(tokens.get("total"))
+            elif stage == "hard_guard_blocked":
+                for key, value in queue_payload.items():
+                    hard_guard_blocked_counts[_normalize_queue_source(key) or key] += value
+        elif message.startswith("진입 거부 요약:"):
+            reject_reason = _extract_context_token(message, "reject_reason", "")
+            total = _safe_int(_extract_context_token(message, "total", "0"))
+            if reject_reason and total > 0:
+                reject_by_reason[reject_reason] += total
 
         setup_match = _SETUP_NAME_RE.search(message)
         entry_reason_match = _ENTRY_REASON_RE.search(message)
         regime_match = _REGIME_LABEL_RE.search(message)
-        if "매수 신호:" in message and setup_match:
-            setup_name = setup_match.group(1)
-            strategy_name = _extract_context_token(message, "strategy_name", "unknown_strategy")
+        is_ev_signal = message.startswith("EV 매수 신호:")
+        if "매수 신호:" in message and (setup_match or is_ev_signal):
+            setup_name = setup_match.group(1) if setup_match else "expected_value"
+            strategy_name = _extract_context_token(
+                message,
+                "strategy_name",
+                _extract_context_token(message, "route", "unknown_strategy"),
+            )
             entry_by_setup[setup_name] += 1
             entry_by_strategy[strategy_name] += 1
             if entry_reason_match:
                 entry_by_reason[entry_reason_match.group(1)] += 1
+            elif is_ev_signal:
+                entry_by_reason["expected_value"] += 1
             regime_label = regime_match.group(1) if regime_match else "unknown"
             entry_by_regime[regime_label] += 1
-            entry_grade_math = _extract_context_token(message, "entry_grade_math", "unknown")
+            entry_grade_math = _extract_context_token_any(message, ["entry_grade_signal", "entry_grade_math"], "unknown")
             math_grade_entries[entry_grade_math] += 1
             symbol = _extract_signal_symbol(message)
             if symbol:
+                partial_sell_net_by_symbol.pop(symbol, None)
                 active_entries[symbol] = {
                     "strategy_name": strategy_name,
                     "setup_name": setup_name,
                     "regime_label": regime_label,
                     "entry_grade_math": entry_grade_math,
                     "leader_score": _extract_context_token(message, "leader_score", "0"),
+                    "effective_leader_score": _extract_context_token(message, "effective_leader_score", "0"),
                     "leader_pct": _extract_context_token(message, "leader_pct", "0"),
-                    "entry_ev": _extract_context_token(message, "entry_ev", "0"),
-                    "entry_ev_conf": _extract_context_token(message, "entry_ev_conf", "none"),
-                    "math_queue_source": _extract_context_token(message, "math_queue_source", ""),
-                    "math_dominant_profile": _extract_context_token(message, "math_dominant_profile", ""),
+                    "recent_acceleration_pct": _extract_context_token(message, "recent_accel", "0"),
+                    "entry_ev": _extract_context_token(
+                        message,
+                        "entry_ev",
+                        _extract_context_token(message, "exp", "0"),
+                    ),
+                    "entry_ev_conf": _extract_context_token(
+                        message,
+                        "entry_ev_conf",
+                        "live_plan" if is_ev_signal else "none",
+                    ),
+                    "conviction_tier": _extract_context_token(message, "conviction_tier", "none"),
+                    "bull_risk_mode": _extract_context_token(message, "bull_risk_mode", "normal"),
+                    "post_loss_admission_class": _extract_context_token(message, "post_loss_admission_class", "general"),
+                    "candidate_class": _extract_context_token(
+                        message,
+                        "candidate_class",
+                        _extract_context_token(message, "live_candidate_class", "unclassified"),
+                    ),
+                    "execution_mode": _extract_context_token(
+                        message,
+                        "execution_mode",
+                        _extract_context_token(message, "route_mode", "live"),
+                    ),
+                    "live_route": _extract_context_token(
+                        message,
+                        "live_route",
+                        _extract_context_token(message, "route", strategy_name),
+                    ),
+                    "volume_gate_threshold_used": _extract_context_token(message, "volume_gate_threshold_used", "0"),
+                    "conviction_score": _extract_context_token(
+                        message,
+                        "conviction_score",
+                        _extract_context_token(
+                            message,
+                            "opening_conviction_score",
+                            _extract_context_token(message, "score", "0"),
+                        ),
+                    ),
+                    "conviction_rank": _extract_context_token(
+                        message,
+                        "conviction_rank",
+                        _extract_context_token(
+                            message,
+                            "opening_conviction_rank",
+                            _extract_context_token(message, "rank", "0"),
+                        ),
+                    ),
+                    "queue_source": _normalize_queue_source(
+                        _extract_context_token(
+                            message,
+                            "queue_source",
+                            _extract_context_token(message, "source", ""),
+                        )
+                    ),
+                    "price_prediction_return_pct": _extract_context_token(message, "pred", "0"),
+                    "price_prediction_lower_pct": _extract_context_token(message, "lower", "0"),
+                    "price_prediction_confidence": _extract_context_token(message, "conf", "0"),
+                    "entry_prediction_win_probability": _extract_context_token(message, "win", "0"),
+                    "math_dominant_profile": _extract_context_token_any(message, ["dominant_profile", "math_dominant_profile"], ""),
                     "size_multiplier": _extract_context_token(message, "size_multiplier", "1"),
                     "bull_prob": _extract_context_token(message, "bull_prob", "0"),
                     "neutral_prob": _extract_context_token(message, "neutral_prob", "0"),
                     "soft_bear_prob": _extract_context_token(message, "soft_bear_prob", "0"),
                     "bear_prob": _extract_context_token(message, "bear_prob", "0"),
+                    "shock_score": _extract_context_token(message, "shock_score", "0"),
+                    "shock_confidence": _extract_context_token(message, "shock_conf", "0"),
+                    "adaptive_take_profit_pct": _extract_context_token(message, "adaptive_tp", "0"),
+                    "adaptive_stop_loss_pct": _extract_context_token(message, "adaptive_sl", "0"),
+                    "adaptive_trailing_activation_pct": _extract_context_token(message, "adaptive_trail_act", "0"),
+                    "adaptive_trailing_stop_pct": _extract_context_token(message, "adaptive_trail", "0"),
+                    "adaptive_max_hold_minutes": _extract_context_token(message, "adaptive_hold", "0"),
                 }
 
-        if "매도 체결:" in message:
-            symbol = _extract_sell_symbol(message)
+        if "부분매도 체결:" in message:
+            symbol = _extract_partial_sell_symbol(message)
             if not symbol:
                 continue
-            entry_meta = active_entries.pop(symbol, {})
-            strategy_name = entry_meta.get("strategy_name") or _extract_context_token(
-                message,
-                "strategy_name",
-                "unknown_strategy",
+            partial_net_pnl = _extract_sell_net_pnl(message)
+            partial_sell_net_by_symbol[symbol] = partial_sell_net_by_symbol.get(symbol, 0) + partial_net_pnl
+            _record_sell_trade(
+                symbol=symbol,
+                entry_meta=active_entries.get(symbol, {}),
+                message=message,
+                line_ts=line_ts,
+                count_as_closed_trade=False,
             )
-            setup_name = entry_meta.get("setup_name") or _extract_context_token(message, "setup_name", "unknown")
-            regime_label = entry_meta.get("regime_label") or _extract_context_token(message, "regime_label", "unknown")
-            entry_grade_math = entry_meta.get("entry_grade_math") or _extract_context_token(
-                message,
-                "entry_grade_math",
-                "unknown",
-            )
-            net_pnl = _extract_sell_net_pnl(message)
-            metrics = setup_pnl[setup_name]
-            metrics["closed_trades"] += 1
-            metrics["net_pnl"] += net_pnl
-            strategy_metrics = strategy_pnl[strategy_name]
-            strategy_metrics["closed_trades"] += 1
-            strategy_metrics["net_pnl"] += net_pnl
-            regime_pnl[regime_label] += net_pnl
-            symbol_pnl[symbol] += net_pnl
-            if net_pnl > 0:
-                metrics["wins"] += 1
-                strategy_metrics["wins"] += 1
-            elif net_pnl < 0:
-                metrics["losses"] += 1
-                strategy_metrics["losses"] += 1
-            if line_ts is not None:
-                hour_key = f"{line_ts.hour:02d}"
-                bucket = strategy_hourly[strategy_name][hour_key]
-                bucket["closed_trades"] += 1
-                bucket["net_pnl"] += net_pnl
-            math_grade_metrics = math_grade_pnl[entry_grade_math]
-            math_grade_metrics["closed_trades"] += 1
-            math_grade_metrics["net_pnl"] += net_pnl
-            entry_ev = _safe_float(entry_meta.get("entry_ev"))
-            ev_bucket = "positive" if entry_ev > 0 else "negative" if entry_ev < 0 else "zero"
-            math_ev_metrics = math_ev_buckets[ev_bucket]
-            math_ev_metrics["closed_trades"] += 1
-            math_ev_metrics["net_pnl"] += net_pnl
-            trade_records.append(
-                {
-                    "symbol": symbol,
-                    "strategy_name": strategy_name,
-                    "setup_name": setup_name,
-                    "regime_label": regime_label,
-                    "hour_bucket": f"{line_ts.hour:02d}" if line_ts is not None else "unknown",
-                    "entry_grade_math": entry_grade_math,
-                    "net_pnl": net_pnl,
-                    "leader_score": _safe_float(entry_meta.get("leader_score")),
-                    "leader_pct": _safe_float(entry_meta.get("leader_pct")),
-                    "entry_ev": entry_ev,
-                    "entry_ev_conf": entry_meta.get("entry_ev_conf") or "none",
-                    "math_queue_source": entry_meta.get("math_queue_source") or "",
-                    "math_dominant_profile": entry_meta.get("math_dominant_profile") or "",
-                    "size_multiplier": _safe_float(entry_meta.get("size_multiplier"), 1.0),
-                    "bull_prob": _safe_float(entry_meta.get("bull_prob")),
-                    "neutral_prob": _safe_float(entry_meta.get("neutral_prob")),
-                    "soft_bear_prob": _safe_float(entry_meta.get("soft_bear_prob")),
-                    "bear_prob": _safe_float(entry_meta.get("bear_prob")),
-                }
+        elif "매도 체결 정정:" in message:
+            _apply_sell_trade_correction(message, line_ts)
+        elif "매도 체결:" in message:
+            symbol = _extract_full_sell_symbol(message)
+            if not symbol:
+                continue
+            exit_reason = _extract_context_token(message, "exit_reason", "")
+            is_partial_legacy_log = exit_reason == "partial_take_profit"
+            entry_meta = active_entries.get(symbol, {})
+            if not is_partial_legacy_log:
+                entry_meta = active_entries.pop(symbol, {})
+            cumulative_trade_net_pnl = _extract_sell_net_pnl(message)
+            prior_partial_net_pnl = partial_sell_net_by_symbol.pop(symbol, 0) if not is_partial_legacy_log else 0
+            _record_sell_trade(
+                symbol=symbol,
+                entry_meta=entry_meta,
+                message=message,
+                line_ts=line_ts,
+                count_as_closed_trade=not is_partial_legacy_log,
+                net_pnl_override=(
+                    cumulative_trade_net_pnl - prior_partial_net_pnl
+                    if not is_partial_legacy_log and prior_partial_net_pnl != 0
+                    else None
+                ),
+                trade_outcome_net_pnl=(cumulative_trade_net_pnl if not is_partial_legacy_log else None),
             )
 
         if "그림자 후보 종료:" in message:
@@ -503,6 +852,7 @@ def analyze_trading_log(
             shadow_metrics["total"] += 1
             shadow_metrics["outcomes"][outcome] += 1
             shadow_metrics["by_reason"][shadow_reason] += 1
+            candidate_reject_reason_outcomes[shadow_reason][outcome] += 1
 
     sorted_symbols = sorted(symbol_pnl.items(), key=lambda item: (item[1], item[0]), reverse=True)
     top_winners = [
@@ -513,9 +863,41 @@ def analyze_trading_log(
         {"symbol": symbol, "net_pnl": net_pnl}
         for symbol, net_pnl in sorted(symbol_pnl.items(), key=lambda item: (item[1], item[0]))[:5]
     ]
+    resolved_queue_counts = dict(sorted(funnel_queue_counts.items()))
+    resolved_queue_eval_reached_counts = {
+        key: min(_safe_int(router_reached_counts.get(key)), _safe_int(value))
+        for key, value in sorted(resolved_queue_counts.items())
+    }
+    resolved_admission_counts = dict(sorted(funnel_admission_counts.items()))
+    realized_net_pnl = sum(
+        _safe_int(metrics.get("net_pnl"))
+        for metrics in strategy_pnl.values()
+    )
+    closed_trades = sum(
+        _safe_int(metrics.get("closed_trades"))
+        for metrics in strategy_pnl.values()
+    )
+    wins = sum(_safe_int(metrics.get("wins")) for metrics in strategy_pnl.values())
+    losses = sum(_safe_int(metrics.get("losses")) for metrics in strategy_pnl.values())
+    realized_fills = [_safe_int(record.get("net_pnl")) for record in trade_records]
+    winning_net_pnl_sum = sum(value for value in realized_fills if value > 0)
+    losing_net_pnl_sum = sum(value for value in realized_fills if value < 0)
 
     return {
         "log_path": str(selected_path) if selected_path else None,
+        "realized": {
+            "source": "sell_fill_log",
+            "has_activity": bool(trade_records or closed_trades or realized_net_pnl),
+            "realized_net_pnl": int(realized_net_pnl),
+            "closed_trades": int(closed_trades),
+            "wins": int(wins),
+            "losses": int(losses),
+            "breakeven": max(0, int(closed_trades - wins - losses)),
+            "winning_net_pnl_sum": int(winning_net_pnl_sum),
+            "losing_net_pnl_sum": int(losing_net_pnl_sum),
+            "largest_win_net": max([0, *realized_fills]),
+            "largest_loss_net": min([0, *realized_fills]),
+        },
         "entries": {
             "total": int(sum(entry_by_setup.values())),
             "by_setup": dict(sorted(entry_by_setup.items())),
@@ -585,10 +967,86 @@ def analyze_trading_log(
             },
             "shadow_gate_counts": dict(sorted(math_shadow_gate_counts.items())),
             "shadow_reason_counts": dict(sorted(math_shadow_reason_counts.items())),
+            "candidate_reject_reason_outcomes": {
+                reason: dict(sorted(outcomes.items()))
+                for reason, outcomes in sorted(candidate_reject_reason_outcomes.items())
+            },
             "regime_shadow_disagreements": dict(sorted(regime_shadow_disagreements.items())),
-            "queue_counts": dict(sorted(math_queue_counts.items())),
-            "queue_eval_reached_counts": dict(sorted(math_eval_reached_counts.items())),
-            "admission_counts": dict(sorted(math_admission_counts.items())),
+            "conviction_tier_pnl": {
+                tier: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+                    if metrics["closed_trades"]
+                    else 0.0,
+                }
+                for tier, metrics in sorted(conviction_tier_pnl.items())
+            },
+            "bull_risk_mode_pnl": {
+                mode: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+                    if metrics["closed_trades"]
+                    else 0.0,
+                }
+                for mode, metrics in sorted(bull_risk_mode_pnl.items())
+            },
+            "post_loss_admission_class_pnl": {
+                admission_class: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+                    if metrics["closed_trades"]
+                    else 0.0,
+                }
+                for admission_class, metrics in sorted(post_loss_admission_class_pnl.items())
+            },
+            "candidate_class_pnl": {
+                candidate_class: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+                    if metrics["closed_trades"]
+                    else 0.0,
+                }
+                for candidate_class, metrics in sorted(candidate_class_pnl.items())
+            },
+            "live_route_pnl": {
+                route: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+                    if metrics["closed_trades"]
+                    else 0.0,
+                }
+                for route, metrics in sorted(live_route_pnl.items())
+            },
+            "queue_source_pnl": {
+                key: {
+                    "closed_trades": int(metrics["closed_trades"]),
+                    "net_pnl": int(metrics["net_pnl"]),
+                    "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+                    if metrics["closed_trades"]
+                    else 0.0,
+                }
+                for key, metrics in sorted(queue_source_pnl.items())
+            },
+            "stop_stats": {
+                "stop_triggered_count": int(stop_triggered_count),
+                "stop_limit_fallback_count": int(stop_limit_fallback_count),
+                "stop_overshoot_avg_krw": round(sum(stop_overshoots) / len(stop_overshoots), 2) if stop_overshoots else 0.0,
+                "stop_overshoot_max_krw": max(stop_overshoots) if stop_overshoots else 0,
+            },
+            "queue_counts": resolved_queue_counts,
+            "precheck_reached_counts": dict(sorted(precheck_reached_counts.items())),
+            "precheck_blocked_counts": dict(sorted(precheck_blocked_counts.items())),
+            "policy_blocked_counts": dict(sorted(policy_blocked_counts.items())),
+            "router_reached_counts": dict(sorted(router_reached_counts.items())),
+            "router_blocked_counts": dict(sorted(router_blocked_counts.items())),
+            "hard_guard_blocked_counts": dict(sorted(hard_guard_blocked_counts.items())),
+            "queue_eval_reached_counts": resolved_queue_eval_reached_counts,
+            "admission_counts": resolved_admission_counts,
         },
         "symbols": {
             "net_pnl": dict(sorted(symbol_pnl.items())),
@@ -602,6 +1060,99 @@ def analyze_trading_log(
             "daily_profit_target_triggered": daily_profit_target_triggered,
         },
     }
+
+
+def _derive_log_realized_summary(log_analysis: Dict[str, Any]) -> Dict[str, Any]:
+    realized = log_analysis.get("realized")
+    if isinstance(realized, dict):
+        return dict(realized)
+
+    strategy_pnl = log_analysis.get("strategy_pnl") or {}
+    closed_trades = sum(
+        _safe_int(metrics.get("closed_trades"))
+        for metrics in strategy_pnl.values()
+        if isinstance(metrics, dict)
+    )
+    wins = sum(
+        _safe_int(metrics.get("wins"))
+        for metrics in strategy_pnl.values()
+        if isinstance(metrics, dict)
+    )
+    losses = sum(
+        _safe_int(metrics.get("losses"))
+        for metrics in strategy_pnl.values()
+        if isinstance(metrics, dict)
+    )
+    realized_net_pnl = sum(
+        _safe_int(metrics.get("net_pnl"))
+        for metrics in strategy_pnl.values()
+        if isinstance(metrics, dict)
+    )
+    records = [
+        record
+        for record in (log_analysis.get("trade_records") or [])
+        if isinstance(record, dict)
+    ]
+    realized_fills = [_safe_int(record.get("net_pnl")) for record in records]
+    winning_net_pnl_sum = sum(value for value in realized_fills if value > 0)
+    losing_net_pnl_sum = sum(value for value in realized_fills if value < 0)
+    unattributed_net = realized_net_pnl - sum(realized_fills)
+    if unattributed_net > 0:
+        winning_net_pnl_sum += unattributed_net
+    elif unattributed_net < 0:
+        losing_net_pnl_sum += unattributed_net
+    return {
+        "source": "sell_fill_log",
+        "has_activity": bool(records or closed_trades or realized_net_pnl),
+        "realized_net_pnl": int(realized_net_pnl),
+        "closed_trades": int(closed_trades),
+        "wins": int(wins),
+        "losses": int(losses),
+        "breakeven": max(0, int(closed_trades - wins - losses)),
+        "winning_net_pnl_sum": int(winning_net_pnl_sum),
+        "losing_net_pnl_sum": int(losing_net_pnl_sum),
+        "largest_win_net": max([0, *realized_fills]),
+        "largest_loss_net": min([0, *realized_fills]),
+    }
+
+
+def _reconcile_scorecard_with_log(scorecard: Dict[str, Any]) -> Dict[str, Any]:
+    log_analysis = scorecard.get("log_analysis") or {}
+    realized = _derive_log_realized_summary(log_analysis)
+    if not bool(realized.get("has_activity")):
+        return scorecard
+
+    pnl = scorecard.setdefault("pnl", {})
+    trades_before = dict(scorecard.get("trades") or {})
+    snapshot_net = _safe_int(pnl.get("realized_net_pnl"))
+    snapshot_session = _safe_int(pnl.get("session_pnl"))
+    log_net = _safe_int(realized.get("realized_net_pnl"))
+    pnl["realized_net_pnl"] = log_net
+    pnl["session_pnl"] = log_net
+    pnl["winning_net_pnl_sum"] = _safe_int(realized.get("winning_net_pnl_sum"))
+    pnl["losing_net_pnl_sum"] = _safe_int(realized.get("losing_net_pnl_sum"))
+    pnl["largest_win_net"] = _safe_int(realized.get("largest_win_net"))
+    pnl["largest_loss_net"] = _safe_int(realized.get("largest_loss_net"))
+    pnl["realized_source"] = "sell_fill_log"
+    scorecard["trades"] = _compute_trade_metrics(
+        {
+            "realized_net_pnl": log_net,
+            "trade_count": _safe_int(realized.get("closed_trades")),
+            "win_count": _safe_int(realized.get("wins")),
+            "loss_count": _safe_int(realized.get("losses")),
+            "breakeven_count": _safe_int(realized.get("breakeven")),
+            "winning_net_pnl_sum": _safe_int(realized.get("winning_net_pnl_sum")),
+            "losing_net_pnl_sum": _safe_int(realized.get("losing_net_pnl_sum")),
+        }
+    )
+    scorecard["reconciliation"] = {
+        "authoritative_source": "sell_fill_log",
+        "strategy_snapshot_realized_net_pnl": snapshot_net,
+        "strategy_snapshot_session_pnl": snapshot_session,
+        "strategy_snapshot_closed_trades": _safe_int(trades_before.get("closed_trades")),
+        "net_pnl_difference": int(log_net - snapshot_net),
+    }
+    return scorecard
 
 
 def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
@@ -706,10 +1257,31 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
             f"{bucket} {_format_currency(value.get('net_pnl'))} / {_safe_int(value.get('closed_trades'))}건"
             for bucket, value in (math_shadow.get("ev_buckets") or {}).items()
         ) or "-"
+        conviction_tier_summary = ", ".join(
+            f"{tier} {_format_currency(value.get('net_pnl'))} / {_safe_int(value.get('closed_trades'))}건"
+            for tier, value in (math_shadow.get("conviction_tier_pnl") or {}).items()
+        ) or "-"
+        candidate_class_summary = ", ".join(
+            f"{candidate_class} {_format_currency(value.get('net_pnl'))} / {_safe_int(value.get('closed_trades'))}건"
+            for candidate_class, value in (math_shadow.get("candidate_class_pnl") or {}).items()
+        ) or "-"
+        queue_source_summary = ", ".join(
+            f"{key} {_format_currency(value.get('net_pnl'))} / {_safe_int(value.get('closed_trades'))}건"
+            for key, value in (math_shadow.get("queue_source_pnl") or {}).items()
+        ) or "-"
+        candidate_reject_reason_summary = ", ".join(
+            f"{reason} "
+            + "/".join(
+                f"{outcome} {count}건"
+                for outcome, count in (outcomes or {}).items()
+            )
+            for reason, outcomes in (math_shadow.get("candidate_reject_reason_outcomes") or {}).items()
+        ) or "-"
         math_regime_summary = ", ".join(
             f"{key} {value}건"
             for key, value in (math_shadow.get("regime_shadow_disagreements") or {}).items()
         ) or "-"
+        stop_stats = math_shadow.get("stop_stats") or {}
         lines.extend(
             [
                 "## 로그 분석",
@@ -724,9 +1296,14 @@ def render_daily_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
                 f"- 셋업별 순손익: {setup_pnl_summary}",
                 f"- 레짐별 순손익: {regime_pnl_summary}",
                 f"- 그림자 차단 후보 결과: {shadow_summary}",
-                f"- Math shadow 등급 분포: {math_grade_summary}",
-                f"- Math shadow EV 버킷: {math_ev_summary}",
-                f"- Math shadow 레짐 불일치: {math_regime_summary}",
+                f"- 보조 신호 등급 분포: {math_grade_summary}",
+                f"- 보조 신호 EV 버킷: {math_ev_summary}",
+                f"- conviction tier별 손익: {conviction_tier_summary}",
+                f"- 실전 후보 class별 손익: {candidate_class_summary}",
+                f"- 후보 source별 손익: {queue_source_summary}",
+                f"- 실전 제외 사유별 결과: {candidate_reject_reason_summary}",
+                f"- 손절 overshoot: 트리거 {_safe_int(stop_stats.get('stop_triggered_count'))}건 / 폴백 {_safe_int(stop_stats.get('stop_limit_fallback_count'))}건 / 평균 {_safe_float(stop_stats.get('stop_overshoot_avg_krw')):,.2f}원 / 최대 {_format_currency(stop_stats.get('stop_overshoot_max_krw'))}",
+                f"- 보조 신호 레짐 불일치: {math_regime_summary}",
                 f"- 종목별 상위: {top_winners_summary}",
                 f"- 종목별 하위: {top_losers_summary}",
                 f"- 손실 1단계 진입 차단: {_safe_int(risk_events.get('risk_stage1_block_count'))}건",
@@ -755,6 +1332,7 @@ def evaluate_strategy_gates(
     *,
     window_days: int = DEFAULT_STRATEGY_GATE_WINDOW_DAYS,
     min_closed_trades: int = DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES,
+    disable_expectancy_threshold: float = -150.0,
 ) -> Dict[str, Any]:
     window_cards = scorecards[-window_days:] if window_days > 0 else list(scorecards)
     strategy_rollup: Dict[str, Dict[str, Any]] = defaultdict(
@@ -771,18 +1349,39 @@ def evaluate_strategy_gates(
 
     for card in window_cards:
         log_analysis = card.get("log_analysis", {})
-        for strategy_name, metrics in (log_analysis.get("strategy_pnl") or {}).items():
-            rollup = strategy_rollup[strategy_name]
-            rollup["closed_trades"] += _safe_int(metrics.get("closed_trades"))
-            rollup["net_pnl"] += _safe_float(metrics.get("net_pnl"))
-            rollup["wins"] += _safe_int(metrics.get("wins"))
-            rollup["losses"] += _safe_int(metrics.get("losses"))
-        for strategy_name, hours in (log_analysis.get("strategy_hourly_pnl") or {}).items():
-            rollup = strategy_rollup[strategy_name]
-            for hour, metrics in hours.items():
+        trade_records = (log_analysis.get("trade_records") or [])
+        if trade_records:
+            for record in trade_records:
+                setup_name = str(record.get("setup_name") or "")
+                queue_source = str(record.get("queue_source") or "")
+                if setup_name == "restored_position" or queue_source == "account_restore":
+                    continue
+                strategy_name = str(record.get("strategy_name") or "unknown_strategy")
+                rollup = strategy_rollup[strategy_name]
+                net_pnl = _safe_float(record.get("net_pnl"))
+                rollup["closed_trades"] += 1
+                rollup["net_pnl"] += net_pnl
+                if net_pnl > 0:
+                    rollup["wins"] += 1
+                elif net_pnl < 0:
+                    rollup["losses"] += 1
+                hour = str(record.get("hour_bucket") or "unknown")
                 bucket = rollup["hourly"][hour]
-                bucket["closed_trades"] += _safe_int(metrics.get("closed_trades"))
-                bucket["net_pnl"] += _safe_float(metrics.get("net_pnl"))
+                bucket["closed_trades"] += 1
+                bucket["net_pnl"] += net_pnl
+        else:
+            for strategy_name, metrics in (log_analysis.get("strategy_pnl") or {}).items():
+                rollup = strategy_rollup[strategy_name]
+                rollup["closed_trades"] += _safe_int(metrics.get("closed_trades"))
+                rollup["net_pnl"] += _safe_float(metrics.get("net_pnl"))
+                rollup["wins"] += _safe_int(metrics.get("wins"))
+                rollup["losses"] += _safe_int(metrics.get("losses"))
+            for strategy_name, hours in (log_analysis.get("strategy_hourly_pnl") or {}).items():
+                rollup = strategy_rollup[strategy_name]
+                for hour, metrics in hours.items():
+                    bucket = rollup["hourly"][hour]
+                    bucket["closed_trades"] += _safe_int(metrics.get("closed_trades"))
+                    bucket["net_pnl"] += _safe_float(metrics.get("net_pnl"))
         for strategy_name, shadow in (log_analysis.get("shadow_blocked") or {}).items():
             rollup = strategy_rollup[strategy_name]
             for outcome, count in (shadow.get("outcomes") or {}).items():
@@ -797,7 +1396,7 @@ def evaluate_strategy_gates(
         net_pnl = _safe_float(metrics.get("net_pnl"))
         expectancy = round(net_pnl / closed_trades, 2) if closed_trades > 0 else 0.0
         win_rate = round(_safe_int(metrics.get("wins")) / closed_trades, 4) if closed_trades > 0 else 0.0
-        enabled = not (closed_trades >= min_closed_trades and expectancy < 0)
+        enabled = not (closed_trades >= min_closed_trades and expectancy <= float(disable_expectancy_threshold))
         reason = "negative_expectancy" if not enabled else "pass"
         strategies[strategy_name] = {
             "enabled": enabled,
@@ -882,15 +1481,46 @@ def evaluate_math_shadow_report(
     leader_percentile_rollup: Dict[str, Dict[str, float]] = defaultdict(
         lambda: {"closed_trades": 0, "net_pnl": 0.0}
     )
+    shock_score_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    adaptive_hold_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
     regime_profile_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    conviction_tier_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    bull_risk_mode_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    post_loss_admission_class_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    candidate_class_rollup: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"closed_trades": 0, "net_pnl": 0.0}
+    )
+    queue_source_rollup: Dict[str, Dict[str, float]] = defaultdict(
         lambda: {"closed_trades": 0, "net_pnl": 0.0}
     )
     shadow_gate_counts: Dict[str, int] = defaultdict(int)
     regime_disagreements: Dict[str, int] = defaultdict(int)
     queue_counts: Dict[str, int] = defaultdict(int)
+    precheck_reached_counts: Dict[str, int] = defaultdict(int)
+    precheck_blocked_counts: Dict[str, int] = defaultdict(int)
+    policy_blocked_counts: Dict[str, int] = defaultdict(int)
+    router_reached_counts: Dict[str, int] = defaultdict(int)
+    router_blocked_counts: Dict[str, int] = defaultdict(int)
+    hard_guard_blocked_counts: Dict[str, int] = defaultdict(int)
     queue_eval_reached_counts: Dict[str, int] = defaultdict(int)
     admission_counts: Dict[str, int] = defaultdict(int)
     leader_hits: List[Dict[str, Any]] = []
+    stop_triggered_count = 0
+    stop_limit_fallback_count = 0
+    stop_overshoots: List[int] = []
+    candidate_reject_reason_outcomes_rollup: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     for card in window_cards:
         log_analysis = card.get("log_analysis", {})
@@ -905,10 +1535,25 @@ def evaluate_math_shadow_report(
             ev_rollup[bucket]["net_pnl"] += _safe_float(metrics.get("net_pnl"))
         for key, value in (math_shadow.get("shadow_gate_counts") or {}).items():
             shadow_gate_counts[key] += _safe_int(value)
+        for reason, outcomes in (math_shadow.get("candidate_reject_reason_outcomes") or {}).items():
+            for outcome, count in (outcomes or {}).items():
+                candidate_reject_reason_outcomes_rollup[str(reason)][str(outcome)] += _safe_int(count)
         for key, value in (math_shadow.get("regime_shadow_disagreements") or {}).items():
             regime_disagreements[key] += _safe_int(value)
         for key, value in (math_shadow.get("queue_counts") or {}).items():
             queue_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("precheck_reached_counts") or {}).items():
+            precheck_reached_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("precheck_blocked_counts") or {}).items():
+            precheck_blocked_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("policy_blocked_counts") or {}).items():
+            policy_blocked_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("router_reached_counts") or {}).items():
+            router_reached_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("router_blocked_counts") or {}).items():
+            router_blocked_counts[key] += _safe_int(value)
+        for key, value in (math_shadow.get("hard_guard_blocked_counts") or {}).items():
+            hard_guard_blocked_counts[key] += _safe_int(value)
         for key, value in (math_shadow.get("queue_eval_reached_counts") or {}).items():
             queue_eval_reached_counts[key] += _safe_int(value)
         for key, value in (math_shadow.get("admission_counts") or {}).items():
@@ -936,6 +1581,30 @@ def evaluate_math_shadow_report(
             leader_percentile_rollup[pct_bucket]["closed_trades"] += 1
             leader_percentile_rollup[pct_bucket]["net_pnl"] += _safe_float(record.get("net_pnl"))
 
+            shock_score = _safe_float(record.get("shock_score"))
+            if shock_score >= 1.50:
+                shock_bucket = "1.50+"
+            elif shock_score >= 1.00:
+                shock_bucket = "1.00-1.49"
+            elif shock_score >= 0.50:
+                shock_bucket = "0.50-0.99"
+            else:
+                shock_bucket = "<0.50"
+            shock_score_rollup[shock_bucket]["closed_trades"] += 1
+            shock_score_rollup[shock_bucket]["net_pnl"] += _safe_float(record.get("net_pnl"))
+
+            adaptive_hold = _safe_int(record.get("adaptive_max_hold_minutes"))
+            if adaptive_hold <= 0:
+                hold_bucket = "none"
+            elif adaptive_hold <= 12:
+                hold_bucket = "<=12"
+            elif adaptive_hold <= 18:
+                hold_bucket = "13-18"
+            else:
+                hold_bucket = "19+"
+            adaptive_hold_rollup[hold_bucket]["closed_trades"] += 1
+            adaptive_hold_rollup[hold_bucket]["net_pnl"] += _safe_float(record.get("net_pnl"))
+
             dominant_profile = str(record.get("math_dominant_profile") or "").strip()
             if not dominant_profile:
                 probs = {
@@ -947,6 +1616,26 @@ def evaluate_math_shadow_report(
                 dominant_profile = sorted(probs.items(), key=lambda item: (item[1], item[0]), reverse=True)[0][0]
             regime_profile_rollup[dominant_profile]["closed_trades"] += 1
             regime_profile_rollup[dominant_profile]["net_pnl"] += _safe_float(record.get("net_pnl"))
+            conviction_tier = str(record.get("conviction_tier") or "none")
+            conviction_tier_rollup[conviction_tier]["closed_trades"] += 1
+            conviction_tier_rollup[conviction_tier]["net_pnl"] += _safe_float(record.get("net_pnl"))
+            bull_risk_mode = str(record.get("bull_risk_mode") or "normal")
+            bull_risk_mode_rollup[bull_risk_mode]["closed_trades"] += 1
+            bull_risk_mode_rollup[bull_risk_mode]["net_pnl"] += _safe_float(record.get("net_pnl"))
+            post_loss_admission_class = str(record.get("post_loss_admission_class") or "general")
+            post_loss_admission_class_rollup[post_loss_admission_class]["closed_trades"] += 1
+            post_loss_admission_class_rollup[post_loss_admission_class]["net_pnl"] += _safe_float(record.get("net_pnl"))
+            candidate_class = str(record.get("candidate_class") or "unclassified")
+            candidate_class_rollup[candidate_class]["closed_trades"] += 1
+            candidate_class_rollup[candidate_class]["net_pnl"] += _safe_float(record.get("net_pnl"))
+            queue_source = str(record.get("queue_source") or "unknown")
+            queue_source_rollup[queue_source]["closed_trades"] += 1
+            queue_source_rollup[queue_source]["net_pnl"] += _safe_float(record.get("net_pnl"))
+            if str(record.get("protective_exit_mode") or ""):
+                stop_triggered_count += 1
+                if str(record.get("fill_mode") or "") == "limit_then_market":
+                    stop_limit_fallback_count += 1
+                stop_overshoots.append(max(0, _safe_int(record.get("stop_overshoot_krw"))))
 
     grade_summary = {
         grade: {
@@ -979,6 +1668,26 @@ def evaluate_math_shadow_report(
         }
         for bucket, metrics in sorted(leader_percentile_rollup.items())
     }
+    shock_score_summary = {
+        bucket: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for bucket, metrics in sorted(shock_score_rollup.items())
+    }
+    adaptive_hold_summary = {
+        bucket: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for bucket, metrics in sorted(adaptive_hold_rollup.items())
+    }
     regime_profile_summary = {
         regime: {
             "closed_trades": int(metrics["closed_trades"]),
@@ -989,6 +1698,56 @@ def evaluate_math_shadow_report(
         }
         for regime, metrics in sorted(regime_profile_rollup.items())
     }
+    conviction_tier_summary = {
+        tier: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for tier, metrics in sorted(conviction_tier_rollup.items())
+    }
+    bull_risk_mode_summary = {
+        mode: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for mode, metrics in sorted(bull_risk_mode_rollup.items())
+    }
+    post_loss_admission_class_summary = {
+        admission_class: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for admission_class, metrics in sorted(post_loss_admission_class_rollup.items())
+    }
+    candidate_class_summary = {
+        candidate_class: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for candidate_class, metrics in sorted(candidate_class_rollup.items())
+    }
+    queue_source_summary = {
+        key: {
+            "closed_trades": int(metrics["closed_trades"]),
+            "net_pnl": int(metrics["net_pnl"]),
+            "expectancy": round(metrics["net_pnl"] / metrics["closed_trades"], 2)
+            if metrics["closed_trades"]
+            else 0.0,
+        }
+        for key, metrics in sorted(queue_source_rollup.items())
+    }
     promotion_ready = any(
         metrics["closed_trades"] >= min_closed_trades and metrics["expectancy"] > 0
         for metrics in grade_summary.values()
@@ -996,6 +1755,16 @@ def evaluate_math_shadow_report(
         metrics["closed_trades"] >= min_closed_trades and metrics["expectancy"] > 0
         for metrics in ev_summary.values()
     )
+    if queue_counts:
+        resolved_queue_eval_reached_counts = {
+            key: min(_safe_int(router_reached_counts.get(key)), _safe_int(value))
+            for key, value in sorted(queue_counts.items())
+        }
+    else:
+        resolved_queue_eval_reached_counts = dict(sorted(queue_eval_reached_counts.items()))
+    queue_total = sum(_safe_int(value) for value in queue_counts.values())
+    queue_eval_total = sum(_safe_int(value) for value in resolved_queue_eval_reached_counts.values())
+    queue_eval_reach_rate = round((queue_eval_total / queue_total), 4) if queue_total else 0.0
     admission_total = _safe_int(admission_counts.get("passed")) + _safe_int(admission_counts.get("blocked"))
     admission_pass_rate = round(
         (_safe_int(admission_counts.get("passed")) / admission_total),
@@ -1009,11 +1778,35 @@ def evaluate_math_shadow_report(
         "grades": grade_summary,
         "ev_buckets": ev_summary,
         "leader_percentile_buckets": leader_percentile_summary,
+        "shock_score_buckets": shock_score_summary,
+        "adaptive_hold_buckets": adaptive_hold_summary,
         "dominant_regime_profiles": regime_profile_summary,
+        "conviction_tiers": conviction_tier_summary,
+        "bull_risk_modes": bull_risk_mode_summary,
+        "post_loss_admission_classes": post_loss_admission_class_summary,
+        "candidate_classes": candidate_class_summary,
+        "queue_source_pnl": queue_source_summary,
+        "stop_stats": {
+            "stop_triggered_count": int(stop_triggered_count),
+            "stop_limit_fallback_count": int(stop_limit_fallback_count),
+            "stop_overshoot_avg_krw": round(sum(stop_overshoots) / len(stop_overshoots), 2) if stop_overshoots else 0.0,
+            "stop_overshoot_max_krw": max(stop_overshoots) if stop_overshoots else 0,
+        },
         "shadow_gate_counts": dict(sorted(shadow_gate_counts.items())),
+        "candidate_reject_reason_outcomes": {
+            reason: dict(sorted(outcomes.items()))
+            for reason, outcomes in sorted(candidate_reject_reason_outcomes_rollup.items())
+        },
         "regime_shadow_disagreements": dict(sorted(regime_disagreements.items())),
         "queue_counts": dict(sorted(queue_counts.items())),
-        "queue_eval_reached_counts": dict(sorted(queue_eval_reached_counts.items())),
+        "precheck_reached_counts": dict(sorted(precheck_reached_counts.items())),
+        "precheck_blocked_counts": dict(sorted(precheck_blocked_counts.items())),
+        "policy_blocked_counts": dict(sorted(policy_blocked_counts.items())),
+        "router_reached_counts": dict(sorted(router_reached_counts.items())),
+        "router_blocked_counts": dict(sorted(router_blocked_counts.items())),
+        "hard_guard_blocked_counts": dict(sorted(hard_guard_blocked_counts.items())),
+        "queue_eval_reached_counts": resolved_queue_eval_reached_counts,
+        "queue_eval_reach_rate": queue_eval_reach_rate,
         "admission_counts": dict(sorted(admission_counts.items())),
         "admission_pass_rate": admission_pass_rate,
         "top_leader_trades": sorted(
@@ -1027,7 +1820,7 @@ def evaluate_math_shadow_report(
 
 def render_math_shadow_markdown(payload: Dict[str, Any]) -> str:
     lines = [
-        "# Math Shadow Report",
+        "# Signal Shadow Report",
         "",
         f"- 생성 시각: {payload.get('generated_at', '')}",
         f"- 최근 창: {_safe_int(payload.get('window_days'))}거래일",
@@ -1055,8 +1848,54 @@ def render_math_shadow_markdown(payload: Dict[str, Any]) -> str:
             )
     else:
         lines.append("- 집계 없음")
-    lines.extend(["", "## Math Queue"])
+    lines.extend(["", "## Conviction Tier"])
+    conviction_tiers = payload.get("conviction_tiers", {})
+    if conviction_tiers:
+        for tier, metrics in conviction_tiers.items():
+            lines.append(
+                f"- {tier}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Bull Risk Mode"])
+    bull_risk_modes = payload.get("bull_risk_modes", {})
+    if bull_risk_modes:
+        for mode, metrics in bull_risk_modes.items():
+            lines.append(
+                f"- {mode}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Post-loss Admission"])
+    post_loss_admission_classes = payload.get("post_loss_admission_classes", {})
+    if post_loss_admission_classes:
+        for admission_class, metrics in post_loss_admission_classes.items():
+            lines.append(
+                f"- {admission_class}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Candidate Class"])
+    candidate_classes = payload.get("candidate_classes", {})
+    if candidate_classes:
+        for candidate_class, metrics in candidate_classes.items():
+            lines.append(
+                f"- {candidate_class}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Candidate Queue"])
     queue_counts = payload.get("queue_counts", {})
+    precheck_reached = payload.get("precheck_reached_counts", {})
+    precheck_blocked = payload.get("precheck_blocked_counts", {})
+    policy_blocked = payload.get("policy_blocked_counts", {})
+    router_reached = payload.get("router_reached_counts", {})
+    router_blocked = payload.get("router_blocked_counts", {})
+    hard_guard_blocked = payload.get("hard_guard_blocked_counts", {})
     queue_eval_reached = payload.get("queue_eval_reached_counts", {})
     admission_counts = payload.get("admission_counts", {})
     if queue_counts:
@@ -1065,14 +1904,99 @@ def render_math_shadow_markdown(payload: Dict[str, Any]) -> str:
             lines.append(f"- {key}: 큐 {_safe_int(value)}건 / 실제 평가 도달 {reached}건")
     else:
         lines.append("- 집계 없음")
+    if precheck_reached:
+        lines.append(
+            "- precheck 도달: "
+            + ", ".join(f"{key} {_safe_int(value)}건" for key, value in sorted(precheck_reached.items()))
+        )
+    if precheck_blocked:
+        lines.append(
+            "- precheck 차단: "
+            + ", ".join(f"{key} {_safe_int(value)}건" for key, value in sorted(precheck_blocked.items()))
+        )
+    if policy_blocked:
+        lines.append(
+            "- policy 차단: "
+            + ", ".join(f"{key} {_safe_int(value)}건" for key, value in sorted(policy_blocked.items()))
+        )
+    if router_reached:
+        lines.append(
+            "- router 도달: "
+            + ", ".join(f"{key} {_safe_int(value)}건" for key, value in sorted(router_reached.items()))
+        )
+    if router_blocked:
+        lines.append(
+            "- router 차단: "
+            + ", ".join(f"{key} {_safe_int(value)}건" for key, value in sorted(router_blocked.items()))
+        )
+    if hard_guard_blocked:
+        lines.append(
+            "- hard guard 차단: "
+            + ", ".join(f"{key} {_safe_int(value)}건" for key, value in sorted(hard_guard_blocked.items()))
+        )
+    lines.append(
+        f"- 큐 대비 실제 평가 도달율: {_safe_float(payload.get('queue_eval_reach_rate')) * 100:.2f}%"
+    )
     lines.append(
         f"- admission 통과율: {_safe_float(payload.get('admission_pass_rate')) * 100:.2f}% "
         f"(통과 {_safe_int(admission_counts.get('passed'))}건 / 차단 {_safe_int(admission_counts.get('blocked'))}건)"
+    )
+    lines.extend(["", "## Queue Source PnL"])
+    queue_source_pnl = payload.get("queue_source_pnl", {})
+    if queue_source_pnl:
+        for key, metrics in queue_source_pnl.items():
+            lines.append(
+                f"- {key}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Candidate Reject Outcomes"])
+    candidate_reject_reason_outcomes = payload.get("candidate_reject_reason_outcomes", {})
+    if candidate_reject_reason_outcomes:
+        for reason, outcomes in candidate_reject_reason_outcomes.items():
+            summary = ", ".join(
+                f"{outcome} {_safe_int(count)}건"
+                for outcome, count in sorted((outcomes or {}).items())
+            ) or "-"
+            lines.append(f"- {reason}: {summary}")
+    else:
+        lines.append("- 집계 없음")
+    stop_stats = payload.get("stop_stats", {})
+    lines.extend(
+        [
+            "",
+            "## Stop Stats",
+            f"- 손절 트리거: {_safe_int(stop_stats.get('stop_triggered_count'))}건",
+            f"- 지정가 후 시장가 폴백: {_safe_int(stop_stats.get('stop_limit_fallback_count'))}건",
+            f"- 손절 overshoot 평균: {_safe_float(stop_stats.get('stop_overshoot_avg_krw')):,.2f}원",
+            f"- 손절 overshoot 최대: {_format_currency(stop_stats.get('stop_overshoot_max_krw'))}",
+        ]
     )
     lines.extend(["", "## Leader Percentile Buckets"])
     leader_pct_buckets = payload.get("leader_percentile_buckets", {})
     if leader_pct_buckets:
         for bucket, metrics in leader_pct_buckets.items():
+            lines.append(
+                f"- {bucket}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Shock Score Buckets"])
+    shock_buckets = payload.get("shock_score_buckets", {})
+    if shock_buckets:
+        for bucket, metrics in shock_buckets.items():
+            lines.append(
+                f"- {bucket}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
+                f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
+            )
+    else:
+        lines.append("- 집계 없음")
+    lines.extend(["", "## Adaptive Hold Buckets"])
+    hold_buckets = payload.get("adaptive_hold_buckets", {})
+    if hold_buckets:
+        for bucket, metrics in hold_buckets.items():
             lines.append(
                 f"- {bucket}: 청산 {_safe_int(metrics.get('closed_trades'))}건 / "
                 f"순손익 {_format_currency(metrics.get('net_pnl'))} / 기대값 {_safe_float(metrics.get('expectancy')):,.2f}원"
@@ -1181,7 +2105,11 @@ def load_scorecards(report_root: Path = DEFAULT_REPORT_ROOT, limit: int = 60) ->
     scorecards = []
     for path in files:
         try:
-            scorecards.append(json.loads(path.read_text(encoding="utf-8")))
+            scorecards.append(
+                _reconcile_scorecard_with_log(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            )
         except (OSError, json.JSONDecodeError):
             continue
     scorecards.sort(key=lambda item: item.get("date", ""))
@@ -1571,7 +2499,7 @@ def update_performance_reports(
     merged_scorecards = _merge_scorecards(existing_scorecards, scorecard)
     scorecard["paper_gate"] = evaluate_paper_trading_gate(merged_scorecards)
     scorecard_paths = write_daily_scorecard(scorecard, report_root=report_root)
-    strategy_cfg = getattr(strategy, "cfg", None)
+    strategy_cfg = getattr(strategy, "cfg", None) or getattr(strategy, "config", None)
     strategy_gates = evaluate_strategy_gates(
         merged_scorecards,
         window_days=_safe_int(
@@ -1581,6 +2509,10 @@ def update_performance_reports(
         min_closed_trades=_safe_int(
             getattr(strategy_cfg, "strategy_gate_min_closed_trades", DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES),
             DEFAULT_STRATEGY_GATE_MIN_CLOSED_TRADES,
+        ),
+        disable_expectancy_threshold=_safe_float(
+            getattr(strategy_cfg, "strategy_gate_disable_expectancy_threshold", -150.0),
+            -150.0,
         ),
     )
     strategy_gate_paths = write_strategy_gates_report(strategy_gates, report_root=report_root)
