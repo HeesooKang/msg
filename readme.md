@@ -1,346 +1,112 @@
 # 주식 자동거래 프로그램 (`msg`)
 
-한국투자증권 KIS Open API를 사용하는 주식 자동거래 프로젝트입니다.  
-현재 기준 운영 철학은 `paper 모의투자 우선`, `실계좌는 게이트 통과 후 단계적 전환`입니다.
+한국투자증권 KIS Open API를 사용하는 국내주식 자동거래 봇입니다. 현재 운영 전략은 시장 레짐이나 장세별 라우터 없이 모든 감시 종목을 같은 실행가격 예측·EV 공식으로 평가합니다.
 
-## 현재 상태 요약
-
-- 실시간 자동매매 봇: `run_bot.py`
-- 일봉 smoke 백테스트: `run_backtest.py`
-- 1분봉 리플레이 백테스트: `run_backtest_intraday.py`
-- 핵심 전략: `src/strategies/momentum_scalp.py`
-- 레짐 라우터: `src/strategies/regime_router.py`
-- 일일 성적표 / 실투자 준비도 리포트: `src/performance_reporting.py`
-
-이 프로젝트는 더 이상 단순 모멘텀 점수 하나로만 진입하지 않습니다.  
-현재 구조는 `레짐 판별 -> 레짐별 서브전략 선택 -> 진입/청산/리스크 제어 -> 리포트 생성` 흐름입니다.
-
-## 전략 구조
-
-현재 진입 로직은 `레짐 라우터 + 장세별 서브전략` 구조입니다.
-
-- `bull_breakout_strategy`
-기본 수익 엔진입니다.  
-최근 고점 돌파, 거래량 스파이크, 확인 틱 유지가 핵심이고, `A급 leader`만 실전 진입합니다.  
-또한 `neutral`로 보이는 장이라도 지수/후보군 breadth가 강하면 `bull bias override`로 이 전략이 우선 선택됩니다.  
-익절 시에는 `부분익절 후 나머지 trailing`을 사용합니다.
-
-- `neutral_pullback_strategy`
-중립장 보조 전략입니다.  
-`상승 -> 눌림 -> 재돌파` 형태만 허용하고, 고점 추격은 차단합니다.  
-현재 기본 운영값에서는 `10:00 이후`에만 진입을 검토하며, `bull`을 못 잡는 구간에서만 제한적으로 씁니다.
-
-- `soft_bear_inverse_strategy`
-완만약세(`score 2`) 전용 인버스 전략입니다.  
-롱은 기본적으로 열지 않고, 인버스 ETF 한 종목만 `runup -> pullback -> reclaim` 구조로 평가합니다.
-
-- `hard_bear_inverse_strategy`
-강한 약세장에서 인버스 ETF만 봅니다.  
-거래 수를 늘리기보다 품질 유지 쪽에 더 가깝습니다.
-
-레짐은 대략 아래 4개로 나뉩니다.
-
-- `bull`
-- `neutral`
-- `soft_bear`
-- `bear`
-
-## 현재 리스크 제어
-
-기본 운영값은 손실 억제를 매우 강하게 둡니다.
-
-- 일일 목표: `+10,000원`
-- 일일 하드스탑: `-5,000원`
-- 손실 1단계: `-2,000원`
-- 중립장 손실 후: `30분 쿨다운 + A급 재도전 1회만 허용`
-- `neutral` 기본 진입 시작 시각: `10:00`
-- `bull A급`은 부분익절 후 잔여 물량만 추세 추종
-- 장마감 직전 신규 진입 차단: `15:00-15:21`
-
-중요한 점은, `실계좌` 모드라고 해서 바로 풀사이즈로 돌지 않는다는 점입니다.  
-`reports/real-trade-readiness.json`의 gate를 통과하기 전에는 실계좌가 자동 보류됩니다.
-
-또한 `reports/strategy-gates.json`을 통해 최근 rolling 기대값이 음수인 전략은 다음 시작 때 자동 비활성화될 수 있습니다.
-
-## 프로젝트 구조
+## 실행 경로
 
 ```text
-.
-├── README.md
-├── run_bot.py
-├── run_backtest.py
-├── run_backtest_intraday.py
-├── bot_ctl.sh
-├── dev
-├── docs/
-│   ├── live-trading-checklist.md
-│   ├── kakao-alert-setup.md
-│   └── kakao-setup-checklist.md
-├── scripts/
-│   └── kakao_oauth_helper.py
-├── src/
-│   ├── account.py
-│   ├── api_client.py
-│   ├── auth.py
-│   ├── config.py
-│   ├── logger_setup.py
-│   ├── main.py
-│   ├── market_data.py
-│   ├── notifications.py
-│   ├── performance_reporting.py
-│   ├── scheduler.py
-│   ├── trading.py
-│   ├── backtest/
-│   │   ├── data_fetcher.py
-│   │   ├── engine.py
-│   │   ├── intraday_engine.py
-│   │   └── report.py
-│   └── strategies/
-│       ├── momentum_scalp.py
-│       └── regime_router.py
-├── logs/
-├── reports/
-├── state/
-├── data/
-│   └── daily/
-├── requirements.txt
-└── open-trading-api/
+bot_ctl.sh
+-> run_bot.py
+-> src.main.run_scheduled()
+-> TradingScheduler
+-> MomentumScalpStrategy.on_batch_tick()
 ```
 
-## 실행 전 준비
+`run_bot.py`가 설정, KIS 클라이언트, 시세 API와 전략을 한 번만 생성합니다. 스케줄러는 전략이 가진 동일 클라이언트를 사용하며 별도 전략·클라이언트 fallback을 만들지 않습니다.
 
-### 1. 가상환경
+## 장중 흐름
+
+한 틱의 순서는 다음과 같습니다.
+
+1. WebSocket 체결 시세를 1초 단위 최신 호가로 병합합니다.
+2. 확정 주문과 계좌 포지션을 정산합니다.
+3. 보유 포지션의 하드스톱 또는 선택된 예측 만료 청산을 판단합니다.
+4. 구매 가능한 모든 최신 종목의 특성을 한 번 계산하고 30·60·120·180초 실행 순손익을 같은 ridge 공식으로 평가합니다.
+5. 종목과 만기를 합친 후보 중 비용 포함 `expected_net`이 가장 큰 양수 EV 계획 하나만 지정가 매수합니다.
+6. 체결 가격으로 EV를 한 번 재검증한 뒤 계획을 유지하거나 즉시 청산합니다.
+
+예측 입력은 한 번만 계산되는 아래 실행 시세 특성입니다.
+
+- 15·60·180초 수익률, 60초 고점 대비 되돌림과 실현 변동성
+- 거래량 증가, 실제 누적 매수·매도 체결량 차이, 호가 잔량 불균형
+- 감시풀 중앙값 대비 60초 상대수익률과 현재 spread
+
+각 만기의 확정된 `ask` 진입·`bid` 청산 비용 차감 순수익을 동일한 NumPy ridge 공식으로 학습합니다. 시간대 분기, 레짐, breadth, leader percentile, 별도 인버스 라우트, confidence gate는 사용하지 않습니다.
+
+## 감시 종목
+
+- 고정 감시 32종목
+- 인버스 ETF 4종목
+- KIS 등락률 순위에서 찾은 동적 종목 30개
+- 현재 보유 종목
+
+인버스 ETF도 일반 종목과 같은 예측·EV·수량 공식을 사용합니다. 순위 API는 감시 종목 발견에만 쓰며 진입 자격이나 점수를 만들지 않습니다.
+
+## 손익과 청산
+
+- 일일 확정 실현손익 목표: `+10,000원`
+- 실현+미실현 손실 하드스톱: `-5,000원`
+- 한 거래가 남은 목표 전부를 채울 필요는 없습니다.
+- 수량은 자본 한도와 남은 일일 손실 여유 안에서 계산합니다.
+- 일반 청산은 EV가 선택한 30·60·120·180초 만료 시장가입니다.
+- 주문 체결, 부분체결, 재시작 복구, API 호출 제한 처리는 운영 필수 경로로 유지합니다.
+
+`ALLOW_DAILY_HARD_STOP_BYPASS=true`로 시작하면 이미 당일 손실한도에 도달한 날의 재시작 시점 손익을 새 손실 기준점으로 삼습니다. 이 설정은 사용자가 명시적으로 켠 당일에만 적용됩니다.
+
+## 주요 파일
+
+```text
+run_bot.py                              봇 조립과 실행
+src/main.py                             스케줄러 시작
+src/scheduler.py                        장 시간, 시세, 주문, 체결 정산
+src/market_stream.py                    KIS WebSocket 시세
+src/market_data.py                      동적 종목 발견과 비상 REST 조회
+src/analytics/price_prediction.py       단일 특성 계산과 다중 만기 ridge 예측
+src/analytics/forecast_outcomes.py      다중 만기 실행가격 결과 원장
+src/strategies/momentum_scalp.py        단일 EV 전략
+src/strategies/momentum_scalp_types.py  설정·계획·포지션 상태
+src/strategies/momentum_scalp_pnl.py    원화 비용·순손익 계산
+src/performance_reporting.py            일일 성적표와 실계좌 준비도
+```
+
+`src/backtest/`와 `run_backtest*.py`는 별도 검증 도구이며 라이브 봇의 장중 호출 경로에는 포함되지 않습니다.
+
+## 실행
 
 ```bash
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
-```
-
-프로젝트 기본 실행 진입점은 `./dev`입니다.
-
-```bash
-./dev py -V
-./dev shell
-```
-
-### 2. 환경변수
-
-`.env`에 최소 아래 값이 필요합니다.
-
-```env
-TRADING_MODE=paper
-
-PAPER_API_KEY=...
-PAPER_API_SECRET=...
-PAPER_ACCOUNT_NUMBER=12345678
-
-REAL_API_KEY=...
-REAL_API_SECRET=...
-REAL_ACCOUNT_NUMBER=12345678
-
-ACCOUNT_PRODUCT_CODE=01
-HTS_ID=...
-LOG_LEVEL=INFO
-OFF_HOURS_CHECK_INTERVAL_SECONDS=1800
-
-ALLOW_DAILY_HARD_STOP_BYPASS=false
-
-ALERTS_ENABLED=true
-ALERT_CHANNEL=kakao
-KAKAO_REST_API_KEY=...
-KAKAO_CLIENT_SECRET=...
-KAKAO_REDIRECT_URI=...
-KAKAO_REFRESH_TOKEN=...
-KAKAO_MESSAGE_WEB_URL=...
-KAKAO_MESSAGE_MOBILE_WEB_URL=...
-```
-
-`TRADING_MODE=paper`이면 모의투자 계정 정보를, `TRADING_MODE=real`이면 실계좌 정보를 사용합니다.
-
-카카오 알림을 쓰려면 `KAKAO_REFRESH_TOKEN`과 메시지 링크용 URL이 추가로 필요합니다.
-
-## 카카오 알림 설정
-
-카카오 알림은 `나에게 보내기` API를 사용합니다.
-
-브라우저 인증부터 `.env`의 `KAKAO_REFRESH_TOKEN` 갱신까지 한 번에 처리:
-
-```bash
-./dev py scripts/kakao_oauth_helper.py setup --env-file .env
-```
-
-만약 브라우저가 자동으로 열리지 않으면 터미널에 출력된 URL을 직접 열면 됩니다. 인증이 끝나면 로컬 콜백(`KAKAO_REDIRECT_URI`)으로 인가 코드를 받아 토큰을 교환하고 `.env`를 갱신합니다.
-
-수동으로 처리해야 할 때만 아래 명령을 사용합니다.
-
-1회 토큰 발급용 URL 생성:
-
-```bash
-./dev py scripts/kakao_oauth_helper.py auth-url \
-  --rest-api-key "$KAKAO_REST_API_KEY" \
-  --redirect-uri "$KAKAO_REDIRECT_URI"
-```
-
-로그인 후 받은 `code`를 토큰으로 교환:
-
-```bash
-./dev py scripts/kakao_oauth_helper.py exchange-code \
-  --rest-api-key "$KAKAO_REST_API_KEY" \
-  --client-secret "$KAKAO_CLIENT_SECRET" \
-  --redirect-uri "$KAKAO_REDIRECT_URI" \
-  --code "인가코드"
-```
-
-반환된 `refresh_token`을 `.env`의 `KAKAO_REFRESH_TOKEN`에 넣고 봇을 재시작하면 됩니다.
-
-## 자주 쓰는 명령
-
-### 백테스트
-
-최근 40일 기준 일봉 smoke 백테스트:
-
-```bash
-./dev py run_backtest.py
-```
-
-기간 지정:
-
-```bash
-./dev py run_backtest.py --days 40
-./dev py run_backtest.py --days 60 --end-date 20260312
-```
-
-주의:
-
-- 이 백테스트는 `장중 스캘프 전략을 완벽 재현하는 도구`가 아니라 `이상한 진입/리스크 구조를 빨리 걸러내는 smoke test`에 가깝습니다.
-- 현재 기본 백테스트는 `일봉 smoke 전용 fallback`이 들어가 있어서, 실전 장중 전략의 절대 성과를 뜻하지 않습니다.
-- `paper` 모드에서는 KIS 1분봉 API를 공식 검증 경로로 쓰지 못합니다.
-
-### 1분봉 백테스트
-
-```bash
-./dev py run_backtest_intraday.py
-```
-
-주의:
-
-- `paper` 모드에서는 이 스크립트가 바로 종료됩니다.
-- 사실상 `real API 사용 가능 환경`에서만 실험용으로 쓸 수 있습니다.
-
-### 유닛 테스트
-
-```bash
-./dev unit tests.test_risk_controls_unittest
-./dev unit tests.test_backtest_engine_unittest
-./dev unit tests.test_performance_reporting_unittest
-```
-
-또는 pytest:
-
-```bash
-./dev test -q
-```
-
-## 봇 실행과 운영
-
-### 직접 실행
-
-```bash
-./dev py run_bot.py
-```
-
-### launchd 관리
-
-실운영은 `bot_ctl.sh` 기준입니다.
-
-```bash
-./bot_ctl.sh install
-./bot_ctl.sh start
-./bot_ctl.sh stop
 ./bot_ctl.sh restart
+```
+
+운영 명령:
+
+```bash
 ./bot_ctl.sh status
 ./bot_ctl.sh today
 ./bot_ctl.sh report
 ./bot_ctl.sh gate
 ./bot_ctl.sh logs
 ./bot_ctl.sh monitor
-./bot_ctl.sh uninstall
 ```
 
-각 명령 의미:
+`gate`는 종목 진입 gate가 아니라 실제 계좌 전환을 제한하는 운영 안전 기능입니다. `paper` 성과가 준비 기준을 통과하지 못하면 `real` 실행을 막고, 통과 뒤에도 자본과 손실한도를 단계적으로 확대합니다.
 
-- `status`: 실행 상태 + 오늘 손익 + 최근 로그
-- `today`: 실행 상태 + 오늘 손익만 간단 출력
-- `report`: 오늘 일일 성적표 출력
-- `gate`: 실계좌 전환 게이트 출력
-- `monitor`: 장중 핵심 이벤트만 필터링해서 보기
+## 로그와 상태
 
-macOS에서는 `run_bot.py`가 `caffeinate -dims`를 띄워 절전을 막습니다.
+- `logs/trading.log`: 배치 평가, 선택 후보, 계획 청산, 체결 정산, 세션 상태
+- `logs/orders.log`: 실제 주문 제출 결과와 확정 체결 가격
+- `reports/forecast-outcomes/`: 동일 신호의 30·60·120·180초 실행가격 결과
+- `reports/YYYY/MM/daily-scorecard.*`: 일일 확정 손익 성적표
+- `reports/real-trade-readiness.*`: 실제 계좌 전환 준비도
+- `state/momentum_scalp_daily_state.json`: 당일 포지션·계획·확정 체결 원장 복구 상태
 
-## 리포트와 생성 파일
+로그, 리포트, 런타임 상태와 토큰 파일은 Git 추적 대상이 아닙니다.
 
-이 프로젝트는 장중 결과를 파일로 계속 남깁니다.
+## 검증
 
-- `logs/trading.log`
-전략 판단, 레짐 계산, 진입 거부, 체결, 리스크 이벤트 로그
+```bash
+venv/bin/python -m unittest discover tests
+```
 
-- `logs/orders.log`
-주문 성공/실패 로그
-
-- `reports/YYYY/MM/daily-scorecard.YYYY-MM-DD.{json,md}`
-일일 손익, 전략별 손익, 차단 사유, 최근 gate 상태
-
-- `reports/real-trade-readiness.{json,md}`
-paper 누적 성과 기준 실계좌 전환 가능 여부
-
-- `state/momentum_scalp_daily_state.json`
-당일 누적 손익/보유/중립장 손실 카운트 등 재시작 복구용 상태
-
-- `data/daily/*.parquet`
-일봉 백테스트 캐시
-
-현재 `.gitignore`에는 아래 경로들이 이미 제외되어 있습니다.
-
-- `logs/`
-- `reports/`
-- `state/momentum_scalp_daily_state.json`
-- `data/daily/`
-
-## 실계좌 전환 방식
-
-실계좌는 바로 풀사이즈로 돌리지 않습니다.
-
-1. `paper`에서 일일 성적표가 누적됩니다.
-2. `reports/real-trade-readiness.json`에서 gate를 계산합니다.
-3. gate 통과 전에는 `TRADING_MODE=real`이어도 자동 보류됩니다.
-4. 통과 후에도 `25% -> 50% -> 100%` 단계로만 승격됩니다.
-
-즉, 이 프로젝트의 기본 철학은 `paper에서 먼저 검증하고, 실계좌는 자동으로 보수적으로 제한`입니다.
-
-## 운영상 알고 계셔야 할 점
-
-- 현재 실전 철학은 `neutral보다 bull을 우선 수익 엔진으로 본다`에 가깝습니다.
-- `neutral` 장세는 보조 전략이며, 오전 초반에는 기본적으로 쉬게 되어 있습니다.
-- `bull_breakout_strategy`는 강한 날 `A급 leader`만 실전 진입하고, 일부 수익을 먼저 확정한 뒤 나머지를 끌고 갑니다.
-- `soft_bear`는 관망이 아니라 `인버스 전용`입니다.
-- 손실 직후에는 일부 후보가 `neutral_loss_cooldown`, `neutral_post_loss_quality_block`, `neutral_loss_limit_block`으로 거절될 수 있습니다.
-- 손실 후 쿨다운은 이제 시장 전체가 아니라 `종목별 + 전략별`로 분리되어 있습니다.
-- `neutral_loss_limit_block`으로 막힌 후보는 이제 그림자 추적으로 결과를 따로 남깁니다.
-- 장마감 직전에는 신규 진입을 막도록 되어 있습니다.
-- KIS API 제한 때문에 백테스트 데이터 다운로드 중 `초당 거래건수를 초과하였습니다`가 나올 수 있습니다.
-
-## 문서
-
-- [실투자 전환 체크리스트](docs/live-trading-checklist.md)
-- [카카오 알림 설정](docs/kakao-alert-setup.md)
-- [카카오 설정 체크리스트](docs/kakao-setup-checklist.md)
-
-## 참고 저장소
-
-`open-trading-api/`는 한국투자증권 샘플 레포를 참고용으로 클론해 둔 디렉터리입니다.  
-실제 자동매매 로직은 이 프로젝트의 `src/` 아래에 있습니다.
-
-## 면책
-
-이 프로젝트는 개인 연구 및 자동화 실험용입니다.  
-실제 투자 손실에 대한 책임은 사용자 본인에게 있습니다.
+핵심 계약은 실행가격 특성의 미래 데이터 차단, 만기별 비용 포함 EV, 고가 1주 구매 불가, 남은 손실 여유 수량, 일반주·인버스 동일 공식, 선택된 만기 청산, 부분체결 정산, 일일 목표와 하드스톱입니다.

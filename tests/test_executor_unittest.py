@@ -145,7 +145,11 @@ class OrderExecutorTests(unittest.TestCase):
         self.assertEqual(result.fill_mode, "order_result_pending")
         self.assertEqual(result.requested_reason, "expected_value")
         message = "\n".join(captured.output)
-        self.assertIn("주문 결과 미확정: buy 457370 MARKET 39주 @ 기준가 14,360원", message)
+        self.assertIn(
+            "주문 결과 미확정: buy 457370 MARKET 39주 @ 시장가 "
+            "(체결가 미확정, 신호가 14,360원",
+            message,
+        )
         self.assertIn("fill_mode=order_result_pending", message)
 
 

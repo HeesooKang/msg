@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -22,6 +23,7 @@ class TokenManager:
         self.config = config
         self._token: str = ""
         self._token_expired: datetime = datetime.min
+        self.last_token_issue_at: float = 0.0
         os.makedirs(TOKEN_DIR, exist_ok=True)
 
     @property
@@ -130,4 +132,5 @@ class TokenManager:
         self._token = data["access_token"]
         expired = data["access_token_token_expired"]
         self._save_token(self._token, expired)
+        self.last_token_issue_at = time.time()
         logger.info("토큰 발급 성공")

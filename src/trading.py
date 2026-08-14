@@ -22,12 +22,10 @@ class TradingAPI:
         return is_kis_rate_limited_message(message)
 
     def _rate_limit_backoff(self, attempt: int) -> float:
-        cooldown_fn = getattr(self.client, "rate_limit_cooldown_remaining", None)
-        if callable(cooldown_fn):
-            try:
-                return max(0.8, float(cooldown_fn()))
-            except Exception:
-                pass
+        try:
+            return max(0.8, float(self.client.rate_limit_cooldown_remaining()))
+        except Exception:
+            pass
         return 0.8 + (0.4 * max(0, attempt))
 
     @staticmethod
@@ -58,9 +56,8 @@ class TradingAPI:
     @staticmethod
     def _order_reference_price(order: Order) -> int:
         for value in (
-            getattr(order, "reference_price", 0),
-            getattr(order, "price", 0),
-            getattr(order, "protective_limit_price", 0),
+            order.reference_price,
+            order.price,
         ):
             price = TradingAPI._to_int(value)
             if price > 0:
@@ -69,9 +66,9 @@ class TradingAPI:
 
     @staticmethod
     def _order_requested_price_label(order: Order) -> str:
-        requested_price = TradingAPI._to_int(getattr(order, "price", 0))
+        requested_price = TradingAPI._to_int(order.price)
         reference_price = TradingAPI._order_reference_price(order)
-        if getattr(order, "order_type", None) == OrderType.MARKET and requested_price <= 0:
+        if order.order_type == OrderType.MARKET and requested_price <= 0:
             if reference_price > 0:
                 return f"기준가 {reference_price:,}원 (시장가)"
             return "시장가"
@@ -81,13 +78,13 @@ class TradingAPI:
 
     @staticmethod
     def _order_success_price_suffix(result: OrderResult) -> str:
-        fill_mode = str(getattr(result, "fill_mode", "") or "")
-        fill_price = TradingAPI._to_int(getattr(result, "price", 0))
-        reference_price = TradingAPI._to_int(getattr(result, "reference_price", 0))
-        filled_quantity = TradingAPI._to_int(getattr(result, "quantity", 0))
-        requested_quantity = TradingAPI._to_int(getattr(result, "requested_quantity", 0))
+        fill_mode = str(result.fill_mode or "")
+        fill_price = TradingAPI._to_int(result.price)
+        reference_price = TradingAPI._to_int(result.reference_price)
+        filled_quantity = TradingAPI._to_int(result.quantity)
+        requested_quantity = TradingAPI._to_int(result.requested_quantity)
         parts: List[str] = []
-        if fill_price > 0 and fill_mode not in {"pending", "market_pending", "limit_then_market_pending"}:
+        if fill_price > 0 and fill_mode not in {"pending", "market_pending"}:
             parts.append(f"체결가 {fill_price:,}원")
         else:
             parts.append("체결가 미확정")
@@ -98,31 +95,6 @@ class TradingAPI:
         if fill_mode:
             parts.append(f"fill_mode={fill_mode}")
         return f" ({', '.join(parts)})" if parts else ""
-
-    def _fallback_to_market_from_protective_limit(self, order: Order, *, requested_price: int) -> OrderResult:
-        market_order = Order(
-            symbol=order.symbol,
-            side=order.side,
-            order_type=OrderType.MARKET,
-            quantity=order.quantity,
-            price=0,
-            reference_price=max(
-                0,
-                int(getattr(order, "reference_price", 0) or 0),
-                int(requested_price or 0),
-            ),
-            protective_exit_mode="limit_then_market",
-            stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
-            requested_reason=order.requested_reason,
-        )
-        market_result = self._place_standard_order(market_order)
-        if market_result.success:
-            market_result.fill_mode = "market_after_limit_reject"
-            market_result.protective_exit_mode = "limit_then_market"
-            market_result.protective_fallback_used = True
-            market_result.requested_price = int(requested_price or 0)
-            market_result.reference_price = max(0, int(market_result.reference_price or 0), int(requested_price or 0))
-        return market_result
 
     def _blocked_account_order_result(self, order: Order) -> OrderResult:
         return OrderResult(
@@ -183,14 +155,20 @@ class TradingAPI:
             )
             return self._blocked_account_order_result(order)
         if (
-            order.side == OrderSide.SELL
-            and order.protective_exit_mode == "limit_then_market"
-            and order.protective_limit_price > 0
+            order.side == OrderSide.BUY
+            and order.order_type == OrderType.LIMIT
+            and order.requested_reason == "expected_value"
         ):
-            return self._place_protective_exit(order)
+            return self._place_expected_value_entry(order)
         return self._place_standard_order(order)
 
-    def _place_standard_order(self, order: Order, *, log_failure: bool = True) -> OrderResult:
+    def _place_standard_order(
+        self,
+        order: Order,
+        *,
+        log_failure: bool = True,
+        log_success: bool = True,
+    ) -> OrderResult:
         """단일 주문을 실행한다."""
         # TR ID: 매수 TTTC0012U, 매도 TTTC0011U (모의투자 시 자동 V 변환)
         if order.side == OrderSide.BUY:
@@ -257,21 +235,20 @@ class TradingAPI:
                 requested_price=order.price,
                 reference_price=reference_price,
                 fill_mode=fill_mode,
-                protective_exit_mode=order.protective_exit_mode,
-                stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
                 requested_reason=order.requested_reason,
                 requested_quantity=max(0, int(order.quantity or 0)),
             )
             requested_label = self._order_requested_price_label(order)
-            logger.info(
-                "주문 성공: %s %s %s %d주 @ %s%s",
-                order.side.value,
-                order.symbol,
-                order.order_type.name,
-                order.quantity,
-                requested_label,
-                self._order_success_price_suffix(result),
-            )
+            if log_success:
+                logger.info(
+                    "주문 성공: %s %s %s %d주 @ %s%s",
+                    order.side.value,
+                    order.symbol,
+                    order.order_type.name,
+                    order.quantity,
+                    requested_label,
+                    self._order_success_price_suffix(result),
+                )
         else:
             error_code = str(res.error_code or "")
             error_message = str(res.error_message or "")
@@ -296,175 +273,128 @@ class TradingAPI:
                     logger.error("주문 실패 [%s]: %s", order.symbol, result.message)
             if result.error_category == "account_order_unavailable":
                 self._account_order_blocked_message = result.message
-                cfg = getattr(self.client, "config", None)
-                account_number = str(getattr(cfg, "account_number", "") or "")
+                cfg = self.client.config
+                account_number = str(cfg.account_number or "")
                 if len(account_number) >= 2:
                     account_mask = f"{account_number[:2]}******"
                 else:
                     account_mask = "***"
                 logger.error(
                     "계좌/API 키 조합이 주문 불가 상태입니다. 이후 주문 제출을 중단합니다. mode=%s account=%s product=%s",
-                    getattr(cfg, "trading_mode", "unknown"),
+                    cfg.trading_mode,
                     account_mask,
-                    getattr(cfg, "account_product_code", ""),
+                    cfg.account_product_code,
                 )
 
         return result
 
-    def _place_protective_exit(self, order: Order) -> OrderResult:
-        """보호 손절은 지정가를 먼저 시도한 뒤 필요 시 시장가로 폴백한다."""
-        limit_order = Order(
-            symbol=order.symbol,
-            side=order.side,
-            order_type=OrderType.LIMIT,
-            quantity=order.quantity,
-            price=max(1, int(order.protective_limit_price or 0)),
-            reference_price=max(
-                1,
-                int(getattr(order, "reference_price", 0) or 0),
-                int(order.protective_limit_price or 0),
-            ),
-            protective_exit_mode="limit_then_market",
-            protective_limit_price=max(1, int(order.protective_limit_price or 0)),
-            protective_fallback_polls=max(1, int(order.protective_fallback_polls or 1)),
-            stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
-            requested_reason=order.requested_reason,
+    def _place_expected_value_entry(self, order: Order) -> OrderResult:
+        """EV 가격 상한까지만 체결하고 남은 매수 수량은 즉시 취소한다."""
+        limit_result = self._place_standard_order(
+            order,
+            log_failure=False,
+            log_success=False,
         )
-        limit_result = self._place_standard_order(limit_order, log_failure=False)
         if not limit_result.success:
-            if limit_result.error_category == "no_holding":
-                logger.warning("보호청산 지정가가 무보유 응답으로 종료됩니다: %s (%s)", order.symbol, limit_result.message)
-                return limit_result
             logger.warning(
-                "보호청산 지정가가 실패하여 시장가로 즉시 폴백합니다: %s (%s)",
+                "EV 제한가 매수 제출 실패: %s %d주 @ %d원 (%s)",
                 order.symbol,
+                int(order.quantity or 0),
+                int(order.price or 0),
                 limit_result.message,
             )
-            return self._fallback_to_market_from_protective_limit(
-                order,
-                requested_price=int(limit_order.price or 0),
-            )
+            return limit_result
 
-        filled_qty = max(0, int(limit_result.quantity or 0))
-        if filled_qty >= order.quantity:
+        requested_qty = max(0, int(order.quantity or 0))
+        filled_qty = min(requested_qty, max(0, int(limit_result.quantity or 0)))
+        if filled_qty >= requested_qty:
             limit_result.fill_mode = "limit"
+            logger.info(
+                "주문 성공: buy %s LIMIT %d주 @ %d원%s",
+                order.symbol,
+                requested_qty,
+                int(order.price or 0),
+                self._order_success_price_suffix(limit_result),
+            )
+            return limit_result
+        if not limit_result.order_no:
+            limit_result.fill_mode = "limit_pending"
             return limit_result
 
         cancel_result = self.cancel(
             limit_result.order_no,
-            quantity=max(0, order.quantity - filled_qty),
+            quantity=max(0, requested_qty - filled_qty),
             cancel_all=True,
+            log_result=False,
         )
-        if not cancel_result.success:
-            if self._cancel_implies_filled(cancel_result.message):
-                assumed_qty = order.quantity
-                assumed_price = max(1, int(limit_order.price or 0))
-                return OrderResult(
-                    success=True,
-                    order_no=limit_result.order_no,
-                    message=cancel_result.message,
-                    error_code=cancel_result.error_code,
-                    error_category=cancel_result.error_category,
-                    symbol=order.symbol,
-                    side=order.side,
-                    quantity=assumed_qty,
-                    price=assumed_price,
-                    requested_price=limit_order.price,
-                    reference_price=max(0, int(limit_order.reference_price or 0), int(limit_order.price or 0)),
-                    fill_mode="limit_assumed_filled",
-                    protective_exit_mode="limit_then_market",
-                    stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
-                    requested_reason=order.requested_reason,
-                    requested_quantity=max(0, int(order.quantity or 0)),
-                )
+        if not cancel_result.success and self._cancel_implies_filled(cancel_result.message):
+            late_qty, late_price = self._resolve_fill(order, limit_result.order_no)
+            resolved_qty = max(filled_qty, late_qty, requested_qty)
+            resolved_price = max(1, int(late_price or limit_result.price or order.price or 0))
+            logger.info(
+                "매수 체결: buy %s LIMIT %d주 @ 체결가 %d원 "
+                "(취소 시점 전량체결 확인)",
+                order.symbol,
+                resolved_qty,
+                resolved_price,
+            )
             return OrderResult(
-                success=False,
+                success=True,
                 order_no=limit_result.order_no,
-                message=f"보호손절 취소 실패: {cancel_result.message}",
-                error_code=cancel_result.error_code,
-                error_category=cancel_result.error_category or "cancel_failed",
+                message=cancel_result.message,
                 symbol=order.symbol,
                 side=order.side,
-                quantity=filled_qty,
-                price=limit_result.price,
-                requested_price=limit_order.price,
-                reference_price=max(0, int(limit_order.reference_price or 0), int(limit_order.price or 0)),
-                fill_mode="limit_cancel_failed",
-                protective_exit_mode="limit_then_market",
-                stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
+                quantity=resolved_qty,
+                price=resolved_price,
+                requested_price=int(order.price or 0),
+                reference_price=self._order_reference_price(order),
+                fill_mode="limit_assumed_filled",
                 requested_reason=order.requested_reason,
-                requested_quantity=max(0, int(order.quantity or 0)),
+                requested_quantity=requested_qty,
             )
-
-        remaining_qty = max(0, order.quantity - filled_qty)
-        if remaining_qty <= 0:
-            limit_result.fill_mode = "limit"
+        if not cancel_result.success:
+            logger.error(
+                "EV 제한가 매수 잔량 취소 실패: %s order_no=%s (%s)",
+                order.symbol,
+                limit_result.order_no,
+                cancel_result.message,
+            )
+            limit_result.fill_mode = (
+                "partial_fill_pending" if filled_qty > 0 else "limit_pending_cancel_failed"
+            )
             return limit_result
 
-        market_order = Order(
-            symbol=order.symbol,
-            side=order.side,
-            order_type=OrderType.MARKET,
-            quantity=remaining_qty,
-            price=0,
-            reference_price=max(0, int(limit_order.reference_price or 0), int(limit_order.price or 0)),
-            protective_exit_mode="limit_then_market",
-            stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
-            requested_reason=order.requested_reason,
-        )
-        market_result = self._place_standard_order(market_order)
-        if not market_result.success:
+        if filled_qty <= 0:
+            logger.info(
+                "매수 미체결 취소: buy %s LIMIT %d주 @ 주문가 %d원",
+                order.symbol,
+                requested_qty,
+                int(order.price or 0),
+            )
             return OrderResult(
                 success=False,
                 order_no=limit_result.order_no,
-                message=f"보호손절 시장가 폴백 실패: {market_result.message}",
-                error_code=market_result.error_code,
-                error_category=market_result.error_category,
+                message="EV 제한가 미체결 취소",
+                error_category="not_filled",
                 symbol=order.symbol,
                 side=order.side,
-                quantity=filled_qty,
-                price=limit_result.price,
-                requested_price=limit_order.price,
-                reference_price=max(0, int(limit_order.reference_price or 0), int(limit_order.price or 0)),
-                fill_mode="limit_then_market_failed",
-                protective_exit_mode="limit_then_market",
-                stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
+                requested_price=int(order.price or 0),
+                reference_price=self._order_reference_price(order),
+                fill_mode="limit_cancelled",
                 requested_reason=order.requested_reason,
-                requested_quantity=max(0, int(order.quantity or 0)),
+                requested_quantity=requested_qty,
             )
 
-        total_qty = filled_qty + max(0, int(market_result.quantity or 0))
-        weighted_price = 0
-        if total_qty > 0:
-            weighted_price = int(
-                round(
-                    (
-                        max(0, filled_qty) * max(0, int(limit_result.price or 0))
-                        + max(0, int(market_result.quantity or 0)) * max(0, int(market_result.price or 0))
-                    )
-                    / total_qty
-                )
-            )
-        fill_mode = "limit_then_market"
-        if total_qty < int(order.quantity or 0):
-            fill_mode = "limit_then_market_pending"
-        return OrderResult(
-            success=True,
-            order_no=market_result.order_no or limit_result.order_no,
-            message=market_result.message or limit_result.message,
-            symbol=order.symbol,
-            side=order.side,
-            quantity=total_qty,
-            price=weighted_price,
-            requested_price=limit_order.price,
-            reference_price=max(0, int(limit_order.reference_price or 0), int(limit_order.price or 0)),
-            fill_mode=fill_mode,
-            protective_exit_mode="limit_then_market",
-            protective_fallback_used=True,
-            stop_reference_amount_krw=max(0, int(order.stop_reference_amount_krw or 0)),
-            requested_reason=order.requested_reason,
-            requested_quantity=max(0, int(order.quantity or 0)),
+        limit_result.fill_mode = "limit_partial"
+        limit_result.message = "EV 제한가 부분체결 후 잔량 취소"
+        logger.info(
+            "매수 부분체결: buy %s LIMIT %d/%d주 @ 체결가 %d원 (잔량 취소)",
+            order.symbol,
+            filled_qty,
+            requested_qty,
+            int(limit_result.price or order.price or 0),
         )
+        return limit_result
 
     @staticmethod
     def _cancel_implies_filled(message: str) -> bool:
@@ -479,9 +409,8 @@ class TradingAPI:
         """
         if not order_no:
             return 0, 0
-        cfg = getattr(self.client, "config", None)
         if (
-            bool(getattr(cfg, "is_paper", False))
+            self.client.config.is_paper
             and order.side == OrderSide.SELL
             and order.order_type == OrderType.MARKET
         ):
@@ -495,7 +424,7 @@ class TradingAPI:
         start_date = datetime.now().strftime("%Y%m%d")
         side_code = "02" if order.side == OrderSide.BUY else "01"
 
-        attempts = 3 if order.order_type == OrderType.MARKET else max(1, int(order.protective_fallback_polls or 1))
+        attempts = 3 if order.order_type == OrderType.MARKET else 1
         self._fill_lookup_rate_limited = False
         # 체결내역 조회는 주문 API 한도와 경쟁하므로, 미반영이면 잔고 재동기화로 넘긴다.
         requested_quantity = max(0, int(order.quantity or 0))
@@ -559,7 +488,7 @@ class TradingAPI:
                 tr_cont=tr_cont,
             )
             if not res.success:
-                message = f"{getattr(res, 'error_code', '')} {getattr(res, 'error_message', '')} {getattr(res, 'data', {})}"
+                message = f"{res.error_code} {res.error_message} {res.data}"
                 if self._is_rate_limited_message(message):
                     self._fill_lookup_rate_limited = True
                 return None
@@ -569,10 +498,10 @@ class TradingAPI:
                 if row.get("odno", "") == order_no and row.get("pdno", "") == symbol:
                     return row
 
-            if not bool(getattr(res, "has_next", False)):
+            if not res.has_next:
                 return None
 
-            payload = getattr(res, "data", {}) or {}
+            payload = res.data or {}
             next_fk = str(payload.get("ctx_area_fk100", "") or "")
             next_nk = str(payload.get("ctx_area_nk100", "") or "")
             if not next_fk and not next_nk:
@@ -591,45 +520,13 @@ class TradingAPI:
         except (TypeError, ValueError):
             return 0
 
-    def buy(
-        self,
-        symbol: str,
-        quantity: int,
-        price: int = 0,
-        order_type: OrderType = OrderType.MARKET,
-    ) -> OrderResult:
-        """매수 주문을 넣는다."""
-        order = Order(
-            symbol=symbol,
-            side=OrderSide.BUY,
-            order_type=order_type,
-            quantity=quantity,
-            price=price,
-        )
-        return self.place_order(order)
-
-    def sell(
-        self,
-        symbol: str,
-        quantity: int,
-        price: int = 0,
-        order_type: OrderType = OrderType.MARKET,
-    ) -> OrderResult:
-        """매도 주문을 넣는다."""
-        order = Order(
-            symbol=symbol,
-            side=OrderSide.SELL,
-            order_type=order_type,
-            quantity=quantity,
-            price=price,
-        )
-        return self.place_order(order)
-
     def cancel(
         self,
         order_no: str,
         quantity: int = 0,
         cancel_all: bool = True,
+        *,
+        log_result: bool = True,
     ) -> OrderResult:
         """주문을 취소한다."""
         body = {
@@ -652,53 +549,12 @@ class TradingAPI:
         )
 
         if res.success:
-            logger.info("주문 취소 성공: %s", order_no)
+            if log_result:
+                logger.info("주문 취소 성공: %s", order_no)
             return OrderResult(success=True, order_no=order_no, message="취소 완료")
         else:
-            logger.error("주문 취소 실패 [%s]: %s", order_no, res.error_message)
-            return OrderResult(
-                success=False,
-                order_no=order_no,
-                message=res.error_message,
-                error_code=str(res.error_code or ""),
-                error_category=self._classify_order_failure(
-                    error_code=str(res.error_code or ""),
-                    message=str(res.error_message or ""),
-                ),
-            )
-
-    def modify(
-        self,
-        order_no: str,
-        quantity: int,
-        price: int,
-        order_type: OrderType = OrderType.LIMIT,
-    ) -> OrderResult:
-        """주문을 정정한다."""
-        body = {
-            "CANO": "",
-            "ACNT_PRDT_CD": "",
-            "KRX_FWDG_ORD_ORGNO": "",
-            "ORGN_ODNO": order_no,
-            "ORD_DVSN": order_type.value,
-            "RVSE_CNCL_DVSN_CD": "01",  # 정정
-            "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(price),
-            "QTY_ALL_ORD_YN": "N",
-            "EXCG_ID_DVSN_CD": "KRX",
-        }
-
-        res = self._post_with_rate_limit_retry(
-            api_url="/uapi/domestic-stock/v1/trading/order-rvsecncl",
-            tr_id="TTTC0013U",
-            body=body,
-        )
-
-        if res.success:
-            logger.info("주문 정정 성공: %s → %d주 @ %d", order_no, quantity, price)
-            return OrderResult(success=True, order_no=order_no, message="정정 완료")
-        else:
-            logger.error("주문 정정 실패 [%s]: %s", order_no, res.error_message)
+            if log_result:
+                logger.error("주문 취소 실패 [%s]: %s", order_no, res.error_message)
             return OrderResult(
                 success=False,
                 order_no=order_no,

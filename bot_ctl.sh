@@ -163,14 +163,13 @@ print_runtime_alignment() {
 }
 
 print_today_pnl() {
-    local today archive_log final_line realized_line legacy_line latest_line pnl balance ts line_ts latest_ts
+    local today archive_log final_line realized_line latest_line pnl balance ts line_ts latest_ts
     today=$(date +%F)
     archive_log="$HOME/msg/logs/$(date +%Y)/$(date +%m)/trading.log.$today"
     final_line=$(grep -h "^$today .*최종 잔고" "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
-    realized_line=$(grep -h "^$today .*누적순손익:" "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
-    legacy_line=$(grep -h "^$today .*누적: " "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
+    realized_line=$(grep -h "^$today .*매도 .* 확정: .*일실현=" "$TRADING_LOG" "$TRADING_LOG.$today" "$archive_log" 2>/dev/null | tail -1)
 
-    for line in "$final_line" "$realized_line" "$legacy_line"; do
+    for line in "$final_line" "$realized_line"; do
         [ -z "$line" ] && continue
         line_ts=$(echo "$line" | awk '{print $1" "$2}')
         if [ -z "$latest_line" ] || [[ "$line_ts" > "$latest_ts" ]]; then
@@ -182,8 +181,8 @@ print_today_pnl() {
     echo "=== 오늘 손익 ==="
     if [ -n "$latest_line" ] && echo "$latest_line" | grep -q "최종 잔고"; then
         ts=$(echo "$latest_line" | awk '{print $1" "$2}')
-        balance=$(echo "$latest_line" | awk -F'평가금액: | \\| 손익: ' '{print $2}')
-        pnl=$(echo "$latest_line" | awk -F'손익: ' '{print $2}')
+        balance=$(echo "$latest_line" | awk -F'평가금액: | \\| 금일 실현손익: ' '{print $2}')
+        pnl=$(echo "$latest_line" | awk -F'금일 실현손익: ' '{print $2}')
         echo "→ 최신 집계 시각: $ts"
         echo "→ 기준: 세션 종료 잔고 요약"
         echo "→ 평가금액: $balance"
@@ -191,20 +190,11 @@ print_today_pnl() {
         return
     fi
 
-    if [ -n "$latest_line" ] && echo "$latest_line" | grep -q "누적순손익:"; then
+    if [ -n "$latest_line" ] && echo "$latest_line" | grep -q "일실현="; then
         ts=$(echo "$latest_line" | awk '{print $1" "$2}')
-        pnl=$(echo "$latest_line" | sed -nE 's/.*누적순손익: ([^)]*).*/\1/p')
+        pnl=$(echo "$latest_line" | sed -nE 's/.*일실현=([+-]?[0-9,]+원).*/\1/p')
         echo "→ 최신 집계 시각: $ts"
-        echo "→ 기준: 최근 체결 누적순손익"
-        echo "→ 손익: $pnl"
-        return
-    fi
-
-    if [ -n "$latest_line" ] && echo "$latest_line" | grep -q "누적: "; then
-        ts=$(echo "$latest_line" | awk '{print $1" "$2}')
-        pnl=$(echo "$latest_line" | sed -nE 's/.*누적: ([^)]*).*/\1/p')
-        echo "→ 최신 집계 시각: $ts"
-        echo "→ 기준: 최근 체결 누적손익"
+        echo "→ 기준: 최근 확정 매도체결 누적순손익"
         echo "→ 손익: $pnl"
         return
     fi
@@ -223,7 +213,7 @@ print_today_pnl() {
 
 monitor_filtered_logs() {
     local pattern
-    pattern='전략 초기화|오늘 적용값 요약|신규 진입 차단 시간대|눌림목 필터|눌림목 대기|눌림목 이탈|눌림목 취소|매수 신호|추가매수 신호|매수 체결|매도 체결|익절|개별손절|추적손절|전역 리스크 쿨다운|시장반등 청산|시간초과 청산|일일 손실한도 도달|보조 손실컷 도달|장마감 임박|최종 잔고'
+    pattern='EV 전략 초기화|동적풀 갱신|틱 상태|EV 배치|EV 매수 선택|신규 진입 종료|매수 체결|매도 체결|계획 청산|당일 손실 하드스탑|당일 목표 달성|최종 잔고|트레이딩 세션'
 
     if command -v rg >/dev/null 2>&1; then
         tail -f "$TRADING_LOG" 2>/dev/null | rg --line-buffered -e "$pattern"

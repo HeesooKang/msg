@@ -26,15 +26,16 @@
 먼저 반드시 읽을 것:
 - `AGENTS.md`
 - `docs/refactor_audit.md`
+- `src/scheduler.py`
+- `src/market_stream.py`
 - `src/strategies/momentum_scalp.py`
 - `src/strategies/momentum_scalp_types.py`
-- `src/strategies/momentum_scalp_exit.py`
 - `src/strategies/momentum_scalp_pnl.py`
 - `src/analytics/price_prediction.py`
 - `src/analytics/forecast_outcomes.py`
-- 관련 테스트: `tests/test_risk_controls_unittest.py`, `tests/test_momentum_scalp_refactor_unittest.py`
+- 관련 테스트: `tests/test_risk_controls_unittest.py`, `tests/test_price_prediction_unittest.py`, `tests/test_execution_policy_replay_unittest.py`
 
-현재 런타임에서 import하지 않는 `momentum_scalp_entry.py`, `momentum_scalp_entry_filters.py`, `momentum_scalp_entry_overrides.py`, `momentum_scalp_conviction.py`의 레거시 경로를 다시 연결하지 마십시오.
+삭제된 entry/filter/override/conviction/regime/micro/exit 라우트 모듈을 다시 만들거나 연결하지 마십시오.
 
 읽은 뒤 먼저 요약하십시오:
 1. 현재 롱 진입 호출 흐름
@@ -45,22 +46,24 @@
 
 목표 구조:
 - 후보 생성/랭킹은 유지합니다.
+- 종목 특성은 틱당 한 번만 계산하고 동일 입력으로 30·60·120·180초 실행 순손익을 평가합니다.
+- 각 만기는 확정된 비용 포함 순수익을 동일한 ridge 공식으로 학습하며 시간대별 모델이나 라우트를 만들지 않습니다.
+- 시장 레짐, confidence, 별도 승률 모델을 추가하지 마십시오.
 - 최종 롱 매수 판단은 단일 함수로 통합합니다.
-  - 예: `_build_expected_value_trade_plan(quote, context, pending_orders)`
-- 이 함수가 수량, 기대 순손익, 예측 순손익, 하단 순손익, 승률, 목표 순익, 손절 순손실을 한 번에 결정합니다.
+  - 현재 함수: `_build_trade_plan(quote, prediction, now)`
+- 이 함수가 수량, 실행가격 기대 순손익, 하단 순손익, 계획 위험과 예측 만료를 한 번에 결정합니다.
 - EV 계산은 비용 포함 순손익 기준으로 통일합니다.
-- 수량은 1주부터 가능한 최대 수량까지 평가해서, 남은 일일 손실 여유 안에서 EV가 가장 큰 수량을 선택합니다.
-- `expected_net > 0`, `predicted_net > 0`, `prediction ready`, `planned_stop_net <= remaining_daily_loss_room`이면 진입을 허용합니다.
+- 수량은 자본 한도와 남은 일일 손실 여유를 이용해 직접 계산합니다.
+- `expected_net > 0`, `prediction ready`, `committed_risk <= remaining_daily_loss_room`이면 진입을 허용합니다.
 - `min_expected_net_profit`이나 “남은 일일 목표를 한 번에 채워야 함” 같은 기준으로 진입을 막지 마십시오.
-- 청산은 `planned_target_net_pnl`과 `planned_stop_net_loss_abs`를 우선합니다.
-- 손절성 청산은 반등 예측 가드 없이 즉시 실행합니다.
+- 청산은 당일 -5,000원 하드스톱과 EV가 선택한 30·60·120·180초 만료만 사용합니다.
 - 인버스 ETF를 위한 별도 gate/route/switch를 만들지 말고 일반 종목과 같은 예측/EV 경로로 평가하십시오.
 
 완료 기준:
 - 롱 라이브 진입 경로에서 기존 복잡한 gate 체인이 최종 판단을 하지 않습니다.
 - 양수 EV의 작은 기대수익 거래가 허용됩니다.
 - 하루 손실 제한 -5,000원을 넘길 수 있는 거래는 수량 축소 또는 거부됩니다.
-- 진입 메타와 포지션 상태에 planned target/stop/EV가 기록됩니다.
+- 진입 메타와 포지션 상태에 실행가격 EV, 계획 위험과 만료시각이 기록됩니다.
 - 관련 단위 테스트를 추가/수정하고, `venv/bin/python -m unittest discover tests`가 통과해야 합니다.
 
 작업 중 길을 잃었다고 판단되면 즉시 이 프롬프트의 “핵심 목표 / 절대 금지 / 목표 구조 / 완료 기준”으로 되돌아가십시오.

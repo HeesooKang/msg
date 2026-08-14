@@ -23,32 +23,71 @@ class _SequenceDateTime(datetime):
         return cls.last
 
 
+def strategy_stub(**values):
+    defaults = {
+        "positions": {},
+        "config": SimpleNamespace(
+            quote_freshness_seconds=5,
+            static_watchlist=[],
+            inverse_etfs=[],
+            pending_order_block_seconds=180,
+            dynamic_pool_quote_min_change_rate=0.0,
+            dynamic_pool_ranking_fetch_count=60,
+            pool_refresh_interval=120,
+        ),
+        "fixed_pool": [],
+        "_pool": [],
+        "_last_evaluation_count": 0,
+        "_pending_entry_meta": {},
+        "_pending_sell_fills": {},
+        "_sell_fill_ledger": [],
+        "daily_pnl": SimpleNamespace(
+            realized_net_pnl=0,
+            trade_count=0,
+            win_count=0,
+            loss_count=0,
+        ),
+        "set_simulated_now": Mock(),
+        "should_continue": Mock(return_value=True),
+        "sync_positions_from_account": Mock(),
+        "reconcile_pending_fills_from_account": Mock(return_value=[]),
+        "reconcile_no_holding_sell_failures_from_account": Mock(return_value=[]),
+        "confirm_reconciled_sell_fills": Mock(return_value=[]),
+    }
+    defaults.update(values)
+    return SimpleNamespace(**defaults)
+
+
 class SchedulerTimingTests(unittest.TestCase):
     def setUp(self):
         self.scheduler = TradingScheduler.__new__(TradingScheduler)
         self.scheduler.config = SimpleNamespace(off_hours_check_interval=1800, is_paper=True, trading_mode="paper")
         self.scheduler._shutdown = False
-        self.scheduler._exit_priority_until = None
-        self.scheduler._last_exit_priority_log_at = None
         self.scheduler._last_rate_limit_watchlist_log_at = None
         self.scheduler.client = SimpleNamespace(rate_limit_cooldown_remaining=lambda: 0.0)
+        self.scheduler.account = Mock()
         self.scheduler.market_data = SimpleNamespace(
             multi_price_backoff_remaining=lambda: 0.0,
-            quote_cache_age_seconds=lambda symbol: None,
-            get_fluctuation_ranking=lambda **kwargs: [],
-            get_market_cap_ranking=lambda **kwargs: [],
+            get_fluctuation_symbols=lambda **kwargs: [],
             get_multi_price=lambda symbols: [],
-            get_cached_quotes=lambda symbols, ttl_seconds: [],
         )
-        self.scheduler.strategy = SimpleNamespace(positions={})
+        self.scheduler.strategy = strategy_stub()
+        self.scheduler._quote_stream = Mock()
+        self.scheduler._quote_stream.stale_symbols.return_value = []
+        self.scheduler._quote_stream.drain_quotes.return_value = []
         self.scheduler._alerts = Mock()
         self.scheduler._last_halt_alert_day = None
-        self.scheduler._watchlist_rotation_cursor = 0
+        self.scheduler._last_loop_error_alert_at = None
         self.scheduler._last_runtime_pool_refresh_at = None
         self.scheduler._session_started_at = None
-        self.scheduler._last_cached_quote_fallback_log_at = None
-        self.scheduler._last_empty_quote_batch_log_at = None
+        self.scheduler._market_closed_session_date = None
+        self.scheduler._account_order_blocked_session_date = None
+        self.scheduler._last_stream_stale_log_at = None
+        self.scheduler._last_emergency_position_refresh_at = None
+        self.scheduler._last_supplemental_quote_refresh_at = None
         self.scheduler._last_tick_activity_log_at = None
+        self.scheduler._last_pending_entry_reconcile_at = None
+        self.scheduler._last_pending_exit_reconcile_at = None
         self.scheduler._pending_order_blocks = {}
 
     def test_session_start_balance_delay_uses_paper_buffer(self):
@@ -111,6 +150,51 @@ class SchedulerTimingTests(unittest.TestCase):
 
         self.assertEqual(symbols, ["006220"])
         self.assertEqual(other_symbols, [])
+
+    def test_pending_exit_is_reconciled_again_on_following_tick(self):
+        now = datetime(2026, 7, 28, 12, 54, 50)
+        position = SimpleNamespace(
+            symbol="463020",
+            pending_exit_started_at=now - timedelta(seconds=15),
+            pending_exit_quantity=91,
+        )
+        sync_positions = Mock()
+        self.scheduler.strategy = strategy_stub(
+            positions={"463020": position},
+            sync_positions_from_account=sync_positions,
+        )
+        balance = SimpleNamespace(positions=[])
+        self.scheduler._fetch_balance_with_retry = Mock(return_value=balance)
+        self.scheduler._confirm_reconciled_sell_prices = Mock()
+
+        reconciled = self.scheduler._reconcile_pending_exit_positions()
+
+        self.assertTrue(reconciled)
+        self.scheduler._fetch_balance_with_retry.assert_called_once_with(
+            "pending 매도 잔고 확인",
+            max_attempts=1,
+            base_delay_seconds=1,
+        )
+        sync_positions.assert_called_once_with([])
+        self.scheduler._confirm_reconciled_sell_prices.assert_called_once_with()
+
+    def test_orphan_pending_sell_is_reconciled_after_position_disappears(self):
+        sync_positions = Mock()
+        self.scheduler.strategy = strategy_stub(
+            positions={},
+            _pending_sell_fills={"463020": {"requested_quantity": 91}},
+            sync_positions_from_account=sync_positions,
+        )
+        self.scheduler._fetch_balance_with_retry = Mock(
+            return_value=SimpleNamespace(positions=[])
+        )
+        self.scheduler._confirm_reconciled_sell_prices = Mock()
+
+        reconciled = self.scheduler._reconcile_pending_exit_positions()
+
+        self.assertTrue(reconciled)
+        sync_positions.assert_called_once_with([])
+        self.scheduler._confirm_reconciled_sell_prices.assert_called_once_with()
 
     def test_confirmed_reconcile_clears_pending_order_block(self):
         now = datetime(2026, 5, 27, 13, 40, 23)
@@ -278,7 +362,7 @@ class SchedulerTimingTests(unittest.TestCase):
 
     def test_run_trading_session_does_not_send_kakao_alert_for_intraday_network_error(self):
         self.scheduler.market_data = SimpleNamespace(is_market_open=lambda: True)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             initialize=lambda: None,
             get_watchlist=lambda: ["005930"],
             sync_positions_from_account=lambda positions: None,
@@ -312,7 +396,7 @@ class SchedulerTimingTests(unittest.TestCase):
     def test_run_trading_session_resumes_after_confirmed_pnl_releases_strategy_halt(self):
         runtime = {"continue": False}
         self.scheduler.market_data = SimpleNamespace(is_market_open=lambda: True)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             initialize=lambda: None,
             get_watchlist=lambda: ["067310"],
             sync_positions_from_account=lambda positions: None,
@@ -345,7 +429,7 @@ class SchedulerTimingTests(unittest.TestCase):
     def test_run_trading_session_fetches_balance_before_runtime_pool_refresh(self):
         order = []
         self.scheduler.market_data = SimpleNamespace(is_market_open=lambda: True)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             initialize=lambda: order.append("initialize"),
             get_watchlist=lambda: order.append("watchlist") or ["005930"],
             sync_positions_from_account=lambda positions: order.append("sync"),
@@ -376,7 +460,7 @@ class SchedulerTimingTests(unittest.TestCase):
     def test_run_trading_session_clears_stale_strategy_simulated_time_before_initialize(self):
         order = []
         self.scheduler.market_data = SimpleNamespace(is_market_open=lambda: True)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             set_simulated_now=lambda now: order.append(("set_simulated_now", now)),
             initialize=lambda: order.append("initialize"),
             get_watchlist=lambda: ["005930"],
@@ -407,10 +491,10 @@ class SchedulerTimingTests(unittest.TestCase):
         self.assertEqual(order[0], ("set_simulated_now", None))
         self.assertEqual(order[1], "initialize")
 
-    def test_run_trading_session_skips_force_runtime_pool_refresh_when_state_snapshot_exists(self):
+    def test_run_trading_session_forces_runtime_pool_refresh_when_state_snapshot_exists(self):
         self.scheduler.market_data = SimpleNamespace(is_market_open=lambda: True)
         refresh_runtime_pool = Mock(return_value=False)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             initialize=lambda: None,
             get_watchlist=lambda: ["005930"],
             sync_positions_from_account=lambda positions: None,
@@ -437,13 +521,13 @@ class SchedulerTimingTests(unittest.TestCase):
         halted = self.scheduler._run_trading_session(10)
 
         self.assertFalse(halted)
-        self.assertFalse(refresh_runtime_pool.call_args.kwargs["force"])
+        self.assertTrue(refresh_runtime_pool.call_args.kwargs["force"])
 
-    def test_log_tick_activity_prefers_strategy_shortlist_symbols(self):
+    def test_log_tick_activity_reports_single_route_evaluation_count(self):
         now = datetime(2026, 4, 15, 9, 9, 0)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
-            _last_long_shortlist_symbols=["046970"],
+            _last_evaluation_count=1,
         )
         self.scheduler._last_tick_activity_log_at = None
 
@@ -525,269 +609,99 @@ class SchedulerTimingTests(unittest.TestCase):
 
         self.assertEqual(sleep_calls, [1800, 300])
 
-    def test_effective_watchlist_uses_held_symbols_during_exit_priority(self):
-        now = datetime(2026, 4, 7, 12, 0, 0)
-        self.scheduler.strategy = SimpleNamespace(positions={"0010F0": object(), "066970": object()})
-        self.scheduler._exit_priority_until = now.replace(second=30)
-
-        watchlist = self.scheduler._effective_watchlist(["005930", "000660", "0010F0"], now)
-
-        self.assertEqual(watchlist, ["0010F0", "066970"])
-
-    def test_effective_watchlist_skips_new_entries_during_rate_limit_cooldown_without_positions(self):
-        now = datetime(2026, 4, 7, 12, 0, 0)
-        self.scheduler.client = SimpleNamespace(rate_limit_cooldown_remaining=lambda: 1.8)
-        self.scheduler.strategy = SimpleNamespace(positions={})
-        watchlist = [f"{i:06d}" for i in range(30)]
-
-        limited = self.scheduler._effective_watchlist(watchlist, now)
-
-        self.assertEqual(limited, [])
-
-    def test_effective_watchlist_keeps_new_entries_during_multi_price_backoff(self):
-        now = datetime(2026, 4, 7, 12, 0, 0)
-        self.scheduler.market_data = SimpleNamespace(multi_price_backoff_remaining=lambda: 12.0)
-        self.scheduler.strategy = SimpleNamespace(positions={})
-
-        limited = self.scheduler._effective_watchlist(["005930", "000660"], now)
-
-        self.assertEqual(limited, ["005930", "000660"])
-
-    def test_effective_watchlist_uses_held_symbols_during_multi_price_backoff(self):
-        now = datetime(2026, 4, 7, 12, 0, 0)
-        self.scheduler.market_data = SimpleNamespace(multi_price_backoff_remaining=lambda: 12.0)
-        self.scheduler.strategy = SimpleNamespace(positions={"005930": object(), "000660": object()})
-
-        limited = self.scheduler._effective_watchlist(["005930", "000660", "051910"], now)
-
-        self.assertEqual(limited, ["005930", "000660"])
-
-    def test_build_quote_refresh_batch_caps_full_watchlist_to_single_chunk(self):
-        now = datetime(2026, 4, 7, 10, 0, 0)
-        self.scheduler.strategy = SimpleNamespace(positions={})
-        watchlist = [f"{i:06d}" for i in range(30)]
-
-        batch = self.scheduler._build_quote_refresh_batch(watchlist, now)
-
-        self.assertEqual(len(batch), 12)
-        self.assertEqual(batch, watchlist[:12])
-
-    def test_build_quote_refresh_batch_uses_smaller_budget_during_session_warmup(self):
-        now = datetime(2026, 4, 7, 10, 0, 20)
-        self.scheduler.strategy = SimpleNamespace(positions={})
-        self.scheduler._session_started_at = datetime(2026, 4, 7, 10, 0, 0)
-        watchlist = [f"{i:06d}" for i in range(30)]
-
-        batch = self.scheduler._build_quote_refresh_batch(watchlist, now)
-
-        self.assertEqual(len(batch), 6)
-        self.assertEqual(batch, watchlist[:6])
-
-    def test_build_quote_refresh_batch_uses_larger_budget_during_opening_fast_warmup(self):
-        now = datetime(2026, 4, 7, 9, 0, 20)
-        self.scheduler.strategy = SimpleNamespace(
-            positions={},
-            config=SimpleNamespace(
-                opening_fast_window_minutes=3,
-                opening_fast_quote_warmup_seconds=2.0,
-                opening_fast_initial_quote_budget=14,
-            ),
-        )
-        self.scheduler._session_started_at = datetime(2026, 4, 7, 9, 0, 0)
-        watchlist = [f"{i:06d}" for i in range(30)]
-
-        batch = self.scheduler._build_quote_refresh_batch(watchlist, now)
-
-        self.assertEqual(len(batch), 14)
-        self.assertEqual(batch, watchlist[:14])
-
-    def test_build_quote_refresh_batch_keeps_tiny_opening_start_buffer(self):
-        now = datetime(2026, 4, 7, 9, 0, 1)
-        self.scheduler.strategy = SimpleNamespace(
-            positions={},
-            config=SimpleNamespace(
-                opening_fast_window_minutes=3,
-                opening_fast_quote_warmup_seconds=2.0,
-                opening_fast_initial_quote_budget=14,
-            ),
-        )
-        self.scheduler._session_started_at = datetime(2026, 4, 7, 9, 0, 0)
-        watchlist = [f"{i:06d}" for i in range(30)]
-
-        batch = self.scheduler._build_quote_refresh_batch(watchlist, now)
-
-        self.assertEqual(batch, [])
-
-    def test_build_quote_refresh_batch_includes_positions_and_hot_symbols_first(self):
-        now = datetime(2026, 4, 7, 9, 2, 0)
-        self.scheduler.strategy = SimpleNamespace(
-            positions={"005930": object(), "000660": object()},
-            _latest_opening_fast_symbols={"051910"},
-            _latest_opening_hot_symbols={"035420"},
-            _latest_math_queue_symbols=["005490", "012330"],
-            _latest_math_backfill_symbols=["034730"],
-        )
-        watchlist = ["005930", "000660", "051910", "035420", "005490", "012330", "034730", "003550"]
-
-        batch = self.scheduler._build_quote_refresh_batch(watchlist, now)
-
-        self.assertEqual(batch[:2], ["005930", "000660"])
-        self.assertIn("051910", batch)
-        self.assertIn("035420", batch)
-        self.assertLessEqual(len(batch), 14)
-
-    def test_build_quote_refresh_batch_rotates_background_symbols(self):
-        now = datetime(2026, 4, 7, 10, 0, 0)
-        self.scheduler.strategy = SimpleNamespace(positions={})
-        watchlist = [f"{i:06d}" for i in range(20)]
-
-        first = self.scheduler._build_quote_refresh_batch(watchlist, now)
-        second = self.scheduler._build_quote_refresh_batch(watchlist, now)
-
-        self.assertEqual(first[:4], watchlist[:4])
-        self.assertEqual(second[:4], watchlist[12:16])
-        self.assertNotEqual(first, second)
-
-    def test_refresh_runtime_pool_if_needed_uses_fluctuation_ranking_for_discovery(self):
+    def test_refresh_runtime_pool_if_needed_uses_fluctuation_symbols_for_discovery(self):
         now = datetime(2026, 4, 7, 9, 2, 0)
         update_runtime_pool = Mock()
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
-            pool_override=[],
+            fixed_pool=[],
             config=SimpleNamespace(
-                opening_candidate_window_minutes=20,
-                opening_fast_window_minutes=3,
-                opening_fast_fetch_count=80,
-                opening_candidate_fetch_count=60,
                 dynamic_pool_ranking_fetch_count=30,
-                dynamic_pool_size=15,
                 dynamic_pool_quote_min_change_rate=0.8,
-                max_change_rate=10.0,
-                min_price=5000,
-                min_volume=180000,
                 pool_refresh_interval=300,
             ),
             update_runtime_pool=update_runtime_pool,
         )
         self.scheduler.market_data = Mock()
-        self.scheduler.market_data.get_fluctuation_ranking.return_value = [
-            SimpleNamespace(symbol="009150"),
-            SimpleNamespace(symbol="000660"),
+        self.scheduler.market_data.get_fluctuation_symbols.return_value = [
+            "009150",
+            "000660",
         ]
-        self.scheduler.market_data.get_market_cap_ranking.return_value = []
 
         self.scheduler._refresh_runtime_pool_if_needed(now)
 
-        self.scheduler.market_data.get_fluctuation_ranking.assert_called_once()
+        self.scheduler.market_data.get_fluctuation_symbols.assert_called_once()
         update_runtime_pool.assert_called_once_with(["009150", "000660"])
 
-    def test_refresh_runtime_pool_if_needed_relaxes_filters_during_opening_fast(self):
+    def test_refresh_runtime_pool_uses_same_discovery_policy_at_market_open(self):
         now = datetime(2026, 4, 7, 9, 0, 3)
         update_runtime_pool = Mock()
         self.scheduler._session_started_at = datetime(2026, 4, 7, 9, 0, 0)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
-            pool_override=[],
+            fixed_pool=[],
             config=SimpleNamespace(
-                opening_candidate_window_minutes=20,
-                opening_fast_window_minutes=3,
-                opening_fast_fetch_count=80,
-                opening_candidate_fetch_count=60,
-                opening_fast_pool_warmup_seconds=2.0,
-                opening_fast_pool_refresh_interval_seconds=20,
-                opening_fast_min_change_rate=0.2,
-                opening_fast_min_volume=30_000,
                 dynamic_pool_ranking_fetch_count=30,
-                dynamic_pool_size=15,
                 dynamic_pool_quote_min_change_rate=0.8,
-                max_change_rate=10.0,
-                min_price=5000,
-                min_volume=180000,
                 pool_refresh_interval=300,
             ),
             update_runtime_pool=update_runtime_pool,
         )
         self.scheduler.market_data = Mock()
-        self.scheduler.market_data.get_fluctuation_ranking.return_value = [
-            SimpleNamespace(symbol="009150"),
-            SimpleNamespace(symbol="000660"),
+        self.scheduler.market_data.get_fluctuation_symbols.return_value = [
+            "009150",
+            "000660",
         ]
-        self.scheduler.market_data.get_market_cap_ranking.return_value = []
 
         self.scheduler._refresh_runtime_pool_if_needed(now)
 
-        self.scheduler.market_data.get_fluctuation_ranking.assert_called_once_with(
-            count=80,
-            min_change_rate=0.2,
-            max_change_rate=30.0,
-            min_price=0,
-            min_volume=0,
+        self.scheduler.market_data.get_fluctuation_symbols.assert_called_once_with(
+            count=30,
+            min_change_rate=0.8,
         )
         update_runtime_pool.assert_called_once_with(["009150", "000660"])
 
     def test_refresh_runtime_pool_if_needed_keeps_existing_pool_when_fluctuation_empty(self):
         now = datetime(2026, 4, 7, 10, 0, 0)
         update_runtime_pool = Mock()
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
-            pool_override=[],
+            fixed_pool=[],
             config=SimpleNamespace(
-                opening_candidate_window_minutes=20,
-                opening_fast_window_minutes=3,
-                opening_fast_fetch_count=80,
-                opening_candidate_fetch_count=60,
                 dynamic_pool_ranking_fetch_count=30,
-                dynamic_pool_size=15,
                 dynamic_pool_quote_min_change_rate=0.8,
-                max_change_rate=10.0,
-                min_price=5000,
-                min_volume=180000,
                 pool_refresh_interval=300,
             ),
             update_runtime_pool=update_runtime_pool,
         )
         self.scheduler.market_data = Mock()
-        self.scheduler.market_data.get_fluctuation_ranking.return_value = []
-        self.scheduler.market_data.get_market_cap_ranking.return_value = [
-            SimpleNamespace(symbol="005930"),
-            SimpleNamespace(symbol="373220"),
-        ]
+        self.scheduler.market_data.get_fluctuation_symbols.return_value = []
 
         refreshed = self.scheduler._refresh_runtime_pool_if_needed(now)
 
         self.assertFalse(refreshed)
-        self.scheduler.market_data.get_market_cap_ranking.assert_not_called()
         update_runtime_pool.assert_not_called()
         self.assertEqual(self.scheduler._last_runtime_pool_refresh_at, now)
 
-    def test_refresh_runtime_pool_if_needed_force_bypasses_warmup_gate(self):
+    def test_refresh_runtime_pool_if_needed_force_refreshes_during_warmup(self):
         now = datetime(2026, 4, 7, 10, 0, 5)
         update_runtime_pool = Mock()
         self.scheduler._session_started_at = datetime(2026, 4, 7, 10, 0, 0)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
-            pool_override=[],
+            fixed_pool=[],
             config=SimpleNamespace(
-                opening_candidate_window_minutes=20,
-                opening_fast_window_minutes=3,
-                opening_fast_fetch_count=80,
-                opening_candidate_fetch_count=60,
                 dynamic_pool_ranking_fetch_count=30,
-                dynamic_pool_size=15,
                 dynamic_pool_quote_min_change_rate=0.8,
-                max_change_rate=10.0,
-                min_price=5000,
-                min_volume=180000,
                 pool_refresh_interval=300,
             ),
             update_runtime_pool=update_runtime_pool,
         )
         self.scheduler.market_data = Mock()
-        self.scheduler.market_data.get_fluctuation_ranking.return_value = [
-            SimpleNamespace(symbol="009150"),
-            SimpleNamespace(symbol="000660"),
+        self.scheduler.market_data.get_fluctuation_symbols.return_value = [
+            "009150",
+            "000660",
         ]
-        self.scheduler.market_data.get_market_cap_ranking.return_value = []
 
         self.scheduler._refresh_runtime_pool_if_needed(now, force=True)
 
@@ -797,20 +711,12 @@ class SchedulerTimingTests(unittest.TestCase):
         now = datetime(2026, 4, 7, 10, 0, 0)
         update_runtime_pool = Mock()
         self.scheduler.client = SimpleNamespace(rate_limit_cooldown_remaining=lambda: 1.0)
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
-            pool_override=[],
+            fixed_pool=[],
             config=SimpleNamespace(
-                opening_candidate_window_minutes=20,
-                opening_fast_window_minutes=3,
-                opening_fast_fetch_count=80,
-                opening_candidate_fetch_count=60,
                 dynamic_pool_ranking_fetch_count=30,
-                dynamic_pool_size=15,
                 dynamic_pool_quote_min_change_rate=0.8,
-                max_change_rate=10.0,
-                min_price=5000,
-                min_volume=180000,
                 pool_refresh_interval=300,
             ),
             update_runtime_pool=update_runtime_pool,
@@ -819,33 +725,24 @@ class SchedulerTimingTests(unittest.TestCase):
 
         self.scheduler._refresh_runtime_pool_if_needed(now)
 
-        self.scheduler.market_data.get_fluctuation_ranking.assert_not_called()
+        self.scheduler.market_data.get_fluctuation_symbols.assert_not_called()
         update_runtime_pool.assert_not_called()
 
-    def test_refresh_runtime_pool_if_needed_skips_market_cap_fallback_when_fluctuation_rate_limited(self):
+    def test_refresh_runtime_pool_if_needed_skips_discovery_while_rate_limited(self):
         now = datetime(2026, 4, 7, 10, 0, 0)
         update_runtime_pool = Mock()
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
-            pool_override=[],
+            fixed_pool=[],
             config=SimpleNamespace(
-                opening_candidate_window_minutes=20,
-                opening_fast_window_minutes=3,
-                opening_fast_fetch_count=80,
-                opening_candidate_fetch_count=60,
                 dynamic_pool_ranking_fetch_count=30,
-                dynamic_pool_size=15,
                 dynamic_pool_quote_min_change_rate=0.8,
-                max_change_rate=10.0,
-                min_price=5000,
-                min_volume=180000,
                 pool_refresh_interval=300,
             ),
             update_runtime_pool=update_runtime_pool,
         )
         self.scheduler.market_data = SimpleNamespace(
-            get_fluctuation_ranking=lambda **kwargs: [],
-            get_market_cap_ranking=Mock(),
+            get_fluctuation_symbols=Mock(),
             fluctuation_backoff_remaining=lambda: 25.0,
             multi_price_backoff_remaining=lambda: 0.0,
         )
@@ -853,43 +750,75 @@ class SchedulerTimingTests(unittest.TestCase):
         refreshed = self.scheduler._refresh_runtime_pool_if_needed(now)
 
         self.assertFalse(refreshed)
-        self.scheduler.market_data.get_market_cap_ranking.assert_not_called()
+        self.scheduler.market_data.get_fluctuation_symbols.assert_not_called()
         update_runtime_pool.assert_not_called()
 
-    def test_load_quotes_for_refresh_batch_uses_cached_quotes_when_live_fetch_fails(self):
-        cached_quote = SimpleNamespace(symbol="005930")
-        self.scheduler.market_data = SimpleNamespace(
-            get_multi_price=lambda symbols: [],
-            get_cached_quotes=lambda symbols, ttl_seconds: [cached_quote],
+    def test_emergency_rest_quotes_are_positions_only_when_stream_is_stale(self):
+        now = datetime(2026, 4, 7, 10, 0, 1)
+        held_quote = SimpleNamespace(symbol="005930")
+        self.scheduler.strategy.positions = {"005930": object()}
+        self.scheduler._quote_stream.stale_symbols.return_value = ["005930"]
+        self.scheduler.market_data.get_multi_price = Mock(return_value=[held_quote])
+
+        quotes = self.scheduler._emergency_position_quotes(now)
+
+        self.assertEqual(quotes, [held_quote])
+        self.scheduler.market_data.get_multi_price.assert_called_once_with(
+            ["005930"],
         )
 
-        quotes = self.scheduler._load_quotes_for_refresh_batch(["005930"], datetime(2026, 4, 7, 10, 0, 0))
-
-        self.assertEqual(quotes, [cached_quote])
-
-    def test_update_exit_priority_from_results_marks_sell_rate_limit(self):
-        now = datetime(2026, 4, 7, 12, 0, 0)
-        result = SimpleNamespace(
-            success=False,
-            side=OrderSide.SELL,
-            message='{"rt_cd":"1","msg1":"초당 거래건수를 초과하였습니다.","message":"EGW00201"}',
+    def test_stream_priority_keeps_positions_and_dynamic_movers_first(self):
+        self.scheduler.strategy = strategy_stub(
+            positions={"005930": object()},
+            _pool=["001210", "004410"],
+            config=SimpleNamespace(
+                inverse_etfs=["114800"],
+                static_watchlist=["005930", "000660"],
+            ),
         )
 
-        self.scheduler._update_exit_priority_from_results([result], now)
+        symbols = self.scheduler._prioritized_stream_symbols(
+            ["000660", "035420"]
+        )
 
-        self.assertIsNotNone(self.scheduler._exit_priority_until)
-        self.assertGreater(self.scheduler._exit_priority_until, now)
+        self.assertEqual(
+            symbols,
+            ["005930", "001210", "004410", "114800", "000660", "035420"],
+        )
+
+    def test_supplemental_quotes_cover_stale_and_unsubscribed_symbols_once_per_interval(self):
+        now = datetime(2026, 8, 5, 10, 0, 0)
+        quote = SimpleNamespace(symbol="001210")
+        self.scheduler._quote_stream.stale_symbols.return_value = ["001210"]
+        self.scheduler.market_data.get_multi_price = Mock(return_value=[quote])
+
+        first = self.scheduler._supplemental_watchlist_quotes(
+            now,
+            ["001210", "004410", "005930"],
+            ["001210", "004410"],
+        )
+        second = self.scheduler._supplemental_watchlist_quotes(
+            now + timedelta(seconds=4),
+            ["001210", "004410", "005930"],
+            ["001210", "004410"],
+        )
+
+        self.assertEqual(first, [quote])
+        self.assertEqual(second, [])
+        self.scheduler.market_data.get_multi_price.assert_called_once_with(
+            ["001210", "005930"]
+        )
 
     def test_reconcile_positions_after_sell_rate_limit_failure_syncs_account_positions(self):
         synced_positions = []
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
             sync_positions_from_account=lambda positions: synced_positions.extend(positions),
         )
         self.scheduler._fetch_balance_with_retry = lambda *args, **kwargs: SimpleNamespace(
             positions=["0010F0"],
         )
-        result = SimpleNamespace(
+        result = OrderResult(
             success=False,
             side=OrderSide.SELL,
             message='{"rt_cd":"1","msg1":"초당 거래건수를 초과하였습니다.","message":"EGW00201"}',
@@ -901,14 +830,14 @@ class SchedulerTimingTests(unittest.TestCase):
 
     def test_reconcile_positions_after_sell_no_position_failure_syncs_account_positions(self):
         synced_positions = []
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={"015760": object()},
             sync_positions_from_account=lambda positions: synced_positions.extend(positions),
         )
         self.scheduler._fetch_balance_with_retry = lambda *args, **kwargs: SimpleNamespace(
             positions=[],
         )
-        result = SimpleNamespace(
+        result = OrderResult(
             success=False,
             side=OrderSide.SELL,
             message='{"rt_cd":"1","msg_cd":"40240000","msg1":"모의투자 잔고내역이 없습니다."}',
@@ -921,14 +850,14 @@ class SchedulerTimingTests(unittest.TestCase):
 
     def test_reconcile_positions_after_pending_fill_syncs_account_positions(self):
         synced_positions = []
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
             sync_positions_from_account=lambda positions: synced_positions.extend(positions),
         )
         self.scheduler._fetch_balance_with_retry = lambda *args, **kwargs: SimpleNamespace(
             positions=["005930"],
         )
-        result = SimpleNamespace(
+        result = OrderResult(
             success=True,
             side=OrderSide.BUY,
             symbol="005930",
@@ -944,7 +873,7 @@ class SchedulerTimingTests(unittest.TestCase):
 
     def test_reconcile_positions_after_pending_fill_reconciles_before_sync(self):
         events = []
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions={},
             reconcile_pending_fills_from_account=lambda results, positions: events.append(("reconcile", list(positions))) or [],
             sync_positions_from_account=lambda positions: events.append(("sync", list(positions))),
@@ -952,7 +881,7 @@ class SchedulerTimingTests(unittest.TestCase):
         self.scheduler._fetch_balance_with_retry = lambda *args, **kwargs: SimpleNamespace(
             positions=["005930"],
         )
-        result = SimpleNamespace(
+        result = OrderResult(
             success=True,
             side=OrderSide.BUY,
             symbol="005930",
@@ -965,6 +894,36 @@ class SchedulerTimingTests(unittest.TestCase):
         self.scheduler._reconcile_positions_after_order_failures([result])
 
         self.assertEqual(events, [("reconcile", ["005930"]), ("sync", ["005930"])])
+
+    def test_pending_sell_syncs_account_before_confirming_realized_pnl(self):
+        events = []
+        self.scheduler.strategy = strategy_stub(
+            positions={"017670": object()},
+            reconcile_pending_fills_from_account=(
+                lambda results, positions: events.append("reconcile") or []
+            ),
+            sync_positions_from_account=(
+                lambda positions: events.append("sync")
+            ),
+        )
+        self.scheduler._confirm_reconciled_sell_prices = (
+            lambda results=None: events.append("confirm")
+        )
+        self.scheduler._fetch_balance_with_retry = lambda *args, **kwargs: SimpleNamespace(
+            positions=[]
+        )
+        result = OrderResult(
+            success=True,
+            side=OrderSide.SELL,
+            symbol="017670",
+            quantity=0,
+            requested_quantity=8,
+            fill_mode="market_pending",
+        )
+
+        self.scheduler._reconcile_positions_after_order_failures([result])
+
+        self.assertEqual(events, ["reconcile", "sync", "confirm"])
 
     def test_reconciled_pending_buy_sends_buy_fill_alert(self):
         positions = {}
@@ -983,10 +942,10 @@ class SchedulerTimingTests(unittest.TestCase):
             positions["085620"] = SimpleNamespace(quantity=24, buy_price=35_700)
             return [inferred]
 
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             positions=positions,
             daily_pnl=SimpleNamespace(realized_net_pnl=0),
-            config=SimpleNamespace(commission_rate=0.00015, tax_slippage_rate=0.002),
+            config=SimpleNamespace(commission_rate=0.00015, sell_tax_rate=0.002),
             reconcile_pending_fills_from_account=reconcile_pending_fills_from_account,
             sync_positions_from_account=lambda account_positions: None,
         )
@@ -1011,8 +970,58 @@ class SchedulerTimingTests(unittest.TestCase):
         self.assertEqual(kwargs["title"], "매수 체결")
         self.assertIn("085620 24주 @ 35,700원", kwargs["message"])
 
+    def test_periodic_pending_buy_reconcile_confirms_delayed_fill(self):
+        now = datetime.now()
+        positions = {}
+        pending = {
+            "085620": {
+                "plan": SimpleNamespace(quantity=24, entry_limit_price=35_700),
+                "signal_price": 35_750,
+                "created_at": now - timedelta(seconds=5),
+                "order_no": "",
+            }
+        }
+
+        def reconcile_pending(results, account_positions):
+            pending.pop("085620", None)
+            positions["085620"] = SimpleNamespace(quantity=24, buy_price=35_700)
+            return [
+                OrderResult(
+                    success=True,
+                    symbol="085620",
+                    side=OrderSide.BUY,
+                    quantity=24,
+                    price=35_700,
+                    requested_quantity=24,
+                    fill_mode="account_reconciled",
+                    timestamp=now,
+                )
+            ]
+
+        self.scheduler.strategy = strategy_stub(
+            _pending_entry_meta=pending,
+            positions=positions,
+            daily_pnl=SimpleNamespace(realized_net_pnl=0),
+            config=SimpleNamespace(commission_rate=0.00015, sell_tax_rate=0.002),
+            reconcile_pending_fills_from_account=reconcile_pending,
+            sync_positions_from_account=lambda account_positions: None,
+        )
+        self.scheduler._fetch_balance_with_retry = lambda *args, **kwargs: SimpleNamespace(
+            positions=[SimpleNamespace(symbol="085620", quantity=24, avg_price=35_700)],
+        )
+
+        reconciled = self.scheduler._reconcile_pending_entry_positions()
+
+        self.assertTrue(reconciled)
+        self.assertNotIn("085620", pending)
+        self.scheduler._alerts.send.assert_called_once()
+        self.assertEqual(
+            self.scheduler._alerts.send.call_args.kwargs["title"],
+            "매수 체결",
+        )
+
     def test_send_order_result_alert_on_buy_fill(self):
-        result = SimpleNamespace(
+        result = OrderResult(
             success=True,
             symbol="005930",
             side=OrderSide.BUY,
@@ -1021,16 +1030,11 @@ class SchedulerTimingTests(unittest.TestCase):
             requested_price=0,
             timestamp=datetime(2026, 4, 9, 9, 1, 0),
         )
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             daily_pnl=SimpleNamespace(realized_net_pnl=1250),
-            config=SimpleNamespace(commission_rate=0.00015, tax_slippage_rate=0.002),
+            config=SimpleNamespace(commission_rate=0.00015, sell_tax_rate=0.002),
         )
-        after_position = SimpleNamespace(
-            entry_strategy_name="opening_conviction_long_strategy",
-            entry_setup_name="opening_conviction",
-            live_route="opening_conviction_long_strategy",
-            buy_price=71200,
-        )
+        after_position = SimpleNamespace(buy_price=71200)
 
         self.scheduler._send_order_result_alert(result, after_position=after_position)
 
@@ -1042,8 +1046,8 @@ class SchedulerTimingTests(unittest.TestCase):
         self.assertIn("당일 누적순손익: 1,250원", kwargs["message"])
         self.assertNotIn("전략:", kwargs["message"])
 
-    def test_send_order_result_alert_skips_pending_account_reconcile_notice(self):
-        result = SimpleNamespace(
+    def test_send_order_result_alert_skips_non_fill_notices(self):
+        result = OrderResult(
             success=True,
             symbol="005930",
             side=OrderSide.BUY,
@@ -1055,11 +1059,49 @@ class SchedulerTimingTests(unittest.TestCase):
         )
 
         self.scheduler._send_order_result_alert(result)
+        self.scheduler._send_order_result_alert(
+            OrderResult(
+                success=False,
+                symbol="005930",
+                side=OrderSide.BUY,
+                quantity=0,
+                price=0,
+                requested_price=71_200,
+                fill_mode="limit_cancelled",
+                error_category="not_filled",
+                message="EV 제한가 미체결 취소",
+                timestamp=datetime(2026, 4, 9, 9, 1, 1),
+            )
+        )
+        self.scheduler._send_order_result_alert(
+            OrderResult(
+                success=False,
+                symbol="459550",
+                side=OrderSide.BUY,
+                quantity=0,
+                price=0,
+                error_category="rate_limit",
+                message="[EGW00201] 초당 거래건수를 초과하였습니다.",
+                timestamp=datetime(2026, 7, 27, 9, 2, 11),
+            )
+        )
+        self.scheduler._send_order_result_alert(
+            OrderResult(
+                success=False,
+                symbol="005930",
+                side=OrderSide.BUY,
+                quantity=0,
+                price=0,
+                error_category="other",
+                message="temporary order API failure",
+                timestamp=datetime(2026, 7, 27, 9, 2, 12),
+            )
+        )
 
         self.scheduler._alerts.send.assert_not_called()
 
-    def test_send_order_result_alert_uses_provisional_buy_position_for_market_pending(self):
-        result = SimpleNamespace(
+    def test_market_pending_buy_does_not_use_provisional_position_as_a_fill(self):
+        result = OrderResult(
             success=True,
             symbol="100790",
             side=OrderSide.BUY,
@@ -1070,23 +1112,21 @@ class SchedulerTimingTests(unittest.TestCase):
             fill_mode="market_pending",
             timestamp=datetime(2026, 6, 9, 9, 1, 56),
         )
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             daily_pnl=SimpleNamespace(realized_net_pnl=0),
-            config=SimpleNamespace(commission_rate=0.00015, tax_slippage_rate=0.002),
+            config=SimpleNamespace(commission_rate=0.00015, sell_tax_rate=0.002),
         )
         after_position = SimpleNamespace(quantity=12, buy_price=41000)
 
         self.scheduler._send_order_result_alert(result, after_position=after_position)
 
-        self.scheduler._alerts.send.assert_called_once()
-        kwargs = self.scheduler._alerts.send.call_args.kwargs
-        self.assertEqual(kwargs["title"], "매수 체결")
-        self.assertIn("100790 12주 @ 41,000원", kwargs["message"])
-        self.assertIn("매수금액: 492,000원", kwargs["message"])
+        self.scheduler._alerts.send.assert_not_called()
 
     def test_send_order_result_alert_on_sell_fill_includes_trade_and_daily_pnl(self):
-        result = SimpleNamespace(
+        result = OrderResult(
             success=True,
+            order_no="S1",
+            fill_id="S1",
             symbol="005930",
             side=OrderSide.SELL,
             quantity=3,
@@ -1094,26 +1134,107 @@ class SchedulerTimingTests(unittest.TestCase):
             requested_price=0,
             timestamp=datetime(2026, 4, 9, 9, 15, 0),
         )
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             daily_pnl=SimpleNamespace(realized_net_pnl=4200),
-            config=SimpleNamespace(commission_rate=0.00015, tax_slippage_rate=0.002),
-        )
-        before_position = SimpleNamespace(
-            buy_price=71200,
+            _sell_fill_ledger=[
+                {
+                    "fill_id": "S1",
+                    "order_no": "S1",
+                    "quantity": 3,
+                    "sell_price": 73000,
+                    "net_pnl": 4734,
+                }
+            ],
         )
 
-        self.scheduler._send_order_result_alert(result, before_position=before_position)
+        self.scheduler._send_order_result_alert(result)
 
         self.scheduler._alerts.send.assert_called_once()
         kwargs = self.scheduler._alerts.send.call_args.kwargs
         self.assertEqual(kwargs["title"], "매도 체결")
         self.assertIn("005930", kwargs["message"])
-        self.assertIn("거래 순손익:", kwargs["message"])
+        self.assertIn("거래 순손익: 4,734원", kwargs["message"])
         self.assertIn("당일 누적순손익: 4,200원", kwargs["message"])
         self.assertNotIn("전략:", kwargs["message"])
 
+    def test_pending_sell_does_not_send_order_received_alert(self):
+        result = OrderResult(
+            success=True,
+            order_no="S1",
+            symbol="005930",
+            side=OrderSide.SELL,
+            quantity=0,
+            requested_quantity=3,
+            reference_price=72_900,
+            fill_mode="market_pending",
+        )
+
+        self.scheduler._send_order_result_alert(result)
+
+        self.scheduler._alerts.send.assert_not_called()
+
+    def test_reconciled_partial_sell_sends_partial_alert_with_remaining_quantity(self):
+        self.scheduler.account = object()
+        self.scheduler.strategy = strategy_stub(
+            daily_pnl=SimpleNamespace(realized_net_pnl=-3_200),
+            confirm_reconciled_sell_fills=lambda account, results=None: [
+                {
+                    "order_no": "S1",
+                    "fill_id": "S1:25",
+                    "symbol": "900300",
+                    "quantity": 25,
+                    "alert_quantity": 25,
+                    "previous_price": 1_856,
+                    "corrected_price": 1_850,
+                    "alert_price": 1_850,
+                    "delta_net_pnl": -10,
+                    "net_pnl": -10,
+                    "alert_net_pnl": -10,
+                    "remaining_quantity": 514,
+                    "partial": True,
+                    "notify": True,
+                    "requested_reason": "planned_stop",
+                }
+            ],
+        )
+
+        self.scheduler._confirm_reconciled_sell_prices()
+
+        self.scheduler._alerts.send.assert_called_once()
+        kwargs = self.scheduler._alerts.send.call_args.kwargs
+        self.assertEqual(kwargs["title"], "매도 부분체결")
+        self.assertIn("900300 25주 @ 1,850원", kwargs["message"])
+        self.assertIn("미체결 잔량: 514주", kwargs["message"])
+
+    def test_confirmed_reconciled_sell_sends_fill_alert(self):
+        self.scheduler.account = object()
+        self.scheduler.strategy = strategy_stub(
+            daily_pnl=SimpleNamespace(realized_net_pnl=-9_369),
+            confirm_reconciled_sell_fills=lambda account, results=None: [
+                {
+                    "order_no": "0000027235",
+                    "symbol": "017670",
+                    "quantity": 8,
+                    "previous_price": 80_800,
+                    "corrected_price": 80_900,
+                    "delta_net_pnl": -3_088,
+                    "net_pnl": -3_088,
+                    "requested_reason": "planned_stop",
+                }
+            ],
+        )
+
+        self.scheduler._confirm_reconciled_sell_prices()
+
+        self.scheduler._alerts.send.assert_called_once()
+        kwargs = self.scheduler._alerts.send.call_args.kwargs
+        self.assertEqual(kwargs["title"], "매도 체결")
+        self.assertIn("017670 8주 @ 80,900원", kwargs["message"])
+        self.assertIn("거래 순손익: -3,088원", kwargs["message"])
+        self.assertIn("당일 누적순손익: -9,369원", kwargs["message"])
+
     def test_send_daily_halt_alert_if_needed(self):
-        self.scheduler.strategy = SimpleNamespace(
+        self.scheduler.strategy = strategy_stub(
             should_continue=lambda: False,
             daily_pnl=SimpleNamespace(realized_net_pnl=-3500),
         )

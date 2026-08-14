@@ -1,434 +1,568 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from math import log, sqrt
 from pathlib import Path
-import tempfile
 
-from src.analytics.forecast_outcomes import ForecastOutcomeLedger, calibrate_walk_forward
-from src.analytics.math_signals import LeaderSignal
-from src.analytics.price_prediction import predict_short_horizon_return
+from src.analytics.forecast_outcomes import FORECAST_SCHEMA_VERSION, ForecastOutcomeLedger
+from src.analytics.price_prediction import (
+    MODEL_FEATURES,
+    PREDICTION_FEATURES,
+    FeatureRow,
+    RidgeModel,
+    build_feature_rows,
+    fit_model,
+    predict_batch,
+)
 from src.models import Quote
+from src.strategies.momentum_scalp_pnl import estimate_trade_net_pnl_unrounded
 
 
-class PricePredictionTests(unittest.TestCase):
-    @staticmethod
-    def _quotes(
-        prices,
-        *,
-        symbol="TEST",
-        open_price=None,
-        interval_seconds=11,
-        volumes=None,
-    ):
-        opening = int(open_price or prices[0])
-        start = datetime(2026, 7, 14, 10, 0, 0)
-        cumulative_volumes = volumes or [100_000 + index * 10_000 for index in range(len(prices))]
-        quotes = []
-        for index, (price, volume) in enumerate(zip(prices, cumulative_volumes)):
-            quotes.append(
-                Quote(
-                    symbol=symbol,
-                    name=symbol,
-                    current_price=price,
-                    change=price - opening,
-                    change_rate=((price - opening) / opening) * 100.0,
-                    open_price=opening,
-                    high_price=max(prices[: index + 1]),
-                    low_price=min(opening, min(prices[: index + 1])),
-                    volume=volume,
-                    trade_amount=price * volume,
-                    timestamp=start + timedelta(seconds=index * interval_seconds),
+def make_quote(
+    symbol: str,
+    timestamp: datetime,
+    price: int,
+    *,
+    cumulative_volume: int = 0,
+    cumulative_sell_volume: int = 0,
+    cumulative_buy_volume: int = 0,
+    total_ask_size: int = 0,
+    total_bid_size: int = 0,
+    flow_available: bool = True,
+    book_depth_available: bool = True,
+) -> Quote:
+    return Quote(
+        symbol=symbol,
+        current_price=price,
+        timestamp=timestamp,
+        ask_price=price + 5,
+        bid_price=price - 5,
+        cumulative_volume=cumulative_volume,
+        cumulative_sell_volume=cumulative_sell_volume,
+        cumulative_buy_volume=cumulative_buy_volume,
+        total_ask_size=total_ask_size,
+        total_bid_size=total_bid_size,
+        book_available=True,
+        flow_available=flow_available,
+        book_depth_available=book_depth_available,
+    )
+
+
+def feature_values(value: float = 0.1) -> dict[str, float]:
+    values = {name: 0.0 for name in PREDICTION_FEATURES}
+    values.update(
+        {
+            "return_15s_pct": value,
+            "return_60s_pct": value * 2.0,
+            "return_180s_pct": value * 3.0,
+            "net_buy_volume_ratio": value,
+            "book_imbalance": value * 0.5,
+            "relative_60s_pct": value,
+            "spread_pct": 0.05,
+        }
+    )
+    return values
+
+
+def outcome(
+    symbol: str,
+    signal_at: datetime,
+    actual: float,
+    value: float = 0.1,
+    *,
+    horizon_seconds: int = 180,
+):
+    return {
+        "symbol": symbol,
+        "signal_timestamp": signal_at.isoformat(),
+        "outcome_timestamp": (
+            signal_at + timedelta(seconds=horizon_seconds)
+        ).isoformat(),
+        "horizon_seconds": horizon_seconds,
+        "compact_features": feature_values(value),
+        "actual_net_return_pct": actual,
+        "training_eligible": True,
+    }
+
+
+class SimplePredictionTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 8, 5, 10, 0, 0)
+
+    def test_features_are_time_based_price_flow_and_relative_strength(self):
+        start = self.now - timedelta(seconds=180)
+        history = [
+            make_quote(
+                "005930",
+                start + timedelta(seconds=second),
+                10_000 + second,
+                cumulative_volume=second * 100,
+                cumulative_sell_volume=second * 100,
+                cumulative_buy_volume=second * 200,
+                total_ask_size=1_000,
+                total_bid_size=2_000,
+            )
+            for second in range(181)
+        ]
+        future = make_quote("005930", self.now + timedelta(seconds=30), 20_000)
+
+        row = build_feature_rows(
+            [history[-1]],
+            recent_quotes_by_symbol={"005930": [*history, future]},
+        )["005930"]
+
+        self.assertTrue(row.ready)
+        self.assertEqual(tuple(row.compact_features), PREDICTION_FEATURES)
+        self.assertEqual(row.unavailable_features, ())
+        self.assertAlmostEqual(
+            row.compact_features["return_15s_pct"],
+            ((10_180 / 10_165) - 1.0) * 100.0,
+            places=8,
+        )
+        self.assertAlmostEqual(row.compact_features["relative_60s_pct"], 0.0)
+        self.assertAlmostEqual(row.compact_features["net_buy_volume_ratio"], 1.0 / 3.0)
+        self.assertAlmostEqual(row.compact_features["book_imbalance"], 1.0 / 3.0)
+
+    def test_rest_microstructure_placeholders_are_marked_unavailable(self):
+        past = make_quote(
+            "005930",
+            self.now - timedelta(seconds=60),
+            10_000,
+            flow_available=False,
+            book_depth_available=False,
+        )
+        current = make_quote(
+            "005930",
+            self.now,
+            10_010,
+            flow_available=False,
+            book_depth_available=False,
+        )
+
+        row = build_feature_rows(
+            [current],
+            recent_quotes_by_symbol={"005930": [past, current]},
+        )["005930"]
+
+        self.assertIn("net_buy_volume_ratio", row.unavailable_features)
+        self.assertIn("book_imbalance", row.unavailable_features)
+        self.assertIn("return_15s_pct", row.unavailable_features)
+
+    def test_short_history_is_ready_without_a_static_history_gate(self):
+        history = [
+            make_quote("005930", self.now - timedelta(seconds=second), 10_000)
+            for second in range(61)
+        ]
+
+        row = build_feature_rows(
+            [history[0]],
+            recent_quotes_by_symbol={"005930": history},
+        )["005930"]
+
+        self.assertTrue(row.ready)
+        self.assertEqual(tuple(row.compact_features), PREDICTION_FEATURES)
+        self.assertIn("return_180s_pct", row.unavailable_features)
+
+    def test_directional_flow_uses_actual_buy_and_sell_volume_deltas(self):
+        past = make_quote(
+            "005930",
+            self.now - timedelta(seconds=60),
+            10_000,
+            cumulative_sell_volume=1_000,
+            cumulative_buy_volume=2_000,
+        )
+        current = make_quote(
+            "005930",
+            self.now,
+            10_000,
+            cumulative_sell_volume=1_500,
+            cumulative_buy_volume=3_500,
+            total_ask_size=300,
+            total_bid_size=700,
+        )
+
+        row = build_feature_rows(
+            [current],
+            recent_quotes_by_symbol={"005930": [past, current]},
+        )["005930"]
+
+        self.assertAlmostEqual(row.compact_features["net_buy_volume_ratio"], 0.5)
+        self.assertAlmostEqual(row.compact_features["book_imbalance"], 0.4)
+
+    def test_training_uses_settled_selected_rows_but_ignores_future_and_incomplete_rows(self):
+        valid = outcome("005930", self.now - timedelta(minutes=10), 0.4)
+        future = outcome("000660", self.now, 5.0)
+        selected = outcome("003670", self.now - timedelta(minutes=10), 5.0)
+        selected["selected"] = True
+        incomplete = outcome("035420", self.now - timedelta(minutes=10), 5.0)
+        incomplete["compact_features"].pop("spread_pct")
+        incompatible = outcome("051910", self.now - timedelta(minutes=10), 5.0)
+        incompatible["compact_features"]["legacy_score"] = 99.0
+
+        model = fit_model(
+            [valid, future, selected, incomplete, incompatible],
+            as_of=self.now,
+        )
+
+        self.assertIsNotNone(model)
+        self.assertEqual(model.sample_count, 2)
+
+    def test_unfinished_current_day_groups_receive_only_observed_day_fraction(self):
+        records = []
+        for symbol_index in range(3):
+            for observation_index in range(8):
+                records.append(
+                    outcome(
+                        f"{symbol_index + 1:06d}",
+                        self.now
+                        - timedelta(days=1, minutes=observation_index + 10),
+                        -0.2,
+                    )
+                )
+        for symbol_index in range(4):
+            records.append(
+                outcome(
+                    f"{symbol_index + 100:06d}",
+                    self.now - timedelta(minutes=10),
+                    5.0,
                 )
             )
-        return quotes
 
-    @staticmethod
-    def _leader(quote, *, score=0.70, percentile=0.90, acceleration=0.40):
-        return LeaderSignal(
-            symbol=quote.symbol,
-            leader_score=score,
-            leader_percentile=percentile,
-            entry_grade="A",
-            change_rate=quote.change_rate,
-            trade_amount=quote.trade_amount,
-            vs_open_pct=quote.change_rate,
-            high_proximity=quote.current_price / max(1, quote.high_price),
-            volume_vs_avg=1.5,
-            reclaim_speed_ticks=1,
-            recent_acceleration_pct=acceleration,
-            effective_leader_score=score,
+        model = fit_model(records, as_of=self.now)
+
+        self.assertIsNotNone(model)
+        self.assertEqual(model.sample_count, 28)
+        self.assertAlmostEqual(model.effective_sample_size, 3.5)
+
+    def test_all_negative_history_cannot_be_extrapolated_positive(self):
+        records = [
+            outcome(
+                f"{index + 1:06d}",
+                self.now - timedelta(minutes=20 - index),
+                actual,
+                value=float(index + 1),
+            )
+            for index, actual in enumerate((-0.38, -0.41, -0.20, -1.36))
+        ]
+        model = fit_model(records, as_of=self.now)
+        symbol = "005930"
+        row = FeatureRow(
+            ready=True,
+            reason="ok",
+            compact_features=feature_values(-100.0),
         )
 
-    def _predict(self, quotes, *, leader=None):
-        return predict_short_horizon_return(
-            quotes[-1],
-            recent_quotes=quotes,
-            leader=leader or self._leader(quotes[-1]),
-            market_state={"tape_heat": 0.50, "tape_caution": 0.10, "vs_open_p90": 8.0},
-            min_samples=5,
+        prediction = predict_batch(
+            {symbol: row},
+            model=model,
+            evaluated_candidate_count=40,
+        )[symbol]
+
+        self.assertLess(prediction.expected_net_return_pct, 0.0)
+
+    def test_one_extreme_outcome_does_not_dominate_the_ridge_target(self):
+        records = [
+            outcome(
+                f"{index + 1:06d}",
+                self.now - timedelta(minutes=10),
+                -0.2,
+            )
+            for index in range(99)
+        ]
+        records.append(
+            outcome("999999", self.now - timedelta(minutes=10), 30.0)
+        )
+        model = fit_model(records, as_of=self.now)
+        prediction = predict_batch(
+            {"005930": FeatureRow(True, "ok", feature_values(0.0))},
+            model=model,
+            evaluated_candidate_count=40,
+        )["005930"]
+
+        self.assertTrue(prediction.ready)
+        self.assertLess(model.target_max_pct, 30.0)
+        self.assertGreater(model.residual_rms_pct, 1.0)
+        self.assertLess(prediction.expected_net_return_pct, 0.0)
+
+    def test_all_horizons_share_one_model_instead_of_tiny_separate_models(self):
+        records = [
+            outcome(
+                f"{index + 1:06d}",
+                self.now - timedelta(minutes=30 - index),
+                -0.4,
+            )
+            for index in range(12)
+        ]
+        records.append(
+            outcome(
+                "005930",
+                self.now - timedelta(minutes=5),
+                1.0,
+                horizon_seconds=60,
+            )
         )
 
-    def test_predictor_requires_real_price_history(self):
-        quotes = self._quotes([10_000])
+        model = fit_model(records, as_of=self.now)
+        prediction = predict_batch(
+            {"005930": FeatureRow(True, "ok", feature_values(0.1))},
+            model=model,
+            evaluated_candidate_count=40,
+            horizon_seconds=60,
+        )["005930"]
 
-        prediction = self._predict(quotes)
+        self.assertEqual(model.sample_count, len(records))
+        self.assertEqual(prediction.sample_count, len(records))
+        self.assertLess(prediction.expected_net_return_pct, 0.0)
+
+    def test_candidate_count_reduces_the_same_model_estimate(self):
+        model = RidgeModel(
+            coefficients=(0.5,) + (0.0,) * len(MODEL_FEATURES),
+            medians=(0.0,) * len(MODEL_FEATURES),
+            scales=(1.0,) * len(MODEL_FEATURES),
+            feature_mins=(-1.0,) * len(MODEL_FEATURES),
+            feature_maxs=(1.0,) * len(MODEL_FEATURES),
+            sample_count=20,
+            effective_sample_size=20,
+            target_min_pct=-1.0,
+            target_max_pct=1.0,
+            residual_rms_pct=0.2,
+            residual_p10_pct=-0.3,
+        )
+        symbol = "005930"
+        row = FeatureRow(
+            ready=True,
+            reason="ok",
+            compact_features={name: 0.0 for name in PREDICTION_FEATURES},
+        )
+
+        single = predict_batch({symbol: row}, model=model, evaluated_candidate_count=1)[symbol]
+        wide = predict_batch({symbol: row}, model=model, evaluated_candidate_count=40)[symbol]
+
+        self.assertEqual(single.expected_net_return_pct, 0.5)
+        self.assertLess(wide.expected_net_return_pct, single.expected_net_return_pct)
+        self.assertAlmostEqual(
+            wide.expected_net_return_pct,
+            0.5
+            - (0.2 / sqrt(20.0))
+            * sqrt(20.0 / 18.0)
+            * sqrt(2.0 * log(40.0)),
+            places=8,
+        )
+
+    def test_model_learns_actual_net_buy_pressure_without_price_momentum(self):
+        records = []
+        for index in range(20):
+            positive = index % 2 == 0
+            record = outcome(
+                f"{index + 1:06d}",
+                self.now - timedelta(minutes=30 - index),
+                0.6 if positive else -0.6,
+                value=0.0,
+            )
+            record["compact_features"]["net_buy_volume_ratio"] = 0.8 if positive else -0.8
+            record["compact_features"]["book_imbalance"] = 0.5 if positive else -0.5
+            records.append(record)
+        model = fit_model(records, as_of=self.now)
+        buy_pressure = feature_values(0.0)
+        buy_pressure["net_buy_volume_ratio"] = 0.8
+        buy_pressure["book_imbalance"] = 0.5
+        sell_pressure = feature_values(0.0)
+        sell_pressure["net_buy_volume_ratio"] = -0.8
+        sell_pressure["book_imbalance"] = -0.5
+
+        predictions = predict_batch(
+            {
+                "005930": FeatureRow(True, "ok", buy_pressure),
+                "000660": FeatureRow(True, "ok", sell_pressure),
+            },
+            model=model,
+            evaluated_candidate_count=1,
+        )
+
+        self.assertGreater(predictions["005930"].expected_net_return_pct, 0.0)
+        self.assertLess(predictions["000660"].expected_net_return_pct, 0.0)
+
+    def test_prediction_clamps_features_to_observed_training_range(self):
+        size = len(MODEL_FEATURES)
+        model = RidgeModel(
+            coefficients=(0.0, 1.0) + (0.0,) * (size - 1),
+            medians=(0.0,) * size,
+            scales=(1.0,) * size,
+            feature_mins=(-1.0,) * size,
+            feature_maxs=(1.0,) * size,
+            sample_count=20,
+            effective_sample_size=20,
+            target_min_pct=-200.0,
+            target_max_pct=200.0,
+            residual_rms_pct=0.0,
+            residual_p10_pct=-0.2,
+        )
+        values = feature_values()
+        values["return_15s_pct"] = 100.0
+        row = FeatureRow(True, "ok", values)
+
+        result = predict_batch(
+            {"005930": row},
+            model=model,
+            evaluated_candidate_count=1,
+        )["005930"]
+
+        self.assertEqual(result.expected_net_return_pct, 1.0)
+
+    def test_zero_mad_feature_uses_observed_dispersion_scale(self):
+        records = [
+            outcome(
+                f"{index + 1:06d}",
+                self.now - timedelta(minutes=20 - index),
+                actual=float(index) / 10.0,
+                value=0.0 if index < 4 else 0.5,
+            )
+            for index in range(5)
+        ]
+
+        model = fit_model(records, as_of=self.now)
+
+        self.assertGreater(model.scales[0], 0.01)
+
+    def test_no_outcomes_is_not_ready(self):
+        symbol = "005930"
+        row = FeatureRow(
+            ready=True,
+            reason="ok",
+            compact_features=feature_values(),
+        )
+
+        prediction = predict_batch(
+            {symbol: row},
+            model=None,
+            evaluated_candidate_count=1,
+        )[symbol]
 
         self.assertFalse(prediction.ready)
-        self.assertEqual(prediction.reason, "insufficient_samples")
+        self.assertEqual(prediction.reason, "no_settled_outcomes")
 
-    def test_repeated_price_updates_beat_one_jump_then_flat(self):
-        one_jump = self._quotes([330_000, 330_500, 330_500, 330_500, 330_500, 332_000, 332_000])
-        confirmed = self._quotes([330_000, 330_300, 330_600, 330_900, 331_200, 331_600, 332_000])
-        erratic_tail_burst = self._quotes([10_000, 10_050, 9_980, 10_040, 9_990, 10_000, 10_020, 10_040])
-        opening_chase = self._quotes(
-            [6_840, 6_840, 6_770, 6_770, 7_050, 7_050, 7_070, 7_070, 7_040, 7_120, 7_120, 7_350],
-            open_price=6_220,
-        )
-        late_chase = self._quotes(
-            [4_925, 4_925, 4_855, 4_855, 4_875, 4_875, 4_970, 4_970, 5_000, 5_035, 5_035, 5_080, 5_080, 5_250],
-            open_price=4_480,
-        )
-        for quote in opening_chase:
-            quote.high_price = 7_665
-        for quote in late_chase:
-            quote.high_price = 5_415
 
-        jump_prediction = self._predict(one_jump)
-        confirmed_prediction = self._predict(confirmed)
-        erratic_prediction = self._predict(erratic_tail_burst)
-        opening_chase_prediction = self._predict(
-            opening_chase,
-            leader=self._leader(opening_chase[-1], score=-0.3946, percentile=0.52, acceleration=-0.20),
-        )
-        late_chase_prediction = self._predict(
-            late_chase,
-            leader=self._leader(late_chase[-1], score=0.5520, percentile=1.0, acceleration=0.80),
-        )
-
-        self.assertTrue(jump_prediction.ready)
-        self.assertLess(jump_prediction.predicted_return_pct, confirmed_prediction.predicted_return_pct)
-        self.assertLess(jump_prediction.lower_bound_return_pct, 0.0)
-        self.assertGreater(jump_prediction.features["single_tick_impulse_risk"], 0.60)
-        self.assertGreater(confirmed_prediction.predicted_return_pct, 0.70)
-        self.assertGreater(confirmed_prediction.lower_bound_return_pct, 0.0)
-        self.assertGreater(confirmed_prediction.confidence, jump_prediction.confidence)
-        self.assertLess(erratic_prediction.confidence, 0.70)
-        self.assertGreater(erratic_prediction.features["terminal_trend_fit"], 0.95)
-        for prediction in (opening_chase_prediction, late_chase_prediction):
-            self.assertGreater(prediction.features["single_tick_impulse_risk"], 0.90)
-            self.assertLess(prediction.lower_bound_return_pct, 0.0)
-            self.assertLess(prediction.confidence, 0.40)
-
-    def test_predictor_recognizes_confirmed_rebound_before_the_last_jump(self):
-        prices = [
-            12_320,
-            12_230,
-            12_290,
-            12_280,
-            12_260,
-            12_210,
-            12_160,
-            12_110,
-            12_100,
-            12_210,
-            12_200,
-            12_190,
-            12_220,
-            12_270,
-            12_220,
-            12_230,
-            12_290,
-            12_380,
-            12_590,
-            12_610,
-        ]
-        early = self._quotes(prices[:17], open_price=10_780)
-        confirmed = self._quotes(prices[:18], open_price=10_780)
-
-        early_prediction = self._predict(early)
-        confirmed_prediction = self._predict(confirmed)
-
-        self.assertLess(early_prediction.predicted_return_pct, 0.60)
-        self.assertGreater(confirmed_prediction.predicted_return_pct, 0.90)
-        self.assertGreater(confirmed_prediction.lower_bound_return_pct, 0.0)
-        self.assertGreater(confirmed_prediction.features["positive_move_support"], 0.90)
-        self.assertLess(confirmed_prediction.features["trap_risk_score"], 0.20)
-
-    def test_sparse_observations_keep_lower_bound_negative(self):
-        prices = [10_000, 10_020, 10_050, 10_090, 10_140, 10_200]
-        dense = self._quotes(prices, interval_seconds=12)
-        sparse = self._quotes(prices, interval_seconds=75)
-
-        dense_prediction = self._predict(dense)
-        sparse_prediction = self._predict(sparse)
-
-        self.assertGreater(sparse_prediction.features["quote_gap_risk"], 0.60)
-        self.assertLess(sparse_prediction.lower_bound_return_pct, dense_prediction.lower_bound_return_pct)
-        self.assertLess(sparse_prediction.predicted_return_pct, dense_prediction.predicted_return_pct)
-        self.assertLess(sparse_prediction.confidence, dense_prediction.confidence)
-
-    def test_latest_two_step_reversal_overrides_sparse_older_jump(self):
-        quotes = self._quotes(
-            [38_300, 38_300, 38_350, 38_350, 40_350, 40_450, 40_300, 40_150],
-            open_price=38_300,
-        )
-        start = quotes[0].timestamp
-        for quote, offset in zip(quotes, [0, 22, 43, 54, 281, 292, 329, 358]):
-            quote.timestamp = start + timedelta(seconds=offset)
-
-        prediction = self._predict(quotes)
-
-        self.assertGreater(prediction.features["fast_trend_pct_per_second"], 0.0)
-        self.assertLess(prediction.features["terminal_trend_pct_per_second"], 0.0)
-        self.assertLess(prediction.predicted_return_pct, 0.0)
-        self.assertLess(prediction.lower_bound_return_pct, prediction.predicted_return_pct)
-
-    def test_sustained_high_hold_remains_positive(self):
-        prices = [10_000, 10_200, 10_350, 10_420, 10_420, 10_450, 10_450, 10_470]
-        volumes = [100_000, 120_000, 150_000, 190_000, 240_000, 300_000, 370_000, 450_000]
-        quotes = self._quotes(prices, volumes=volumes)
-
-        prediction = self._predict(quotes)
-
-        self.assertGreater(prediction.predicted_return_pct, 0.70)
-        self.assertGreater(prediction.lower_bound_return_pct, 0.0)
-        self.assertGreater(prediction.features["confirmed_high_hold_continuation_score"], 0.30)
-        self.assertGreater(prediction.confidence, 0.60)
-
-    def test_opening_rally_that_stalls_is_not_extrapolated_as_continuation(self):
-        quotes = self._quotes(
-            [1_150, 1_195, 1_219, 1_219, 1_219],
-            open_price=1_109,
-            interval_seconds=22,
-        )
-
-        prediction = self._predict(
-            quotes,
-            leader=self._leader(quotes[-1], score=0.302476, percentile=0.92, acceleration=0.40),
-        )
-
-        self.assertLess(prediction.predicted_return_pct, 0.20)
-        self.assertLess(prediction.lower_bound_return_pct, -1.0)
-        self.assertGreater(prediction.features["effective_deceleration_score"], 0.60)
-        self.assertLess(prediction.confidence, 0.45)
-
-    def test_late_acceleration_after_large_prior_extension_inflates_downside(self):
-        prices = [4_875, 4_875, 4_875, 4_880, 4_890, 4_900, 5_010, 5_010, 5_010, 5_050, 5_100, 5_140]
-        quotes = self._quotes(prices, open_price=4_000)
-        unextended_quotes = self._quotes(prices, open_price=4_875)
-
-        prediction = self._predict(
-            quotes,
-            leader=self._leader(quotes[-1], score=0.2212, percentile=0.92, acceleration=0.40),
-        )
-        unextended_prediction = self._predict(
-            unextended_quotes,
-            leader=self._leader(unextended_quotes[-1], score=0.2212, percentile=0.92, acceleration=0.40),
-        )
-
-        self.assertGreater(prediction.features["late_extension_risk"], 0.70)
-        self.assertLess(prediction.lower_bound_return_pct, unextended_prediction.lower_bound_return_pct)
-        self.assertLess(prediction.confidence, unextended_prediction.confidence)
-
-    def test_rebound_far_below_intraday_high_is_not_scored_as_fresh_breakout(self):
-        quotes = self._quotes(
-            [2_380, 2_390, 2_410, 2_430, 2_460, 2_490, 2_525],
-            open_price=1_926,
-        )
-        for quote in quotes:
-            quote.high_price = 3_105
-            quote.low_price = 1_900
-        fresh_breakout_quotes = self._quotes(
-            [2_380, 2_390, 2_410, 2_430, 2_460, 2_490, 2_525],
-            open_price=1_926,
-        )
-        for quote in fresh_breakout_quotes:
-            quote.high_price = 2_525
-            quote.low_price = 1_900
-
-        prediction = self._predict(
-            quotes,
-            leader=self._leader(quotes[-1], score=0.266, percentile=0.88, acceleration=0.40),
-        )
-        fresh_breakout_prediction = self._predict(
-            fresh_breakout_quotes,
-            leader=self._leader(fresh_breakout_quotes[-1], score=0.266, percentile=0.88, acceleration=0.40),
-        )
-
-        self.assertLess(prediction.predicted_return_pct, fresh_breakout_prediction.predicted_return_pct)
-        self.assertLess(prediction.lower_bound_return_pct, 0.0)
-        self.assertGreater(prediction.features["rejection_risk_score"], 0.35)
-
-    def test_downtrend_is_negative_even_with_strong_leader_metadata(self):
-        quotes = self._quotes([10_000, 9_980, 9_950, 9_910, 9_880, 9_840, 9_800])
-        leader = self._leader(quotes[-1], score=1.10, percentile=1.0, acceleration=0.80)
-
-        prediction = self._predict(quotes, leader=leader)
-
-        self.assertLess(prediction.predicted_return_pct, 0.0)
-        self.assertLess(prediction.lower_bound_return_pct, prediction.predicted_return_pct)
-        self.assertLess(prediction.direction_score, 0.20)
-
-    def test_leader_quality_adjusts_but_does_not_replace_price_evidence(self):
-        quotes = self._quotes([10_000, 10_040, 10_090, 10_150, 10_220, 10_300, 10_390])
-        strong = self._predict(
-            quotes,
-            leader=self._leader(quotes[-1], score=1.0, percentile=0.98, acceleration=0.70),
-        )
-        weak = self._predict(
-            quotes,
-            leader=self._leader(quotes[-1], score=-0.05, percentile=0.80, acceleration=-0.20),
-        )
-
-        self.assertGreaterEqual(strong.predicted_return_pct, weak.predicted_return_pct)
-        self.assertGreater(strong.confidence, weak.confidence)
-        self.assertGreater(weak.predicted_return_pct, 0.0)
-        self.assertGreater(weak.features["positive_move_support"], 0.90)
-
-    def test_flow_spike_inflates_uncertainty_instead_of_direction(self):
-        prices = [69_700, 69_900, 69_900, 70_800, 71_700]
-        normal = self._quotes(prices, volumes=[100_000, 110_000, 120_000, 130_000, 140_000])
-        spike = self._quotes(prices, volumes=[100_000, 110_000, 120_000, 130_000, 900_000])
-
-        normal_prediction = self._predict(normal)
-        spike_prediction = self._predict(spike)
-
-        self.assertGreater(spike_prediction.features["tail_flow_spike_risk"], 0.30)
-        self.assertLess(spike_prediction.lower_bound_return_pct, normal_prediction.lower_bound_return_pct)
-        self.assertLess(spike_prediction.confidence, normal_prediction.confidence)
-
-    def test_walk_forward_uses_gross_forecast_error_and_current_execution_cost(self):
-        outcomes = [
-            {
-                "horizon_seconds": 180,
-                "strategy_name": "intraday_conviction_long_strategy",
-                "signal_timestamp": "2026-07-20T10:00:00",
-                "symbol": f"10000{index}",
-                "raw_win_probability": 0.6,
-                "raw_predicted_return_pct": 0.5,
-                "actual_return_pct": 0.6,
-                "actual_net_return_pct": -5.0,
-                "round_trip_cost_pct": 5.6,
-                "profitable": False,
-            }
-            for index in range(4)
-        ]
-        outcomes.extend(
-            {
-                "horizon_seconds": 180,
-                "strategy_name": "opening_conviction_long_strategy",
-                "signal_timestamp": "2026-07-20T09:00:00",
-                "symbol": f"20000{index}",
-                "raw_win_probability": 0.6,
-                "raw_predicted_return_pct": 0.5,
-                "actual_return_pct": -3.0,
-            }
-            for index in range(4)
-        )
-
-        calibration = calibrate_walk_forward(
-            outcomes,
-            raw_win_probability=0.6,
-            raw_return_pct=0.5,
-            horizon_seconds=180,
-            round_trip_cost_pct=0.43,
-            strategy_name="intraday_conviction_long_strategy",
-        )
-
-        self.assertEqual(calibration.sample_count, 4)
-        self.assertGreater(calibration.calibrated_win_probability, 0.6)
-        self.assertGreater(calibration.calibrated_return_pct, 0.5)
-
-        unsupported = calibrate_walk_forward(
-            outcomes,
-            raw_win_probability=0.9,
-            raw_return_pct=3.0,
-            horizon_seconds=180,
-            round_trip_cost_pct=0.43,
-            strategy_name="intraday_conviction_long_strategy",
-        )
-        self.assertAlmostEqual(unsupported.calibrated_win_probability, 0.9, delta=0.02)
-        self.assertAlmostEqual(unsupported.calibrated_return_pct, 3.0, delta=0.02)
-
-        corrected = calibrate_walk_forward(
-            [
+class ForecastLedgerTests(unittest.TestCase):
+    def test_multi_horizon_observations_share_one_non_overlapping_signal(self):
+        signal_at = datetime(2026, 8, 5, 10, 0, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = ForecastOutcomeLedger(directory)
+            payloads = [
                 {
-                    "horizon_seconds": 180,
-                    "strategy_name": "intraday_conviction_long_strategy",
-                    "raw_win_probability": 0.6,
-                    "raw_predicted_return_pct": 0.5,
-                    "actual_return_pct": -1.0,
-                    "symbol": f"LOSS{index}",
+                    "symbol": "005930",
+                    "signal_timestamp": signal_at.isoformat(),
+                    "signal_entry_ask": 10_010,
+                    "horizon_seconds": horizon,
+                    "compact_features": feature_values(),
+                    "commission_rate": 0.00015,
+                    "sell_tax_rate": 0.002,
                 }
-                for index in range(4)
-            ],
-            raw_win_probability=0.6,
-            raw_return_pct=0.5,
-            horizon_seconds=180,
-            round_trip_cost_pct=0.43,
-            strategy_name="intraday_conviction_long_strategy",
-        )
-        self.assertLess(corrected.calibrated_return_pct, 0.0)
+                for horizon in (30, 60, 120, 180)
+            ]
 
-    def test_forecast_ledger_calibrates_from_similar_prior_day_outcomes_only(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ledger = ForecastOutcomeLedger(Path(tmpdir))
-            first_signal_at = datetime(2026, 7, 20, 10, 0, 0)
-            symbols = ["100001", "100002", "100003", "100004"]
-            for symbol in symbols:
-                payload = {
-                    "symbol": symbol,
-                    "signal_timestamp": first_signal_at.isoformat(timespec="seconds"),
-                    "signal_price": 10_000,
-                    "horizon_seconds": 180,
-                    "round_trip_cost_pct": 0.4,
-                    "raw_win_probability": 0.8,
-                    "raw_predicted_return_pct": 1.5,
-                }
-                self.assertTrue(ledger.record(payload, now=first_signal_at, selected=False))
-
-            outcome_at = first_signal_at + timedelta(seconds=180)
-            outcome_quotes = []
-            for symbol in symbols:
-                outcome_quote = self._quotes([9_800], symbol=symbol)[0]
-                outcome_quote.timestamp = outcome_at
-                outcome_quotes.append(outcome_quote)
-            settled = ledger.settle(outcome_quotes, now=outcome_at)
-            self.assertEqual(len(settled), 4)
-
-            next_day = datetime(2026, 7, 21, 10, 0, 0)
-            calibration = ledger.calibrate(
-                as_of=next_day,
-                raw_win_probability=0.8,
-                raw_return_pct=1.5,
-                horizon_seconds=180,
-                round_trip_cost_pct=0.4,
+            first = ledger.record_observation_sets(payloads, now=signal_at)
+            duplicate = ledger.record_observation_sets(
+                payloads,
+                now=signal_at + timedelta(seconds=31),
             )
-            self.assertEqual(calibration.sample_count, 4)
-            self.assertLess(calibration.calibrated_win_probability, 0.8)
-            self.assertLess(calibration.calibrated_return_pct, 1.5)
+            settled = ledger.settle(
+                [
+                    make_quote("005930", signal_at + timedelta(seconds=horizon), 10_100)
+                    for horizon in (30, 60, 120, 180)
+                ],
+                now=signal_at + timedelta(seconds=180),
+            )
 
-            current_payload = {
-                "symbol": "100005",
-                "signal_timestamp": next_day.isoformat(timespec="seconds"),
-                "signal_price": 10_000,
-                "horizon_seconds": 180,
-                "round_trip_cost_pct": 0.4,
-                "raw_win_probability": 0.8,
-                "raw_predicted_return_pct": 1.5,
+            self.assertEqual(set(horizon for _, horizon in first), {30, 60, 120, 180})
+            self.assertEqual(duplicate, {})
+            self.assertEqual(
+                [item["horizon_seconds"] for item in settled],
+                [30, 60, 120, 180],
+            )
+
+    def test_incompatible_old_outcome_is_kept_but_not_trained(self):
+        now = datetime(2026, 8, 5, 10, 0, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "2026" / "08" / "forecast-outcomes.2026-08-05.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            legacy = {
+                "symbol": "005930",
+                "signal_timestamp": now.isoformat(),
+                "outcome_timestamp": (now + timedelta(seconds=180)).isoformat(),
+                "raw_expected_return_pct": 3.0,
             }
-            ledger.record(current_payload, now=next_day, selected=False)
-            current_outcome = self._quotes([10_500], symbol="100005")[0]
-            current_outcome.timestamp = next_day + timedelta(seconds=180)
-            ledger.settle([current_outcome], now=current_outcome.timestamp)
-            same_day_calibration = ledger.calibrate(
-                as_of=current_outcome.timestamp,
-                raw_win_probability=0.8,
-                raw_return_pct=1.5,
-                horizon_seconds=180,
-                round_trip_cost_pct=0.4,
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "date": "2026-08-05",
+                        "pending": [],
+                        "outcomes": [legacy],
+                    }
+                ),
+                encoding="utf-8",
             )
-            self.assertEqual(same_day_calibration, calibration)
+            ledger = ForecastOutcomeLedger(directory)
+            ledger.record(
+                {
+                    "symbol": "000660",
+                    "signal_timestamp": now.isoformat(),
+                    "signal_entry_ask": 10_010,
+                    "signal_exit_bid": 9_990,
+                    "horizon_seconds": 180,
+                    "compact_features": feature_values(),
+                },
+                now=now,
+                selected=False,
+            )
 
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["schema_version"], FORECAST_SCHEMA_VERSION)
+            self.assertEqual(saved["outcomes"][0], legacy)
+            self.assertIsNone(
+                fit_model(
+                    ledger.training_outcomes(as_of=now + timedelta(minutes=10)),
+                    as_of=now + timedelta(minutes=10),
+                )
+            )
+
+    def test_signal_ask_settles_at_180_second_bid_with_costs(self):
+        signal_at = datetime(2026, 8, 5, 10, 0, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = ForecastOutcomeLedger(directory)
+            ledger.record(
+                {
+                    "symbol": "005930",
+                    "signal_timestamp": signal_at.isoformat(),
+                    "signal_entry_ask": 10_010,
+                    "signal_exit_bid": 9_990,
+                    "horizon_seconds": 180,
+                    "compact_features": feature_values(),
+                    "commission_rate": 0.00015,
+                    "sell_tax_rate": 0.002,
+                },
+                now=signal_at,
+                selected=True,
+            )
+            settled = ledger.settle(
+                [make_quote("005930", signal_at + timedelta(seconds=180), 10_100)],
+                now=signal_at + timedelta(seconds=180),
+            )
+
+            self.assertEqual(len(settled), 1)
+            expected_net = estimate_trade_net_pnl_unrounded(
+                entry_price=10_010,
+                exit_price=10_095,
+                quantity=1,
+                commission_rate=0.00015,
+                sell_tax_rate=0.002,
+            )
+            self.assertAlmostEqual(
+                settled[0]["actual_net_return_pct"],
+                expected_net / 10_010 * 100.0,
+                places=8,
+            )
 
 
 if __name__ == "__main__":

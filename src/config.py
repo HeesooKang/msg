@@ -19,7 +19,6 @@ class Config:
     # 계좌
     account_number: str  # 8자리
     account_product_code: str  # 2자리 (01:종합, 03:선물옵션 등)
-    hts_id: str
 
     # 도메인
     base_url: str
@@ -64,7 +63,6 @@ class Config:
         api_key = api_key.strip()
         api_secret = api_secret.strip()
         account_product_code = os.getenv("ACCOUNT_PRODUCT_CODE", "01").strip()
-        hts_id = os.getenv("HTS_ID", "").strip()
         log_level = os.getenv("LOG_LEVEL", "INFO")
         request_connect_timeout = float(os.getenv("REQUEST_CONNECT_TIMEOUT_SECONDS", "3.05"))
         request_read_timeout = float(os.getenv("REQUEST_READ_TIMEOUT_SECONDS", "10"))
@@ -77,7 +75,6 @@ class Config:
             api_secret=api_secret,
             account_number=account_number,
             account_product_code=account_product_code,
-            hts_id=hts_id,
             base_url=base_url,
             ws_url=ws_url,
             rate_limit_interval=rate_limit_interval,
@@ -88,11 +85,10 @@ class Config:
         )
         config.validate()
         logger.info(
-            "설정 로드: mode=%s, account=%s, product=%s, hts_id=%s",
+            "설정 로드: mode=%s, account=%s, product=%s",
             config.trading_mode.upper(),
             config.account_number[:-3] + "***" if len(config.account_number) >= 3 else "***",
             config.account_product_code,
-            config.hts_id,
         )
         return config
 

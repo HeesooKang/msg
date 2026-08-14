@@ -1,5 +1,5 @@
 import os
-from datetime import date as date_cls, datetime, timedelta
+from datetime import date as date_cls, datetime
 
 
 # Local safety net for dates where the KIS holiday endpoint is unavailable in
@@ -96,10 +96,3 @@ def is_krx_regular_trading_day(value=None) -> bool:
     date_key = normalize_trading_date(value)
     day = datetime.strptime(date_key, "%Y%m%d")
     return day.weekday() < 5 and not is_known_krx_closed_date(date_key)
-
-
-def next_krx_regular_trading_day(value=None) -> datetime:
-    day = datetime.strptime(normalize_trading_date(value), "%Y%m%d")
-    while not is_krx_regular_trading_day(day):
-        day += timedelta(days=1)
-    return day

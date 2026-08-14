@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from src.backtest.engine import BacktestEngine
 from src.backtest.intraday_engine import IntradayBacktestEngine
-from src.models import Order, OrderResult, OrderSide, Quote
+from src.models import Order, OrderResult, OrderSide
 from src.strategy import BaseStrategy
 
 
@@ -29,9 +29,6 @@ class DummyBacktestStrategy(BaseStrategy):
     def get_watchlist(self):
         return ["AAA"]
 
-    def on_tick(self, quote):
-        return []
-
     def on_batch_tick(self, quotes):
         quote = quotes[0]
         if self.completed_round_trip:
@@ -45,14 +42,7 @@ class DummyBacktestStrategy(BaseStrategy):
             return
         if result.side == OrderSide.BUY:
             self.has_position = True
-            self.positions[result.symbol] = SimpleNamespace(
-                entry_strategy_name="opening_conviction_long_strategy",
-                entry_setup_name="opening_conviction",
-                entry_reason="opening_conviction",
-                regime_label="bull",
-                bear_score=0,
-                planned_risk_stage="normal",
-            )
+            self.positions[result.symbol] = SimpleNamespace()
         elif result.side == OrderSide.SELL:
             self.has_position = False
             self.completed_round_trip = True
@@ -82,9 +72,6 @@ class PartialExitBacktestStrategy(BaseStrategy):
     def get_watchlist(self):
         return ["AAA"]
 
-    def on_tick(self, quote):
-        return []
-
     def on_batch_tick(self, quotes):
         quote = quotes[0]
         if self.completed:
@@ -102,12 +89,6 @@ class PartialExitBacktestStrategy(BaseStrategy):
         if result.side == OrderSide.BUY:
             self.positions[result.symbol] = SimpleNamespace(
                 quantity=result.quantity,
-                entry_strategy_name="opening_conviction_long_strategy",
-                entry_setup_name="opening_conviction",
-                entry_reason="opening_conviction",
-                regime_label="bull",
-                bear_score=0,
-                planned_risk_stage="normal",
             )
             return
         pos = self.positions.get(result.symbol)
@@ -151,9 +132,8 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertEqual(len(result.daily_records), 1)
         self.assertEqual(result.daily_records[0].trade_count, 2)
         self.assertEqual([record.date for record in result.trade_records], ["20260102", "20260102"])
-        self.assertEqual(result.trade_records[0].strategy_name, "opening_conviction_long_strategy")
-        self.assertEqual(result.trade_records[0].setup_name, "opening_conviction")
-        self.assertEqual(result.trade_records[1].regime_label, "bull")
+        self.assertEqual(result.trade_records[0].side, "buy")
+        self.assertEqual(result.trade_records[1].side, "sell")
         self.assertTrue(strategy.simulated_times)
         self.assertEqual(strategy.simulated_times[0].strftime("%Y%m%d"), "20260102")
         self.assertEqual(strategy.simulated_times[-1].hour, 15)

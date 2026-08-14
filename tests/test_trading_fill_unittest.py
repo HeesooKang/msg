@@ -36,11 +36,18 @@ class FakeClient:
         self.get_responses = list(get_responses)
         self.get_calls = 0
         self.post_calls = 0
+        self.post_requests = []
         self._cooldown_remaining = 0.0
-        self.config = SimpleNamespace(is_paper=is_paper)
+        self.config = SimpleNamespace(
+            is_paper=is_paper,
+            account_number="12345678",
+            account_product_code="01",
+            trading_mode="paper" if is_paper else "real",
+        )
 
     def post(self, **kwargs):
         self.post_calls += 1
+        self.post_requests.append(kwargs)
         if self.post_responses:
             return self.post_responses.pop(0)
         return DummyResponse(success=False, error_message="no post response")
@@ -238,7 +245,7 @@ class TradingFillPriceTests(unittest.TestCase):
         self.assertEqual(result.quantity, 3)
         self.assertEqual(result.price, 70100)
 
-    def test_place_order_keeps_partial_buy_fill_pending(self):
+    def test_expected_value_limit_buy_keeps_partial_fill_and_cancels_remainder(self):
         partial_row = {
             "odno": "303360-order",
             "pdno": "303360",
@@ -246,10 +253,11 @@ class TradingFillPriceTests(unittest.TestCase):
             "avg_prvs": "5140",
         }
         client = FakeClient(
-            post_response=DummyResponse(success=True, output={"ODNO": "303360-order"}),
+            post_response=[
+                DummyResponse(success=True, output={"ODNO": "303360-order"}),
+                DummyResponse(success=True, output={}),
+            ],
             get_responses=[
-                DummyResponse(success=True, output1=[partial_row]),
-                DummyResponse(success=True, output1=[partial_row]),
                 DummyResponse(success=True, output1=[partial_row]),
             ],
         )
@@ -257,9 +265,11 @@ class TradingFillPriceTests(unittest.TestCase):
         order = Order(
             symbol="303360",
             side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
+            order_type=OrderType.LIMIT,
             quantity=143,
+            price=5_140,
             reference_price=5140,
+            requested_reason="expected_value",
         )
 
         with patch("src.trading.time.sleep", return_value=None), self.assertLogs("kis_trader.orders", level="INFO") as logs:
@@ -268,9 +278,13 @@ class TradingFillPriceTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.quantity, 2)
         self.assertEqual(result.requested_quantity, 143)
-        self.assertEqual(result.fill_mode, "partial_fill_pending")
+        self.assertEqual(result.fill_mode, "limit_partial")
         self.assertEqual(client.get_calls, 1)
-        self.assertIn("부분체결 2/143주", "\n".join(logs.output))
+        self.assertEqual(client.post_calls, 2)
+        self.assertEqual(client.post_requests[0]["body"]["ORD_DVSN"], "00")
+        self.assertEqual(client.post_requests[0]["body"]["ORD_UNPR"], "5140")
+        self.assertEqual(client.post_requests[1]["body"]["ORGN_ODNO"], "303360-order")
+        self.assertIn("매수 부분체결", "\n".join(logs.output))
 
     def test_place_order_fallback_when_fill_not_found(self):
         client = FakeClient(
@@ -420,164 +434,36 @@ class TradingFillPriceTests(unittest.TestCase):
         self.assertEqual(result.price, 70300)
         self.assertEqual(client.get_calls, 2)
 
-    def test_place_order_uses_limit_then_market_for_protective_exit(self):
+    def test_expected_value_limit_buy_cancels_without_market_fallback_when_unfilled(self):
         client = FakeClient(
             post_response=[
-                DummyResponse(success=True, output={"ODNO": "11111"}),
-                DummyResponse(success=True, output={}),
-                DummyResponse(success=True, output={"ODNO": "22222"}),
-            ],
-            get_responses=[
-                DummyResponse(success=True, output1=[]),
-                DummyResponse(
-                    success=True,
-                    output1=[{
-                        "odno": "22222",
-                        "pdno": "005930",
-                        "tot_ccld_qty": "5",
-                        "avg_prvs": "9910",
-                    }],
-                ),
-            ],
-        )
-        trading = TradingAPI(client)
-        order = Order(
-            symbol="005930",
-            side=OrderSide.SELL,
-            order_type=OrderType.MARKET,
-            quantity=5,
-            price=0,
-            protective_exit_mode="limit_then_market",
-            protective_limit_price=9930,
-            protective_fallback_polls=1,
-            stop_reference_amount_krw=1500,
-        )
-
-        with patch("src.trading.time.sleep", return_value=None):
-            result = trading.place_order(order)
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.quantity, 5)
-        self.assertEqual(result.fill_mode, "limit_then_market")
-        self.assertTrue(result.protective_fallback_used)
-        self.assertEqual(result.requested_price, 9930)
-        self.assertEqual(result.stop_reference_amount_krw, 1500)
-        self.assertEqual(client.post_calls, 3)
-
-    def test_protective_exit_treats_non_cancellable_limit_as_filled(self):
-        client = FakeClient(
-            post_response=[
-                DummyResponse(success=True, output={"ODNO": "11111"}),
-                DummyResponse(success=False, error_message="모의투자 정정/취소할 수량이 없습니다."),
-            ],
-            get_responses=[
-                DummyResponse(success=True, output1=[]),
-            ],
-        )
-        trading = TradingAPI(client)
-        order = Order(
-            symbol="010170",
-            side=OrderSide.SELL,
-            order_type=OrderType.MARKET,
-            quantity=25,
-            price=0,
-            protective_exit_mode="limit_then_market",
-            protective_limit_price=13500,
-            protective_fallback_polls=1,
-            stop_reference_amount_krw=2385,
-        )
-
-        with patch("src.trading.time.sleep", return_value=None):
-            result = trading.place_order(order)
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.quantity, 25)
-        self.assertEqual(result.price, 13500)
-        self.assertEqual(result.fill_mode, "limit_assumed_filled")
-        self.assertEqual(result.protective_exit_mode, "limit_then_market")
-        self.assertEqual(result.stop_reference_amount_krw, 2385)
-
-    def test_protective_exit_falls_back_to_market_on_tick_error(self):
-        client = FakeClient(
-            post_response=[
-                DummyResponse(success=False, error_code="40030000", error_message="모의투자 주문처리가 안되었습니다(호가단위 오류)"),
-                DummyResponse(success=True, output={"ODNO": "22222"}),
-            ],
-            get_responses=[
-                DummyResponse(
-                    success=True,
-                    output1=[{
-                        "odno": "22222",
-                        "pdno": "464930",
-                        "tot_ccld_qty": "1",
-                        "avg_prvs": "19655",
-                    }],
-                )
-            ],
-        )
-        trading = TradingAPI(client)
-        order = Order(
-            symbol="464930",
-            side=OrderSide.SELL,
-            order_type=OrderType.MARKET,
-            quantity=1,
-            price=0,
-            protective_exit_mode="limit_then_market",
-            protective_limit_price=19660,
-            protective_fallback_polls=1,
-            stop_reference_amount_krw=1500,
-        )
-
-        with patch("src.trading.time.sleep", return_value=None):
-            result = trading.place_order(order)
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.quantity, 1)
-        self.assertEqual(result.price, 19655)
-        self.assertEqual(result.fill_mode, "market_after_limit_reject")
-        self.assertTrue(result.protective_fallback_used)
-        self.assertEqual(result.requested_price, 19660)
-
-    def test_protective_exit_falls_back_to_market_on_generic_limit_reject(self):
-        client = FakeClient(
-            post_response=[
-                DummyResponse(success=False, error_code="99999999", error_message="지정가 주문 검증 실패"),
                 DummyResponse(success=True, output={"ODNO": "33333"}),
+                DummyResponse(success=True, output={}),
             ],
-            get_responses=[
-                DummyResponse(
-                    success=True,
-                    output1=[{
-                        "odno": "33333",
-                        "pdno": "005930",
-                        "tot_ccld_qty": "2",
-                        "avg_prvs": "70000",
-                    }],
-                )
-            ],
+            get_responses=[DummyResponse(success=True, output1=[])],
         )
         trading = TradingAPI(client)
         order = Order(
             symbol="005930",
-            side=OrderSide.SELL,
-            order_type=OrderType.MARKET,
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
             quantity=2,
-            price=0,
-            protective_exit_mode="limit_then_market",
-            protective_limit_price=70100,
-            protective_fallback_polls=1,
-            stop_reference_amount_krw=1500,
+            price=70_100,
+            reference_price=70_000,
+            requested_reason="expected_value",
         )
 
         with patch("src.trading.time.sleep", return_value=None):
             result = trading.place_order(order)
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.quantity, 2)
-        self.assertEqual(result.price, 70000)
-        self.assertEqual(result.fill_mode, "market_after_limit_reject")
-        self.assertTrue(result.protective_fallback_used)
-        self.assertEqual(result.requested_price, 70100)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_category, "not_filled")
+        self.assertEqual(result.quantity, 0)
+        self.assertEqual(result.fill_mode, "limit_cancelled")
+        self.assertEqual(result.requested_price, 70_100)
+        self.assertEqual(client.post_calls, 2)
+        self.assertEqual(client.post_requests[0]["body"]["ORD_DVSN"], "00")
+        self.assertEqual(client.post_requests[1]["api_url"], "/uapi/domestic-stock/v1/trading/order-rvsecncl")
 
     def test_buy_order_waits_for_next_tick_when_rate_limited(self):
         client = FakeClient(

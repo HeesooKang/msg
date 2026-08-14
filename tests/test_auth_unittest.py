@@ -21,7 +21,6 @@ def _config(
         api_secret=api_secret,
         account_number=account_number,
         account_product_code=account_product_code,
-        hts_id="",
         base_url="https://openapivts.koreainvestment.com:29443",
         ws_url="ws://ops.koreainvestment.com:31000",
         rate_limit_interval=0.5,

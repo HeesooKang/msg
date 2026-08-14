@@ -77,6 +77,31 @@ class NotificationTests(unittest.TestCase):
         self.assertFalse(second)
         self.assertEqual(mock_post.call_count, 2)
 
+    def test_transient_kakao_send_failure_is_retried(self):
+        cfg = AlertConfig(
+            enabled=True,
+            channel="kakao",
+            kakao_rest_api_key="rest-key",
+            kakao_refresh_token="refresh-token",
+            kakao_message_web_url="https://example.com",
+            min_interval_seconds=0,
+        )
+        mgr = AlertManager(cfg=cfg)
+
+        with patch(
+            "src.notifications.requests.post",
+            side_effect=[
+                DummyResp(200, json_body={"access_token": "access-token", "expires_in": 3600}),
+                DummyResp(503, text="temporary"),
+                DummyResp(200, json_body={"result_code": 0}),
+            ],
+        ) as mock_post, patch("src.notifications.time.sleep") as mock_sleep:
+            ok = mgr.send(event_key="retry", title="t", message="m")
+
+        self.assertTrue(ok)
+        self.assertEqual(mock_post.call_count, 3)
+        mock_sleep.assert_called_once_with(0.5)
+
     def test_disabled_alert_returns_false(self):
         cfg = AlertConfig(
             enabled=False,

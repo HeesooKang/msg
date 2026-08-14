@@ -39,10 +39,10 @@ class AccountAPI:
             if not res.success:
                 return responses + [res]
             responses.append(res)
-            if not bool(getattr(res, "has_next", False)):
+            if not res.has_next:
                 return responses
 
-            payload = getattr(res, "data", {}) or {}
+            payload = res.data or {}
             next_fk = str(payload.get("ctx_area_fk100", "") or "")
             next_nk = str(payload.get("ctx_area_nk100", "") or "")
             if not next_fk and not next_nk:
@@ -99,9 +99,9 @@ class AccountAPI:
             return None
         res = responses[-1]
         if not res.success:
-            config = getattr(self.client, "config", None)
-            acc_no = getattr(config, "account_number", "")
-            acc_prod = getattr(config, "account_product_code", "")
+            config = self.client.config
+            acc_no = config.account_number
+            acc_prod = config.account_product_code
             if acc_no:
                 acc_masked = f"{acc_no[:2]}******" if len(acc_no) > 2 else "***"
             else:
@@ -113,7 +113,7 @@ class AccountAPI:
                     "CANO=%s, ACNT_PRDT_CD=%s, MODE=%s",
                     acc_masked,
                     acc_prod,
-                    getattr(config, "trading_mode", "unknown"),
+                    config.trading_mode,
                 )
             else:
                 logger.error("잔고 조회 실패: %s", res.error_message)
@@ -128,13 +128,8 @@ class AccountAPI:
                     continue
                 positions.append(Position(
                     symbol=item.get("pdno", ""),
-                    name=item.get("prdt_name", ""),
                     quantity=qty,
                     avg_price=float(item.get("pchs_avg_pric", 0)),
-                    current_price=int(item.get("prpr", 0)),
-                    eval_amount=int(item.get("evlu_amt", 0)),
-                    profit_loss=int(item.get("evlu_pfls_amt", 0)),
-                    profit_rate=float(item.get("evlu_pfls_rt", 0)),
                 ))
 
         # 계좌 요약 (output2의 첫 번째 항목)
@@ -147,7 +142,6 @@ class AccountAPI:
             total_eval_amount=int(summary.get("tot_evlu_amt", 0)),
             total_deposit=int(summary.get("dnca_tot_amt", 0)),
             total_profit_loss=int(summary.get("evlu_pfls_smtl_amt", 0)),
-            total_profit_rate=float(summary.get("tot_evlu_pfls_amt_rt", 0) or 0),
             positions=positions,
         )
 
@@ -157,8 +151,7 @@ class AccountAPI:
         주식잔고조회_실현손익(v1_국내주식-041) 기준이며,
         전일 매매를 제외(PRCS_DVSN=01)한 당일 값을 사용한다.
         """
-        cfg = getattr(self.client, "config", None)
-        if bool(getattr(cfg, "is_paper", False)):
+        if self.client.config.is_paper:
             return None
 
         params = {
@@ -216,30 +209,6 @@ class AccountAPI:
 
         logger.warning("실현손익 응답 파싱 실패: rlzt_pfls 값을 찾지 못했습니다.")
         return None
-
-    def get_buying_power(self, symbol: str = "", price: int = 0) -> int:
-        """매수 가능 금액을 조회한다."""
-        params = {
-            "CANO": "",
-            "ACNT_PRDT_CD": "",
-            "PDNO": symbol,
-            "ORD_UNPR": str(price),
-            "ORD_DVSN": "01",  # 시장가
-            "CMA_EVLU_AMT_ICLD_YN": "Y",
-            "OVRS_ICLD_YN": "N",
-        }
-
-        res = self.client.get(
-            api_url="/uapi/domestic-stock/v1/trading/inquire-psbl-order",
-            tr_id="TTTC8908R",
-            params=params,
-        )
-        if not res.success:
-            logger.error("매수가능 조회 실패: %s", res.error_message)
-            return 0
-
-        output = res.output or {}
-        return int(output.get("ord_psbl_cash", 0))
 
     def get_order_history(
         self,

@@ -95,9 +95,16 @@ class AlertManager:
         if min_interval > 0 and now - last_ts < min_interval:
             return False
 
-        ok = self._send_kakao(level=level, title=title, message=message)
+        ok = False
+        for attempt in range(3):
+            ok = self._send_kakao(level=level, title=title, message=message)
+            if ok or self._kakao_auth_disabled_reason:
+                break
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
         if ok:
             self._last_sent[event_key] = now
+            logger.info("알림 전송 성공: event=%s title=%s", event_key, title)
         else:
             logger.warning("알림 전송 실패: event=%s title=%s", event_key, title)
         return ok
@@ -197,6 +204,9 @@ class AlertManager:
                     logger.warning("카카오 알림 실패 result_code=%s: %s", body.get("result_code"), body)
                     return False
                 return True
+            if res.status_code == 401:
+                self._kakao_access_token = ""
+                self._kakao_access_token_expires_at = 0.0
             logger.warning("카카오 알림 실패 HTTP %d: %s", res.status_code, res.text)
             return False
         except Exception as e:

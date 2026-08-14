@@ -9,6 +9,8 @@ class DummyResponse:
         self.output1 = output1 or []
         self.output2 = output2 or []
         self.error_message = error_message
+        self.has_next = False
+        self.data = {}
 
 
 class DummyClient:

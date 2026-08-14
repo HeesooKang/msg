@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime, timedelta
-from math import exp, sqrt
 from pathlib import Path
-from statistics import median
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
+from src.analytics.price_prediction import (
+    PREDICTION_FEATURES,
+    executable_bid,
+)
 from src.models import Quote
+from src.strategies.momentum_scalp_pnl import estimate_trade_net_pnl_unrounded
 
 
-def _clip(value: float, low: float, high: float) -> float:
-    return max(low, min(high, float(value)))
+FORECAST_SCHEMA_VERSION = 3
+
+
+def _has_current_features(item: Mapping[str, Any]) -> bool:
+    compact_features = item.get("compact_features")
+    return (
+        isinstance(compact_features, Mapping)
+        and set(compact_features) == set(PREDICTION_FEATURES)
+    )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -32,183 +40,13 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
 
 
-def _weighted_median(values: Sequence[tuple[float, float]]) -> float:
-    ordered = sorted((float(value), max(0.0, float(weight))) for value, weight in values)
-    total_weight = sum(weight for _, weight in ordered)
-    if not ordered or total_weight <= 0.0:
-        return 0.0
-    threshold = total_weight / 2.0
-    running = 0.0
-    for value, weight in ordered:
-        running += weight
-        if running >= threshold:
-            return value
-    return ordered[-1][0]
-
-
-def _median_absolute_deviation(values: Sequence[float]) -> float:
-    if not values:
-        return 0.0
-    center = median(float(value) for value in values)
-    return median(abs(float(value) - center) for value in values)
-
-
-def _actual_return_pct(item: Mapping[str, Any]) -> float | None:
-    if "actual_return_pct" in item:
-        return _safe_float(item.get("actual_return_pct"))
-    if "actual_net_return_pct" not in item:
-        return None
-    return _safe_float(item.get("actual_net_return_pct")) + max(
-        0.0,
-        _safe_float(item.get("round_trip_cost_pct")),
-    )
-
-
-@dataclass(frozen=True)
-class WalkForwardCalibration:
-    sample_count: int
-    effective_sample_size: float
-    raw_win_probability: float
-    calibrated_win_probability: float
-    raw_return_pct: float
-    calibrated_return_pct: float
-
-    @property
-    def return_shift_pct(self) -> float:
-        return float(self.calibrated_return_pct) - float(self.raw_return_pct)
-
-
-def calibrate_walk_forward(
-    outcomes: Iterable[Mapping[str, Any]],
-    *,
-    raw_win_probability: float,
-    raw_return_pct: float,
-    horizon_seconds: int,
-    round_trip_cost_pct: float = 0.0,
-    strategy_name: str = "",
-) -> WalkForwardCalibration:
-    raw_probability = _clip(raw_win_probability, 0.0, 1.0)
-    raw_return = float(raw_return_pct)
-    normalized_strategy = str(strategy_name or "")
-    usable = [
-        item
-        for item in outcomes
-        if int(item.get("horizon_seconds", 0) or 0) == int(horizon_seconds)
-        and _actual_return_pct(item) is not None
-        and "raw_win_probability" in item
-        and "raw_predicted_return_pct" in item
-        and (
-            not normalized_strategy
-            or str(item.get("strategy_name") or "") == normalized_strategy
-        )
-    ]
-    if not usable:
-        return WalkForwardCalibration(
-            sample_count=0,
-            effective_sample_size=0.0,
-            raw_win_probability=raw_probability,
-            calibrated_win_probability=raw_probability,
-            raw_return_pct=raw_return,
-            calibrated_return_pct=raw_return,
-        )
-
-    historical_probabilities = [_safe_float(item.get("raw_win_probability"), 0.5) for item in usable]
-    historical_returns = [_safe_float(item.get("raw_predicted_return_pct")) for item in usable]
-    statistical_floor = 1.0 / sqrt(len(usable) + 1.0)
-    probability_scale = max(
-        statistical_floor,
-        1.4826 * _median_absolute_deviation(historical_probabilities),
-    )
-    return_scale = max(
-        statistical_floor,
-        1.4826 * _median_absolute_deviation(historical_returns),
-    )
-    raw_weights: List[float] = []
-    for historical_probability, historical_return in zip(
-        historical_probabilities,
-        historical_returns,
-    ):
-        distance_squared = (
-            ((historical_probability - raw_probability) / probability_scale) ** 2
-            + ((historical_return - raw_return) / return_scale) ** 2
-        )
-        raw_weights.append(exp(-0.5 * distance_squared))
-
-    # Repeated signals share both symbol-specific and session-wide noise.
-    # Cap their combined influence so quote frequency cannot masquerade as evidence.
-    group_totals: Dict[tuple[str, str], float] = defaultdict(float)
-    group_keys: List[tuple[str, str]] = []
-    for index, (item, weight) in enumerate(zip(usable, raw_weights)):
-        timestamp = str(item.get("signal_timestamp") or "")
-        symbol = str(item.get("symbol") or f"row-{index}")
-        group_key = (timestamp[:10], symbol)
-        group_keys.append(group_key)
-        group_totals[group_key] += weight
-    weights = [
-        weight / max(1.0, group_totals[group_key])
-        for weight, group_key in zip(raw_weights, group_keys)
-    ]
-    date_totals: Dict[str, float] = defaultdict(float)
-    for (date_text, _symbol), weight in zip(group_keys, weights):
-        date_totals[date_text] += weight
-    weights = [
-        weight / max(1.0, date_totals[date_text])
-        for weight, (date_text, _symbol) in zip(weights, group_keys)
-    ]
-    effective_samples = sum(weights)
-    if effective_samples <= 1e-9:
-        return WalkForwardCalibration(
-            sample_count=len(usable),
-            effective_sample_size=round(effective_samples, 6),
-            raw_win_probability=raw_probability,
-            calibrated_win_probability=raw_probability,
-            raw_return_pct=raw_return,
-            calibrated_return_pct=raw_return,
-        )
-
-    execution_cost = max(0.0, float(round_trip_cost_pct))
-    weighted_wins = sum(
-        weight * (1.0 if float(_actual_return_pct(item) or 0.0) > execution_cost else 0.0)
-        for item, weight in zip(usable, weights)
-    )
-    prior_strength = max(1.0, sqrt(effective_samples))
-    calibrated_probability = (
-        weighted_wins + prior_strength * raw_probability
-    ) / (effective_samples + prior_strength)
-    forecast_errors = [
-        float(_actual_return_pct(item) or 0.0)
-        - _safe_float(item.get("raw_predicted_return_pct"))
-        for item in usable
-    ]
-    forecast_error = _weighted_median(list(zip(forecast_errors, weights)))
-    residual_deviation = _weighted_median(
-        [
-            (abs(error - forecast_error), weight)
-            for error, weight in zip(forecast_errors, weights)
-        ]
-    )
-    # A noisy mix of over- and under-predictions should not create a large shift.
-    residual_consistency = abs(forecast_error) / max(
-        1e-12,
-        abs(forecast_error) + 1.4826 * residual_deviation,
-    )
-    reliability = effective_samples / max(
-        1.0,
-        effective_samples + prior_strength,
-    )
-    calibrated_return = raw_return + reliability * residual_consistency * forecast_error
-    return WalkForwardCalibration(
-        sample_count=len(usable),
-        effective_sample_size=round(effective_samples, 6),
-        raw_win_probability=raw_probability,
-        calibrated_win_probability=_clip(calibrated_probability, 0.0, 1.0),
-        raw_return_pct=raw_return,
-        calibrated_return_pct=float(calibrated_return),
-    )
+def _settlement_grace_seconds(horizon_seconds: int) -> int:
+    horizon = max(1, int(horizon_seconds or 0))
+    return max(15, min(60, int(round(horizon / 3.0))))
 
 
 class ForecastOutcomeLedger:
-    """Persist non-overlapping forecasts and settle them on the first post-horizon quote."""
+    """Persist executable forecasts and settle each one on its first post-horizon bid."""
 
     def __init__(self, root: Path | str):
         self.root = Path(root)
@@ -217,6 +55,7 @@ class ForecastOutcomeLedger:
         self._outcomes: List[Dict[str, Any]] = []
         self._history_cache_date = ""
         self._history_cache: List[Dict[str, Any]] = []
+        self._sequence = 0
 
     def _path_for_date(self, date_text: str) -> Path:
         year, month, _ = date_text.split("-")
@@ -226,20 +65,30 @@ class ForecastOutcomeLedger:
         date_text = moment.date().isoformat()
         if date_text == self._active_date:
             return
+        if self._active_date and self._pending:
+            self._save()
         self._active_date = date_text
         self._pending = {}
         self._outcomes = []
+        self._sequence = 0
         path = self._path_for_date(date_text)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
-        self._pending = {
-            str(item.get("symbol") or ""): dict(item)
-            for item in (payload.get("pending") or [])
-            if str(item.get("symbol") or "")
-        }
-        self._outcomes = [dict(item) for item in (payload.get("outcomes") or [])]
+        schema_version = int(payload.get("schema_version", 0) or 0)
+        if schema_version >= FORECAST_SCHEMA_VERSION:
+            self._pending = {
+                str(item.get("forecast_id") or ""): dict(item)
+                for item in (payload.get("pending") or [])
+                if str(item.get("forecast_id") or "")
+            }
+        self._outcomes = [
+            dict(item)
+            for item in (payload.get("outcomes") or [])
+            if isinstance(item, Mapping)
+        ]
+        self._sequence = len(self._pending) + len(self._outcomes)
 
     def _save(self) -> None:
         if not self._active_date:
@@ -247,13 +96,14 @@ class ForecastOutcomeLedger:
         path = self._path_for_date(self._active_date)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "schema_version": FORECAST_SCHEMA_VERSION,
             "date": self._active_date,
             "pending": list(self._pending.values()),
             "outcomes": list(self._outcomes),
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
         temporary.replace(path)
@@ -261,82 +111,264 @@ class ForecastOutcomeLedger:
     def settle(self, quotes: Sequence[Quote], *, now: datetime) -> List[Dict[str, Any]]:
         self._ensure_date(now)
         settled: List[Dict[str, Any]] = []
-        for quote in quotes:
-            symbol = str(getattr(quote, "symbol", "") or "")
-            pending = self._pending.get(symbol)
-            if not pending:
-                continue
-            due_at = _parse_datetime(pending.get("due_at"))
-            quote_at = _parse_datetime(getattr(quote, "timestamp", None)) or now
-            if due_at is None or quote_at < due_at:
-                continue
-            signal_price = max(0, int(pending.get("signal_price", 0) or 0))
-            outcome_price = max(0, int(getattr(quote, "current_price", 0) or 0))
-            if signal_price <= 0 or outcome_price <= 0:
-                continue
-            actual_return = ((float(outcome_price) / float(signal_price)) - 1.0) * 100.0
-            actual_net_return = actual_return - max(
-                0.0,
-                _safe_float(pending.get("round_trip_cost_pct")),
-            )
-            record = dict(pending)
-            record.update(
-                {
-                    "outcome_timestamp": quote_at.isoformat(timespec="seconds"),
-                    "outcome_price": outcome_price,
-                    "elapsed_seconds": max(
-                        0,
-                        int((quote_at - (_parse_datetime(pending.get("signal_timestamp")) or quote_at)).total_seconds()),
-                    ),
-                    "actual_return_pct": round(actual_return, 6),
-                    "actual_net_return_pct": round(actual_net_return, 6),
-                    "raw_prediction_error_pct": round(
-                        actual_return - _safe_float(pending.get("raw_predicted_return_pct")),
-                        6,
-                    ),
-                    "calibrated_prediction_error_pct": round(
-                        actual_return
-                        - _safe_float(
-                            pending.get(
-                                "calibrated_predicted_return_pct",
-                                pending.get("raw_predicted_return_pct"),
-                            )
-                        ),
-                        6,
-                    ),
-                    "profitable": bool(actual_net_return > 0.0),
-                }
-            )
-            self._outcomes.append(record)
-            settled.append(record)
-            self._pending.pop(symbol, None)
+        ordered_quotes = sorted(
+            quotes,
+            key=lambda quote: (quote.timestamp, str(quote.symbol)),
+        )
+        for quote in ordered_quotes:
+            symbol = str(quote.symbol or "")
+            quote_at = quote.timestamp
+            matching_ids = [
+                forecast_id
+                for forecast_id, pending in self._pending.items()
+                if str(pending.get("symbol") or "") == symbol
+            ]
+            for forecast_id in matching_ids:
+                pending = self._pending.get(forecast_id)
+                if pending is None:
+                    continue
+                due_at = _parse_datetime(pending.get("due_at"))
+                if due_at is None:
+                    continue
+                if quote_at < due_at:
+                    continue
+                entry_ask = max(
+                    0,
+                    int(pending.get("signal_entry_ask", 0) or 0),
+                )
+                outcome_bid = executable_bid(quote)
+                if entry_ask <= 0 or outcome_bid <= 0:
+                    continue
+                commission_rate = max(0.0, _safe_float(pending.get("commission_rate")))
+                sell_tax_rate = max(0.0, _safe_float(pending.get("sell_tax_rate")))
+                actual_return = ((float(outcome_bid) / float(entry_ask)) - 1.0) * 100.0
+                actual_net = estimate_trade_net_pnl_unrounded(
+                    entry_price=entry_ask,
+                    exit_price=outcome_bid,
+                    quantity=1,
+                    commission_rate=commission_rate,
+                    sell_tax_rate=sell_tax_rate,
+                )
+                actual_net_return = actual_net / float(entry_ask) * 100.0
+                signal_at = _parse_datetime(pending.get("signal_timestamp")) or quote_at
+                elapsed_seconds = max(0, int((quote_at - signal_at).total_seconds()))
+                horizon_seconds = max(1, int(pending.get("horizon_seconds", 0) or 0))
+                training_eligible = elapsed_seconds <= (
+                    horizon_seconds + _settlement_grace_seconds(horizon_seconds)
+                )
+                record = dict(pending)
+                record.update(
+                    {
+                        "outcome_timestamp": quote_at.isoformat(timespec="seconds"),
+                        "outcome_bid": int(outcome_bid),
+                        "elapsed_seconds": elapsed_seconds,
+                        "training_eligible": training_eligible,
+                        "outcome_status": "on_horizon" if training_eligible else "late",
+                        "actual_return_pct": round(actual_return, 8),
+                        "actual_net_return_pct": round(actual_net_return, 8),
+                        "profitable": bool(actual_net_return > 0.0),
+                    }
+                )
+                self._outcomes.append(record)
+                settled.append(record)
+                self._pending.pop(forecast_id, None)
         if settled:
             self._save()
             self._history_cache_date = ""
         return settled
 
-    def record(self, payload: Mapping[str, Any], *, now: datetime, selected: bool) -> bool:
+    def _pending_for_symbol(
+        self,
+        symbol: str,
+        *,
+        selected: bool,
+        record_kind: str,
+    ) -> Dict[str, Any] | None:
+        return next(
+            (
+                item
+                for item in self._pending.values()
+                if str(item.get("symbol") or "") == symbol
+                and _has_current_features(item)
+                and bool(item.get("selected")) is bool(selected)
+                and str(
+                    item.get("record_kind")
+                    or ("selected" if item.get("selected") else "observed")
+                )
+                == record_kind
+            ),
+            None,
+        )
+
+    def record(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+        selected: bool,
+    ) -> str | None:
         self._ensure_date(now)
         symbol = str(payload.get("symbol") or "")
-        signal_price = max(0, int(payload.get("signal_price", 0) or 0))
+        entry_ask = max(
+            0,
+            int(payload.get("signal_entry_ask", 0) or 0),
+        )
         horizon_seconds = max(1, int(payload.get("horizon_seconds", 0) or 0))
-        if not symbol or signal_price <= 0:
-            return False
-        if symbol in self._pending and not selected:
-            return False
+        if not symbol or entry_ask <= 0 or not _has_current_features(payload):
+            return None
+        record_kind = str(
+            payload.get("record_kind")
+            or ("selected" if selected else "observed")
+        )
+        existing = self._pending_for_symbol(
+            symbol,
+            selected=selected,
+            record_kind=record_kind,
+        )
+        if existing is not None:
+            return str(existing.get("forecast_id") or "") or None
+        forecast_id = self._append_pending(payload, now=now, selected=selected)
+        if forecast_id is not None:
+            self._save()
+        return forecast_id
+
+    def _append_pending(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+        selected: bool,
+    ) -> str | None:
+        symbol = str(payload.get("symbol") or "")
+        entry_ask = max(
+            0,
+            int(payload.get("signal_entry_ask", 0) or 0),
+        )
+        horizon_seconds = max(1, int(payload.get("horizon_seconds", 0) or 0))
+        if not symbol or entry_ask <= 0 or not _has_current_features(payload):
+            return None
+        record_kind = str(
+            payload.get("record_kind")
+            or ("selected" if selected else "observed")
+        )
         signal_at = _parse_datetime(payload.get("signal_timestamp")) or now
+        self._sequence += 1
+        forecast_id = str(payload.get("forecast_id") or "").strip() or (
+            f"{symbol}:{signal_at.isoformat(timespec='seconds')}:{horizon_seconds}:"
+            f"{record_kind}:{self._sequence}"
+        )
         record = dict(payload)
         record.update(
             {
+                "forecast_id": forecast_id,
                 "symbol": symbol,
-                "signal_price": signal_price,
+                "signal_entry_ask": entry_ask,
                 "horizon_seconds": horizon_seconds,
                 "signal_timestamp": signal_at.isoformat(timespec="seconds"),
                 "due_at": (signal_at + timedelta(seconds=horizon_seconds)).isoformat(timespec="seconds"),
                 "selected": bool(selected),
+                "record_kind": record_kind,
             }
         )
-        self._pending[symbol] = record
+        self._pending[forecast_id] = record
+        return forecast_id
+
+    def record_observation_sets(
+        self,
+        payloads: Sequence[Mapping[str, Any]],
+        *,
+        now: datetime,
+    ) -> Dict[tuple[str, int], str]:
+        """Record one non-overlapping multi-horizon sample per symbol."""
+        self._ensure_date(now)
+        grouped: Dict[str, Dict[int, Mapping[str, Any]]] = {}
+        for payload in payloads:
+            symbol = str(payload.get("symbol") or "")
+            horizon = max(1, int(payload.get("horizon_seconds", 0) or 0))
+            if symbol:
+                grouped.setdefault(symbol, {})[horizon] = payload
+
+        recorded: Dict[tuple[str, int], str] = {}
+        changed = False
+        for symbol, horizon_payloads in grouped.items():
+            existing = self._pending_for_symbol(
+                symbol,
+                selected=False,
+                record_kind="observed",
+            )
+            if existing is not None:
+                continue
+            for horizon, payload in sorted(horizon_payloads.items()):
+                forecast_id = self._append_pending(
+                    payload,
+                    now=now,
+                    selected=False,
+                )
+                if forecast_id is None:
+                    continue
+                recorded[(symbol, horizon)] = forecast_id
+                changed = True
+        if changed:
+            self._save()
+        return recorded
+
+    def has_pending_selected(self, symbol: str, *, now: datetime) -> bool:
+        self._ensure_date(now)
+        return self._pending_for_symbol(
+            str(symbol or "").strip(),
+            selected=True,
+            record_kind="selected",
+        ) is not None
+
+    def record_execution_outcome(
+        self,
+        *,
+        symbol: str,
+        forecast_id: str = "",
+        entry_price: int,
+        exit_price: int,
+        quantity: int,
+        net_pnl: int,
+        now: datetime,
+    ) -> bool:
+        self._ensure_date(now)
+        normalized_symbol = str(symbol or "").strip()
+        resolved_entry = max(0, int(entry_price or 0))
+        resolved_exit = max(0, int(exit_price or 0))
+        resolved_quantity = max(0, int(quantity or 0))
+        if not normalized_symbol or resolved_entry <= 0 or resolved_exit <= 0 or resolved_quantity <= 0:
+            return False
+
+        normalized_id = str(forecast_id or "").strip()
+        target = self._pending.get(normalized_id) if normalized_id else None
+        if target is None:
+            target = next(
+                (
+                    item
+                    for item in reversed(self._outcomes)
+                    if str(item.get("symbol") or "") == normalized_symbol
+                    and bool(item.get("selected"))
+                    and (not normalized_id or str(item.get("forecast_id") or "") == normalized_id)
+                ),
+                None,
+            )
+        if target is None:
+            return False
+        invested = float(resolved_entry * resolved_quantity)
+        signal_at = _parse_datetime(target.get("signal_timestamp")) or now
+        target.update(
+            {
+                "execution_timestamp": now.isoformat(timespec="seconds"),
+                "execution_elapsed_seconds": max(0, int((now - signal_at).total_seconds())),
+                "execution_entry_price": resolved_entry,
+                "execution_exit_price": resolved_exit,
+                "execution_quantity": resolved_quantity,
+                "execution_net_pnl": int(net_pnl),
+                "execution_return_pct": round(((resolved_exit / resolved_entry) - 1.0) * 100.0, 8),
+                "execution_net_return_pct": round(float(net_pnl) / invested * 100.0, 8),
+                "execution_profitable": bool(net_pnl > 0),
+            }
+        )
         self._save()
         return True
 
@@ -351,32 +383,25 @@ class ForecastOutcomeLedger:
                     payload = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
+                if int(payload.get("schema_version", 0) or 0) != FORECAST_SCHEMA_VERSION:
+                    continue
                 if str(payload.get("date") or "") >= date_text:
                     continue
                 outcomes.extend(
                     dict(item)
                     for item in (payload.get("outcomes") or [])
-                    if isinstance(item, dict)
+                    if isinstance(item, Mapping)
                 )
         self._history_cache_date = date_text
         self._history_cache = outcomes
         return list(outcomes)
 
-    def calibrate(
-        self,
-        *,
-        as_of: datetime,
-        raw_win_probability: float,
-        raw_return_pct: float,
-        horizon_seconds: int,
-        round_trip_cost_pct: float = 0.0,
-        strategy_name: str = "",
-    ) -> WalkForwardCalibration:
-        return calibrate_walk_forward(
-            self.historical_outcomes(as_of=as_of),
-            raw_win_probability=raw_win_probability,
-            raw_return_pct=raw_return_pct,
-            horizon_seconds=horizon_seconds,
-            round_trip_cost_pct=round_trip_cost_pct,
-            strategy_name=strategy_name,
+    def training_outcomes(self, *, as_of: datetime) -> List[Dict[str, Any]]:
+        self._ensure_date(as_of)
+        outcomes = self.historical_outcomes(as_of=as_of)
+        outcomes.extend(
+            dict(item)
+            for item in self._outcomes
+            if (_parse_datetime(item.get("outcome_timestamp")) or as_of) <= as_of
         )
+        return outcomes

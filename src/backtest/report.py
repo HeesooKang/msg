@@ -9,31 +9,6 @@ def _closed_trades(result: BacktestResult):
     return [record for record in result.trade_records if record.side == "sell"]
 
 
-def _strategy_breakdown(result: BacktestResult) -> list[tuple[str, dict]]:
-    stats = defaultdict(lambda: {"trades": 0, "net_pnl": 0})
-    for trade in _closed_trades(result):
-        key = trade.strategy_name or "unknown_strategy"
-        stats[key]["trades"] += 1
-        stats[key]["net_pnl"] += trade.pnl
-    return sorted(stats.items(), key=lambda item: (item[1]["net_pnl"], item[0]), reverse=True)
-
-
-def _setup_breakdown(result: BacktestResult) -> list[tuple[str, dict]]:
-    stats = defaultdict(lambda: {"trades": 0, "net_pnl": 0})
-    for trade in _closed_trades(result):
-        key = trade.setup_name or ("inverse_unknown" if trade.is_inverse else "unknown")
-        stats[key]["trades"] += 1
-        stats[key]["net_pnl"] += trade.pnl
-    return sorted(stats.items(), key=lambda item: (item[1]["net_pnl"], item[0]), reverse=True)
-
-
-def _regime_breakdown(result: BacktestResult) -> list[tuple[str, int]]:
-    stats = defaultdict(int)
-    for trade in _closed_trades(result):
-        stats[trade.regime_label or "unknown"] += trade.pnl
-    return sorted(stats.items(), key=lambda item: (item[1], item[0]), reverse=True)
-
-
 def _symbol_breakdown(result: BacktestResult) -> list[tuple[str, int]]:
     stats = defaultdict(int)
     for trade in _closed_trades(result):
@@ -77,26 +52,6 @@ def print_report(result: BacktestResult, daily_target: int = 10_000, daily_limit
 
     closed_trades = _closed_trades(result)
     if closed_trades:
-        print("\n  전략별 손익:")
-        for strategy_name, metrics in _strategy_breakdown(result):
-            expectancy = metrics["net_pnl"] / metrics["trades"] if metrics["trades"] else 0
-            print(
-                f"    - {strategy_name}: {metrics['trades']}건, "
-                f"순손익 {metrics['net_pnl']:,}원, 기대값 {expectancy:,.0f}원"
-            )
-
-        print("\n  셋업별 손익:")
-        for setup_name, metrics in _setup_breakdown(result)[:5]:
-            expectancy = metrics["net_pnl"] / metrics["trades"] if metrics["trades"] else 0
-            print(
-                f"    - {setup_name}: {metrics['trades']}건, "
-                f"순손익 {metrics['net_pnl']:,}원, 기대값 {expectancy:,.0f}원"
-            )
-
-        print("\n  레짐별 손익:")
-        for regime_label, net_pnl in _regime_breakdown(result):
-            print(f"    - {regime_label}: {net_pnl:,}원")
-
         symbol_breakdown = _symbol_breakdown(result)
         if symbol_breakdown:
             print("\n  종목별 손익 상위:")

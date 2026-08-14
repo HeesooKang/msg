@@ -1,24 +1,16 @@
 """1분봉 리플레이용 백테스트 엔진."""
 
 import logging
-from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 
 import pandas as pd
 
 from src.backtest.engine import BacktestResult, DailyRecord, TradeRecord
-from src.models import Order, OrderResult, OrderSide, Quote
+from src.models import Order, OrderResult, OrderSide, OrderType, Quote
 from src.strategy import BaseStrategy
 
 logger = logging.getLogger("kis_trader.backtest.intraday")
-
-
-@dataclass
-class _DayMeta:
-    prev_close: int
-    day_open: int
 
 
 class IntradayBacktestEngine:
@@ -44,7 +36,6 @@ class IntradayBacktestEngine:
         self._positions: Dict[str, dict] = {}
         self._daily_pnl = 0
         self._pending_orders: List[Order] = []
-        self._day_meta = self._build_day_meta()
 
     def run(self, start_date: str, end_date: str) -> BacktestResult:
         trading_days = self._get_trading_days(start_date, end_date)
@@ -69,7 +60,6 @@ class IntradayBacktestEngine:
             first_timestamp = min(df["timestamp"].min() for df in day_frames.values())
             self._set_strategy_time(first_timestamp.to_pydatetime())
             self.strategy.initialize()
-            self._load_strategy_avg_volumes(day)
 
             for ts in self._day_timestamps(day_frames):
                 tick_quotes = self._build_quotes_for_timestamp(day, ts, day_frames)
@@ -159,21 +149,6 @@ class IntradayBacktestEngine:
             prepared[symbol] = work.reset_index(drop=True)
         return prepared
 
-    def _build_day_meta(self) -> Dict[str, Dict[str, _DayMeta]]:
-        meta: Dict[str, Dict[str, _DayMeta]] = defaultdict(dict)
-        for symbol, df in self.data.items():
-            for trade_date, day_df in df.groupby("trade_date"):
-                day_df = day_df.sort_values("timestamp")
-                prev_close = int(day_df["close"].iloc[0])
-                prior = df[df["trade_date"] < trade_date]
-                if not prior.empty:
-                    prev_close = int(prior.sort_values("timestamp")["close"].iloc[-1])
-                meta[symbol][trade_date] = _DayMeta(
-                    prev_close=prev_close,
-                    day_open=int(day_df["open"].iloc[0]),
-                )
-        return meta
-
     def _get_trading_days(self, start: str, end: str) -> List[str]:
         days = set()
         for df in self.data.values():
@@ -207,23 +182,11 @@ class IntradayBacktestEngine:
             if row_df.empty:
                 continue
             row = row_df.iloc[-1]
-            meta = self._day_meta.get(symbol, {}).get(day)
-            prev_close = meta.prev_close if meta is not None else int(row["open"])
             current_price = int(row["close"])
-            change = current_price - prev_close
-            change_rate = (change / prev_close * 100) if prev_close > 0 else 0.0
             quotes.append(
                 Quote(
                     symbol=symbol,
-                    name=symbol,
                     current_price=current_price,
-                    change=change,
-                    change_rate=change_rate,
-                    open_price=int(meta.day_open if meta is not None else row["open"]),
-                    high_price=int(row["high"]),
-                    low_price=int(row["low"]),
-                    volume=int(row["cumulative_volume"]),
-                    trade_amount=int(current_price * max(0, int(row["volume"]))),
                     timestamp=ts.to_pydatetime(),
                 )
             )
@@ -245,6 +208,12 @@ class IntradayBacktestEngine:
 
             if order.side == OrderSide.BUY:
                 fill_price = int(q.current_price * (1 + self.slippage_bps / 10000))
+                if (
+                    order.order_type == OrderType.LIMIT
+                    and int(order.price or 0) > 0
+                    and fill_price > int(order.price)
+                ):
+                    continue
                 gross_cost = fill_price * order.quantity
                 buy_commission = int(gross_cost * self.commission_rate)
                 total_cost = gross_cost + buy_commission
@@ -338,18 +307,3 @@ class IntradayBacktestEngine:
     def _set_strategy_time(self, now: Optional[datetime]):
         if hasattr(self.strategy, "set_simulated_now"):
             self.strategy.set_simulated_now(now)
-
-    def _load_strategy_avg_volumes(self, day: str):
-        if not hasattr(self.strategy, "load_avg_volumes"):
-            return
-
-        avg_volumes: Dict[str, int] = {}
-        for symbol, df in self.data.items():
-            prior = df[df["trade_date"] < day]
-            if prior.empty:
-                continue
-            daily_volume = prior.groupby("trade_date")["volume"].sum().tail(5)
-            if daily_volume.empty:
-                continue
-            avg_volumes[symbol] = int(daily_volume.mean())
-        self.strategy.load_avg_volumes(avg_volumes)

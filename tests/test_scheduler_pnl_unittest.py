@@ -44,19 +44,16 @@ class SchedulerPnLResolutionTests(unittest.TestCase):
 
         self.assertEqual(resolved, 1234)
 
-    def test_resolve_session_pnl_uses_strategy_session_delta_when_baseline_exists(self):
+    def test_resolve_session_pnl_never_resets_at_process_restart(self):
         scheduler = self._make_scheduler(
             realized_pnl=None,
             daily_pnl=SimpleNamespace(realized_net_pnl=19727),
         )
         balance = SimpleNamespace(total_profit_loss=0)
 
-        resolved = scheduler._resolve_session_profit_loss(
-            balance,
-            strategy_pnl_baseline=19727,
-        )
+        resolved = scheduler._resolve_session_profit_loss(balance)
 
-        self.assertEqual(resolved, 0)
+        self.assertEqual(resolved, 19727)
 
     def test_resolve_session_pnl_fallbacks_to_balance(self):
         scheduler = self._make_scheduler(realized_pnl=None, daily_pnl=None)

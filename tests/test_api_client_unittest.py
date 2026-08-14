@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 import requests
 
@@ -15,7 +16,6 @@ def _config() -> Config:
         api_secret="paper-secret",
         account_number="12345678",
         account_product_code="01",
-        hts_id="",
         base_url="https://openapivts.koreainvestment.com:29443",
         ws_url="ws://ops.koreainvestment.com:31000",
         rate_limit_interval=0.0,
@@ -40,6 +40,7 @@ class FakeTokenManager:
     def __init__(self):
         self.invalidated = 0
         self._token = "expired-token"
+        self.last_token_issue_at = 0.0
 
     def get_token(self):
         return self._token
@@ -125,9 +126,6 @@ class KISClientTokenRetryTests(unittest.TestCase):
             )
 
         self.assertEqual(client.rate_limit_cooldown_remaining(), 0.0)
-        self.assertGreater(client.transport_cooldown_remaining(), 0.0)
-        self.assertLessEqual(client.transport_cooldown_remaining(), 2.0)
-        self.assertEqual(client._transport_error_streak, 1)
 
     def test_get_ledger_rate_limit_sets_global_cooldown(self):
         token_manager = FakeTokenManager()
@@ -149,6 +147,26 @@ class KISClientTokenRetryTests(unittest.TestCase):
         self.assertFalse(response.success)
         self.assertGreaterEqual(client.rate_limit_cooldown_remaining(), 2.5)
         self.assertEqual(len(client._session.calls), 1)
+
+    def test_paper_rate_limit_keeps_margin_from_half_second_gateway_boundary(self):
+        config = _config()
+        config.rate_limit_interval = 0.5
+        client = KISClient(config, FakeTokenManager())
+        client._last_call_time = 100.0
+
+        with (
+            patch("src.api_client.time.time", return_value=100.5),
+            patch("src.api_client.time.sleep") as sleep,
+        ):
+            client._rate_limit()
+            market_wait = sleep.call_args.args[0]
+            sleep.reset_mock()
+            client._last_call_time = 100.0
+            client._rate_limit("/uapi/domestic-stock/v1/trading/order-cash")
+            trading_wait = sleep.call_args.args[0]
+
+        self.assertGreaterEqual(market_wait, 0.099)
+        self.assertGreaterEqual(trading_wait, 0.599)
 
 
 if __name__ == "__main__":

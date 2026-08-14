@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from src.models import Order, OrderResult, OrderSide, Quote
+from src.models import Order, OrderResult, OrderSide, OrderType, Quote
 from src.strategy import BaseStrategy
 
 logger = logging.getLogger("kis_trader.backtest.engine")
@@ -22,13 +22,6 @@ class TradeRecord:
     quantity: int
     price: int
     pnl: int = 0
-    strategy_name: str = ""
-    setup_name: str = ""
-    entry_reason: str = ""
-    regime_label: str = ""
-    bear_score: int = 0
-    planned_risk_stage: str = ""
-    is_inverse: bool = False
 
 
 @dataclass
@@ -143,7 +136,6 @@ class BacktestEngine:
             # 전략 초기화 (매일 리셋)
             self._set_strategy_time(self._tick_datetime(day, 0))
             self.strategy.initialize()
-            self._load_strategy_avg_volumes(day)
 
             # 하루 4틱 시뮬레이션
             ticks = self._generate_day_ticks(day)
@@ -201,13 +193,6 @@ class BacktestEngine:
                     result.trade_records.append(TradeRecord(
                         date=day, symbol=symbol, side="sell",
                         quantity=pos["qty"], price=fill_price, pnl=net_pnl,
-                        strategy_name=str(pos.get("strategy_name", "") or ""),
-                        setup_name=str(pos.get("setup_name", "") or ""),
-                        entry_reason=str(pos.get("entry_reason", "") or ""),
-                        regime_label=str(pos.get("regime_label", "") or ""),
-                        bear_score=int(pos.get("bear_score", 0) or 0),
-                        planned_risk_stage=str(pos.get("planned_risk_stage", "") or ""),
-                        is_inverse=bool(pos.get("is_inverse", False)),
                     ))
                     result.total_trades += 1
                     day_trades += 1
@@ -264,14 +249,9 @@ class BacktestEngine:
             h = int(row.get("stck_hgpr", 0))
             l = int(row.get("stck_lwpr", 0))
             c = int(row.get("stck_clpr", 0))
-            v = int(row.get("acml_vol", 0))
 
             if o <= 0 or c <= 0:
                 continue
-
-            prev_close = int(row.get("stck_prdy_clpr", o))
-            if prev_close <= 0:
-                prev_close = o
 
             # 상승일: O → L → H → C, 하락일: O → H → L → C
             if c >= o:
@@ -280,20 +260,10 @@ class BacktestEngine:
                 prices = [o, h, l, c]
 
             for i, price in enumerate(prices):
-                change = price - prev_close
-                change_rate = change / prev_close * 100 if prev_close > 0 else 0
-
                 ticks[i].append(Quote(
                     symbol=symbol,
-                    name=symbol,
                     current_price=price,
-                    change=change,
-                    change_rate=change_rate,
-                    open_price=o,
-                    high_price=h if i >= 2 else max(o, price),
-                    low_price=l if i >= 2 else min(o, price),
-                    volume=v * (i + 1) // 4,
-                    trade_amount=0,
+                    timestamp=self._tick_datetime(day, i),
                 ))
 
         return ticks
@@ -316,6 +286,12 @@ class BacktestEngine:
             if order.side == OrderSide.BUY:
                 # 슬리피지 적용
                 fill_price = int(q.current_price * (1 + self.slippage_bps / 10000))
+                if (
+                    order.order_type == OrderType.LIMIT
+                    and int(order.price or 0) > 0
+                    and fill_price > int(order.price)
+                ):
+                    continue
                 gross_cost = fill_price * order.quantity
                 buy_commission = int(gross_cost * self.commission_rate)
                 total_cost = gross_cost + buy_commission
@@ -335,18 +311,10 @@ class BacktestEngine:
                     quantity=order.quantity, price=fill_price,
                 )
                 self.strategy.on_order_filled(fill_result)
-                self._positions[order.symbol].update(self._extract_strategy_position_meta(order.symbol))
 
                 result.trade_records.append(TradeRecord(
                     date=trade_date, symbol=order.symbol, side="buy",
                     quantity=order.quantity, price=fill_price,
-                    strategy_name=str(self._positions[order.symbol].get("strategy_name", "") or ""),
-                    setup_name=str(self._positions[order.symbol].get("setup_name", "") or ""),
-                    entry_reason=str(self._positions[order.symbol].get("entry_reason", "") or ""),
-                    regime_label=str(self._positions[order.symbol].get("regime_label", "") or ""),
-                    bear_score=int(self._positions[order.symbol].get("bear_score", 0) or 0),
-                    planned_risk_stage=str(self._positions[order.symbol].get("planned_risk_stage", "") or ""),
-                    is_inverse=bool(self._positions[order.symbol].get("is_inverse", False)),
                 ))
                 result.total_trades += 1
                 filled_count += 1
@@ -397,13 +365,6 @@ class BacktestEngine:
                 result.trade_records.append(TradeRecord(
                     date=trade_date, symbol=order.symbol, side="sell",
                     quantity=sell_qty, price=fill_price, pnl=net_pnl,
-                    strategy_name=str(pos.get("strategy_name", "") or ""),
-                    setup_name=str(pos.get("setup_name", "") or ""),
-                    entry_reason=str(pos.get("entry_reason", "") or ""),
-                    regime_label=str(pos.get("regime_label", "") or ""),
-                    bear_score=int(pos.get("bear_score", 0) or 0),
-                    planned_risk_stage=str(pos.get("planned_risk_stage", "") or ""),
-                    is_inverse=bool(pos.get("is_inverse", False)),
                 ))
                 result.total_trades += 1
                 filled_count += 1
@@ -415,40 +376,7 @@ class BacktestEngine:
         if hasattr(self.strategy, "set_simulated_now"):
             self.strategy.set_simulated_now(now)
 
-    def _extract_strategy_position_meta(self, symbol: str) -> dict:
-        positions = getattr(self.strategy, "positions", None)
-        if not isinstance(positions, dict):
-            return {}
-
-        pos = positions.get(symbol)
-        if pos is None:
-            return {}
-
-        inverse_symbols = getattr(self.strategy, "_inverse_symbols", set()) or set()
-        return {
-            "strategy_name": str(getattr(pos, "entry_strategy_name", "") or ""),
-            "setup_name": str(getattr(pos, "entry_setup_name", "") or ""),
-            "entry_reason": str(getattr(pos, "entry_reason", "") or ""),
-            "regime_label": str(getattr(pos, "regime_label", "") or ""),
-            "bear_score": int(getattr(pos, "bear_score", 0) or 0),
-            "planned_risk_stage": str(getattr(pos, "planned_risk_stage", "") or ""),
-            "is_inverse": symbol in inverse_symbols,
-        }
-
     def _tick_datetime(self, day: str, tick_idx: int) -> datetime:
         slots = ((9, 0), (9, 20), (11, 0), (15, 10))
         hour, minute = slots[min(max(tick_idx, 0), len(slots) - 1)]
         return datetime.strptime(day, "%Y%m%d").replace(hour=hour, minute=minute)
-
-    def _load_strategy_avg_volumes(self, day: str):
-        if not hasattr(self.strategy, "load_avg_volumes"):
-            return
-
-        avg_volumes: Dict[str, int] = {}
-        for symbol, df in self.data.items():
-            history = df[df.index < day].tail(5)
-            if history.empty:
-                continue
-            avg_volumes[symbol] = int(history["acml_vol"].mean())
-
-        self.strategy.load_avg_volumes(avg_volumes)
