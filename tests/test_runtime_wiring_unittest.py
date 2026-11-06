@@ -7,6 +7,17 @@ from src.scheduler import TradingScheduler
 
 
 class RuntimeWiringTests(unittest.TestCase):
+    def test_paper_launch_keeps_user_capital_daily_limits_and_costs(self):
+        from run_bot import get_strategy
+        with (patch("src.api_client.KISClient"), patch("src.auth.TokenManager"),
+              patch("src.market_data.MarketDataAPI") as market_data):
+            strategy = get_strategy(SimpleNamespace(is_paper=True))
+        config = strategy.config
+        self.assertEqual((config.seed_money, config.daily_profit_target, config.daily_loss_limit),
+                         (1_000_000, 10_000, -5_000))
+        self.assertEqual((config.commission_rate, config.sell_tax_rate), (.000142, .0015))
+        self.assertEqual(str(market_data.call_args.kwargs["discovery_archive"].root), config.quote_archive_root)
+
     @patch("src.scheduler.AlertManager")
     @patch("src.scheduler.OrderExecutor")
     @patch("src.scheduler.AccountAPI")
@@ -31,7 +42,7 @@ class RuntimeWiringTests(unittest.TestCase):
         self.assertIs(scheduler.config, shared_config)
         self.assertIs(scheduler.client, shared_client)
         self.assertIs(scheduler.market_data, shared_market_data)
-        trading_cls.assert_called_once_with(shared_client)
+        trading_cls.assert_called_once_with(shared_client, quote_provider=scheduler._quote_stream.latest_quote)
         account_cls.assert_called_once_with(shared_client)
         executor_cls.assert_called_once()
         alerts_cls.assert_called_once()

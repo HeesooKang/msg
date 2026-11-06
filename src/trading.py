@@ -1,10 +1,12 @@
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import requests
 
 from src.api_client import KISClient, is_kis_rate_limited_message
-from src.models import Order, OrderResult, OrderSide, OrderType
+from src.models import Order, OrderResult, OrderSide, OrderType, Quote
 
 logger = logging.getLogger("kis_trader.orders")
 
@@ -12,8 +14,9 @@ logger = logging.getLogger("kis_trader.orders")
 class TradingAPI:
     """국내주식 주문 API."""
 
-    def __init__(self, client: KISClient):
+    def __init__(self, client: KISClient, *, quote_provider: Callable[[str], Quote | None] | None = None):
         self.client = client
+        self._quote_provider = quote_provider
         self._fill_lookup_rate_limited = False
         self._account_order_blocked_message = ""
 
@@ -37,6 +40,8 @@ class TradingAPI:
     def _classify_order_failure(cls, *, error_code: str, message: str) -> str:
         normalized = str(message or "")
         code = str(error_code or "")
+        if code in {"LOCAL_ORDER_EXPIRED", "LOCAL_ORDER_INVALIDATED"}:
+            return "stale_order"
         if cls._is_rate_limited_message(normalized):
             return "rate_limit"
         if code == "40100000" or "영업일이 아닙니다" in normalized or "비영업일" in normalized:
@@ -116,6 +121,8 @@ class TradingAPI:
         tr_id: str,
         body: Dict[str, Any],
         retry_on_rate_limit: bool = True,
+        submit_before: float | None = None,
+        pre_submit: Callable[[], str | None] | None = None,
     ):
         last_response = None
         for attempt in range(3):
@@ -123,6 +130,8 @@ class TradingAPI:
                 api_url=api_url,
                 tr_id=tr_id,
                 body=body,
+                **({"submit_before": submit_before} if submit_before is not None else {}),
+                **({"pre_submit": pre_submit} if pre_submit is not None else {}),
             )
             last_response = res
             if res.success:
@@ -145,6 +154,34 @@ class TradingAPI:
             time.sleep(backoff)
         return last_response
 
+    @staticmethod
+    def entry_quote_rejection(order: Order, quote: Quote | None) -> str | None:
+        if (order.breakout_price <= 0 or quote is None or quote.symbol != order.symbol
+                or not quote.has_valid_prices or not quote.book_available
+                or not 0 < quote.bid_price <= quote.ask_price):
+            return "최신 유효 호가/진입 근거가 없어 매수를 제출하지 않았습니다."
+        if not quote.is_price_breakout(order.breakout_price, signal_price=order.reference_price):
+            return (f"돌파 해소로 매수 미제출: {order.symbol} "
+                    f"체결시세={quote.current_price} bid={quote.bid_price} "
+                    f"관측고점={max(quote.trade_high_price, order.reference_price)} 돌파선={order.breakout_price}")
+        if quote.ask_price > order.price:
+            return (f"호가가 계획 지정가를 넘어 매수 미제출: {order.symbol} "
+                    f"ask={quote.ask_price} 지정가={order.price}")
+        if quote.book_depth_available and min(quote.ask_size, quote.bid_size) <= 0:
+            return (f"최우선 호가 잔량이 없어 매수 미제출: {order.symbol} "
+                    f"ask잔량={quote.ask_size} bid잔량={quote.bid_size}")
+        return None
+
+    def _entry_submission_rejection(self, order: Order) -> str | None:
+        quote = self._quote_provider(order.symbol) if self._quote_provider is not None else None
+        rejected = self.entry_quote_rejection(order, quote)
+        if rejected:
+            return rejected
+        logger.info("매수 전송 직전: %s %d주 @ %d원 체결시세=%d bid/ask=%d/%d 시세=%s",
+                    order.symbol, order.quantity, order.price, quote.current_price,
+                    quote.bid_price, quote.ask_price, quote.timestamp.strftime("%H:%M:%S.%f"))
+        return None
+
     def place_order(self, order: Order) -> OrderResult:
         """매수/매도 주문을 실행한다."""
         if self._account_order_blocked_message:
@@ -157,9 +194,9 @@ class TradingAPI:
         if (
             order.side == OrderSide.BUY
             and order.order_type == OrderType.LIMIT
-            and order.requested_reason == "expected_value"
+            and order.requested_reason == "price_breakout"
         ):
-            return self._place_expected_value_entry(order)
+            return self._place_price_breakout_entry(order)
         return self._place_standard_order(order)
 
     def _place_standard_order(
@@ -168,6 +205,7 @@ class TradingAPI:
         *,
         log_failure: bool = True,
         log_success: bool = True,
+        resolve_fill: bool = True,
     ) -> OrderResult:
         """단일 주문을 실행한다."""
         # TR ID: 매수 TTTC0012U, 매도 TTTC0011U (모의투자 시 자동 V 변환)
@@ -193,13 +231,16 @@ class TradingAPI:
             tr_id=tr_id,
             body=body,
             retry_on_rate_limit=order.side != OrderSide.BUY,
+            submit_before=order.submit_before if order.side == OrderSide.BUY else None,
+            pre_submit=(lambda: self._entry_submission_rejection(order))
+            if order.side == OrderSide.BUY and order.requested_reason == "price_breakout" else None,
         )
 
         if res.success:
             output = res.output or {}
             order_no = output.get("ODNO", "")
             reference_price = self._order_reference_price(order)
-            fill_qty, fill_price = self._resolve_fill(order, order_no)
+            fill_qty, fill_price = self._resolve_fill(order, order_no) if resolve_fill else (0, 0)
             if fill_qty > 0:
                 resolved_qty = fill_qty
                 resolved_price = fill_price if fill_price > 0 else order.price
@@ -288,16 +329,17 @@ class TradingAPI:
 
         return result
 
-    def _place_expected_value_entry(self, order: Order) -> OrderResult:
-        """EV 가격 상한까지만 체결하고 남은 매수 수량은 즉시 취소한다."""
+    def _place_price_breakout_entry(self, order: Order) -> OrderResult:
+        """신호 지정가로 제출한 뒤 체결 조회보다 잔량 취소 요청을 먼저 한다."""
         limit_result = self._place_standard_order(
             order,
             log_failure=False,
             log_success=False,
+            resolve_fill=False,
         )
         if not limit_result.success:
             logger.warning(
-                "EV 제한가 매수 제출 실패: %s %d주 @ %d원 (%s)",
+                "돌파 지정가 매수 제출 실패: %s %d주 @ %d원 (%s)",
                 order.symbol,
                 int(order.quantity or 0),
                 int(order.price or 0),
@@ -306,75 +348,64 @@ class TradingAPI:
             return limit_result
 
         requested_qty = max(0, int(order.quantity or 0))
-        filled_qty = min(requested_qty, max(0, int(limit_result.quantity or 0)))
-        if filled_qty >= requested_qty:
-            limit_result.fill_mode = "limit"
-            logger.info(
-                "주문 성공: buy %s LIMIT %d주 @ %d원%s",
-                order.symbol,
-                requested_qty,
-                int(order.price or 0),
-                self._order_success_price_suffix(limit_result),
-            )
-            return limit_result
+        limit_result.price = 0
         if not limit_result.order_no:
             limit_result.fill_mode = "limit_pending"
             return limit_result
 
-        cancel_result = self.cancel(
-            limit_result.order_no,
-            quantity=max(0, requested_qty - filled_qty),
-            cancel_all=True,
-            log_result=False,
-        )
-        if not cancel_result.success and self._cancel_implies_filled(cancel_result.message):
-            late_qty, late_price = self._resolve_fill(order, limit_result.order_no)
-            resolved_qty = max(filled_qty, late_qty, requested_qty)
-            resolved_price = max(1, int(late_price or limit_result.price or order.price or 0))
-            logger.info(
-                "매수 체결: buy %s LIMIT %d주 @ 체결가 %d원 "
-                "(취소 시점 전량체결 확인)",
-                order.symbol,
-                resolved_qty,
-                resolved_price,
-            )
-            return OrderResult(
-                success=True,
-                order_no=limit_result.order_no,
-                message=cancel_result.message,
-                symbol=order.symbol,
-                side=order.side,
-                quantity=resolved_qty,
-                price=resolved_price,
-                requested_price=int(order.price or 0),
-                reference_price=self._order_reference_price(order),
-                fill_mode="limit_assumed_filled",
-                requested_reason=order.requested_reason,
-                requested_quantity=requested_qty,
-            )
-        if not cancel_result.success:
-            logger.error(
-                "EV 제한가 매수 잔량 취소 실패: %s order_no=%s (%s)",
-                order.symbol,
+        # Do not keep a stale buy resting while a fill-history GET waits or retries.
+        cancel_accepted = False
+        try:
+            cancel_result = self.cancel(
                 limit_result.order_no,
-                cancel_result.message,
+                quantity=requested_qty,
+                cancel_all=True,
+                log_result=False,
             )
+            cancel_accepted = cancel_result.success or self._cancel_has_no_remaining_quantity(cancel_result.message)
+            if not cancel_accepted:
+                logger.error("돌파 지정가 매수 잔량 취소 실패: %s order_no=%s (%s)",
+                             order.symbol, limit_result.order_no, cancel_result.message)
+        except Exception as exc:
+            logger.warning("매수 잔량 취소 미확정: %s order_no=%s (%s)",
+                           order.symbol, limit_result.order_no, exc)
+
+        # An acknowledgement is not a fill. Keep the accepted order's identity
+        # even when cancellation or the final lookup cannot be confirmed.
+        try:
+            row = self._fetch_fill_row(
+                order_no=limit_result.order_no,
+                symbol=order.symbol,
+                side_code="02",
+                start_date=datetime.now().strftime("%Y%m%d"),
+            )
+        except Exception as exc:
+            logger.warning("매수 체결 조회 미확정: %s order_no=%s (%s)",
+                           order.symbol, limit_result.order_no, exc)
+            row = None
+        final_qty, final_price = self._fill_quantity_and_price(row or {})
+        terminal = self._entry_order_terminal(row, requested_qty)
+        if not terminal or (final_qty > 0 and final_price <= 0):
+            filled_qty = min(requested_qty, final_qty) if final_price > 0 else 0
+            limit_result.quantity = filled_qty
+            limit_result.price = final_price if filled_qty > 0 else 0
             limit_result.fill_mode = (
-                "partial_fill_pending" if filled_qty > 0 else "limit_pending_cancel_failed"
+                "partial_fill_pending" if filled_qty > 0
+                else "limit_pending" if cancel_accepted else "limit_pending_cancel_failed"
             )
+            logger.info("매수 체결 확인 대기: %s order_no=%s 체결=%s 잔여=%s 취소=%s",
+                        order.symbol, limit_result.order_no,
+                        (row or {}).get("tot_ccld_qty", "-"),
+                        (row or {}).get("rmn_qty", "-"),
+                        (row or {}).get("cncl_yn", "-"))
             return limit_result
 
+        filled_qty = min(requested_qty, final_qty)
         if filled_qty <= 0:
-            logger.info(
-                "매수 미체결 취소: buy %s LIMIT %d주 @ 주문가 %d원",
-                order.symbol,
-                requested_qty,
-                int(order.price or 0),
-            )
             return OrderResult(
                 success=False,
                 order_no=limit_result.order_no,
-                message="EV 제한가 미체결 취소",
+                message="돌파 지정가 미체결 취소",
                 error_category="not_filled",
                 symbol=order.symbol,
                 side=order.side,
@@ -385,21 +416,77 @@ class TradingAPI:
                 requested_quantity=requested_qty,
             )
 
-        limit_result.fill_mode = "limit_partial"
-        limit_result.message = "EV 제한가 부분체결 후 잔량 취소"
-        logger.info(
-            "매수 부분체결: buy %s LIMIT %d/%d주 @ 체결가 %d원 (잔량 취소)",
-            order.symbol,
-            filled_qty,
-            requested_qty,
-            int(limit_result.price or order.price or 0),
-        )
+        limit_result.quantity = filled_qty
+        limit_result.price = final_price
+        limit_result.fill_mode = "limit" if filled_qty == requested_qty else "limit_partial"
+        limit_result.message = "돌파 지정가 취소 후 최종 체결 확인"
         return limit_result
 
+    @classmethod
+    def _entry_order_terminal(cls, row: Optional[Dict[str, Any]], requested_qty: int) -> bool:
+        if row is None or requested_qty <= 0:
+            return False
+        try:
+            filled = int(str(row["tot_ccld_qty"]).strip())
+            if filled < 0 or filled > requested_qty:
+                return False
+            if filled == requested_qty:
+                return True
+            remaining = int(str(row["rmn_qty"]).strip())
+        except (KeyError, TypeError, ValueError):
+            return False
+        # The original order's cancellation flag also confirms a closed
+        # remainder; a cancel POST acknowledgement alone does not.
+        return remaining == 0 and (
+            str(row.get("cncl_yn", "")).strip().upper() == "Y"
+            or filled + cls._to_int(row.get("cnc_cfrm_qty"))
+            + cls._to_int(row.get("rjct_qty")) >= requested_qty
+        )
+
+    def resolve_pending_entry(self, result: OrderResult) -> Optional[OrderResult]:
+        """Return cumulative confirmed fills and the original order's terminal state."""
+        row = self._fetch_fill_row(
+            order_no=result.order_no, symbol=result.symbol, side_code="02",
+            start_date=result.timestamp.strftime("%Y%m%d"),
+        )
+        if row is None:
+            return None
+        terminal = self._entry_order_terminal(row, result.requested_quantity)
+        if not terminal and self._to_int(row.get("rmn_qty")) > 0:
+            # A previous cancel acknowledgement may not have removed the order.
+            cancelled = self.cancel(result.order_no, quantity=result.requested_quantity,
+                                    cancel_all=True, log_result=False)
+            if not cancelled.success and not self._cancel_has_no_remaining_quantity(cancelled.message):
+                logger.warning("매수 잔량 취소 재확인 실패: %s order_no=%s (%s)",
+                               result.symbol, result.order_no, cancelled.message)
+        quantity, price = self._fill_quantity_and_price(row)
+        if quantity > result.requested_quantity or (quantity > 0 and price <= 0):
+            return None
+        if quantity <= 0 and not terminal:
+            return None
+        return OrderResult(
+            success=quantity > 0, symbol=result.symbol, side=OrderSide.BUY,
+            order_no=result.order_no, quantity=quantity, price=price,
+            requested_quantity=result.requested_quantity, requested_price=result.requested_price,
+            requested_reason=result.requested_reason, timestamp=result.timestamp,
+            fill_mode=("entry_reconciled" if terminal and quantity > 0
+                       else "entry_reconciled_partial" if quantity > 0 else "limit_cancelled"),
+            error_category="" if quantity > 0 else "not_filled",
+        )
+
     @staticmethod
-    def _cancel_implies_filled(message: str) -> bool:
+    def _cancel_has_no_remaining_quantity(message: str) -> bool:
         normalized = str(message or "")
         return "정정/취소할 수량이 없습니다" in normalized
+
+    @classmethod
+    def _fill_quantity_and_price(cls, row: Dict[str, Any]) -> Tuple[int, int]:
+        quantity = max(0, cls._to_int(row.get("tot_ccld_qty")))
+        price = max(0, cls._to_int(row.get("avg_prvs")))
+        if quantity > 0 and price <= 0:
+            amount = max(0, cls._to_int(row.get("tot_ccld_amt")))
+            price = int(round(amount / quantity)) if amount > 0 else 0
+        return quantity, price
 
     def _resolve_fill(self, order: Order, order_no: str) -> Tuple[int, int]:
         """주문 직후 체결내역에서 실제 체결수량/평균체결가를 조회한다.
@@ -436,12 +523,7 @@ class TradingAPI:
                 start_date=start_date,
             )
             if row:
-                qty = self._to_int(row.get("tot_ccld_qty", 0))
-                avg_price = self._to_int(row.get("avg_prvs", 0))
-                if qty > 0 and avg_price <= 0:
-                    total_amt = self._to_int(row.get("tot_ccld_amt", 0))
-                    if total_amt > 0:
-                        avg_price = int(round(total_amt / qty))
+                qty, avg_price = self._fill_quantity_and_price(row)
                 if qty > 0:
                     resolved_quantity = min(qty, requested_quantity) if requested_quantity > 0 else qty
                     return resolved_quantity, max(0, avg_price)
@@ -471,7 +553,9 @@ class TradingAPI:
             "INQR_DVSN": "00",
             "INQR_DVSN_3": "00",
             "ORD_GNO_BRNO": "",
-            "ODNO": order_no,
+            # A cancelled buy can remain cncl_yn=N on the original row.
+            # Its separate cancellation row is linked by orgn_odno.
+            "ODNO": "" if side_code == "02" else order_no,
             "INQR_DVSN_1": "",
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
@@ -480,6 +564,8 @@ class TradingAPI:
 
         page_params = dict(params)
         tr_cont = ""
+        fill_row = None
+        cancellations = {}
         for _ in range(10):
             res = self.client.get(
                 api_url="/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
@@ -491,27 +577,59 @@ class TradingAPI:
                 message = f"{res.error_code} {res.error_message} {res.data}"
                 if self._is_rate_limited_message(message):
                     self._fill_lookup_rate_limited = True
-                return None
+                return fill_row
 
             rows = res.output1 or []
             for row in rows:
-                if row.get("odno", "") == order_no and row.get("pdno", "") == symbol:
-                    return row
+                if row.get("pdno", "") != symbol:
+                    continue
+                if row.get("odno", "") == order_no:
+                    if side_code != "02":
+                        return row
+                    if fill_row is None:
+                        fill_row = row
+                elif (
+                    side_code == "02"
+                    and row.get("orgn_odno", "") == order_no
+                    and row.get("ord_dt", start_date) == start_date
+                    and str(row.get("cncl_yn", "")).strip().upper() == "Y"
+                    and row.get("odno")
+                ):
+                    try:
+                        quantity = int(str(row["ord_qty"]).strip())
+                        filled = int(str(row["tot_ccld_qty"]).strip())
+                        remaining = int(str(row["rmn_qty"]).strip())
+                        rejected = int(str(row["rjct_qty"]).strip())
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if quantity > 0 and filled == remaining == rejected == 0:
+                        cancellations[row["odno"]] = quantity
+
+            if fill_row is not None and cancellations:
+                # Count each linked cancellation once; keep the original
+                # fill and remainder as the source of its terminal status.
+                fill_row = dict(fill_row, cnc_cfrm_qty=str(max(
+                    self._to_int(fill_row.get("cnc_cfrm_qty")), sum(cancellations.values()),
+                )))
+            if fill_row is not None and self._entry_order_terminal(
+                fill_row, self._to_int(fill_row.get("ord_qty")),
+            ):
+                return fill_row
 
             if not res.has_next:
-                return None
+                break
 
             payload = res.data or {}
             next_fk = str(payload.get("ctx_area_fk100", "") or "")
             next_nk = str(payload.get("ctx_area_nk100", "") or "")
             if not next_fk and not next_nk:
-                return None
+                break
 
             page_params["CTX_AREA_FK100"] = next_fk
             page_params["CTX_AREA_NK100"] = next_nk
             tr_cont = "N"
             time.sleep(0.1)
-        return None
+        return fill_row
 
     @staticmethod
     def _to_int(value: Any) -> int:

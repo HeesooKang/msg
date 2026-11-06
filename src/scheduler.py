@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import copy
 import logging
 import math
 import time
 import json
-from datetime import datetime, time as clock_time, timedelta
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import date, datetime, time as clock_time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
@@ -16,7 +16,7 @@ from src.api_client import is_kis_rate_limited_message
 from src.executor import OrderExecutor, RiskManager
 from src.logger_setup import setup_logger
 from src.market_calendar import is_krx_regular_trading_day, normalize_trading_date
-from src.market_stream import MarketQuoteStream
+from src.market_stream import MAX_SYMBOLS_PER_CONNECTION, MarketQuoteStream
 from src.performance_reporting import update_performance_reports
 from src.notifications import AlertManager
 from src.models import Order, OrderResult, OrderSide
@@ -31,6 +31,7 @@ logger = logging.getLogger("kis_trader.scheduler")
 MARKET_OPEN = (9, 0)    # 09:00
 MARKET_CLOSE = (15, 30)  # 15:30
 PRE_OPEN = (8, 50)       # 장 시작 10분 전 준비
+MAX_SUPPLEMENTAL_QUOTE_SYMBOLS = 30
 
 
 class TradingScheduler:
@@ -43,15 +44,15 @@ class TradingScheduler:
         self.config = self.client.config
         self._shutdown = False
 
-        self.trading = TradingAPI(self.client)
-        self.account = AccountAPI(self.client)
-        self.executor = OrderExecutor(self.trading, RiskManager())
-        self._alerts = AlertManager()
         quote_freshness = float(strategy.config.quote_freshness_seconds or 5)
         self._quote_stream = MarketQuoteStream(
             self.config,
             stale_seconds=quote_freshness,
         )
+        self.trading = TradingAPI(self.client, quote_provider=self._quote_stream.latest_quote)
+        self.account = AccountAPI(self.client)
+        self.executor = OrderExecutor(self.trading, RiskManager())
+        self._alerts = AlertManager()
 
         self._balance_retry_attempts = 3
         self._balance_retry_delay_seconds = 2
@@ -61,7 +62,6 @@ class TradingScheduler:
         self._session_started_at = None
         self._last_stream_stale_log_at = None
         self._last_emergency_position_refresh_at = None
-        self._last_supplemental_quote_refresh_at = None
         self._last_tick_activity_log_at = None
         self._last_loop_error_alert_at = None
         self._market_closed_session_date = None
@@ -69,6 +69,18 @@ class TradingScheduler:
         self._pending_order_blocks = {}
         self._last_pending_entry_reconcile_at = None
         self._last_pending_exit_reconcile_at = None
+        self._market_reader: ThreadPoolExecutor | None = None
+        self._market_read: Future | None = None
+        self._last_supplemental_read_at: dict[str, float] = {}
+        self._pool_read: Future | None = None
+        self._order_execution: Future | None = None
+        self._executing_orders: List[Order] = []
+        self._account_read: Future | None = None
+        self._account_reconcile_results: List[OrderResult] = []
+        self._account_snapshot_results: List[OrderResult] = []
+        self._order_sequence = 0
+        self._account_order_sequence = 0
+        self._alert_sender: ThreadPoolExecutor | None = None
 
     def stop(self):
         self._shutdown = True
@@ -95,6 +107,12 @@ class TradingScheduler:
                     if self._is_trading_time(now):
                         halted_for_day = self._run_trading_session(tick_interval)
                         if halted_for_day and not self._shutdown:
+                            self._collect_quotes_until_close(now.date())
+                            if self._shutdown:
+                                break
+                            # A sleeping laptop may resume on the next trading day.
+                            if datetime.now().date() != now.date():
+                                continue
                             if self._last_session_end_reason == "daily_hard_stop":
                                 logger.info("당일 하드스탑 감지: 다음 장 준비 시각까지 대기합니다.")
                             elif self._last_session_end_reason == "daily_profit_target":
@@ -135,6 +153,8 @@ class TradingScheduler:
             logger.info("Ctrl+C — 스케줄러를 종료합니다.")
         finally:
             self._quote_stream.stop()
+            self._stop_market_reads()
+            self._stop_alerts()
             logger.info("스케줄러 종료")
 
     def _is_trading_time(self, now: datetime) -> bool:
@@ -251,16 +271,16 @@ class TradingScheduler:
         base_delay = 2.0 if self.config.is_paper else 0.25
         return max(base_delay, self._client_rate_limit_cooldown())
 
-    def _refresh_runtime_pool_if_needed(self, now: datetime, *, force: bool = False) -> bool:
+    def _pool_refresh_params(self, now: datetime, *, force: bool = False) -> dict | None:
         strategy = self.strategy
         if strategy.fixed_pool:
-            return False
+            return None
         cfg = strategy.config
         if self._market_data_pressure_active():
-            return False
+            return None
         session_age_seconds = self._session_age_seconds(now)
         if not force and session_age_seconds is not None and session_age_seconds < 2.0:
-            return False
+            return None
 
         min_change_rate = float(cfg.dynamic_pool_quote_min_change_rate or 0.0)
         refresh_interval = max(30, int(cfg.pool_refresh_interval or 120))
@@ -268,27 +288,37 @@ class TradingScheduler:
 
         last_refreshed = self._last_runtime_pool_refresh_at
         if last_refreshed is not None and (now - last_refreshed).total_seconds() < refresh_interval:
-            return False
+            return None
 
         # Discovery should be wider than entry judgment: do not exclude low-price
-        # or already-fast movers before the EV planner can evaluate them.
-        symbols = self.market_data.get_fluctuation_symbols(
-            count=fetch_count,
-            min_change_rate=min_change_rate,
-        )
+        # or already-fast movers before the strategy can evaluate them.
+        return dict(count=fetch_count, min_change_rate=min_change_rate)
+
+    def _apply_runtime_pool(self, symbols: List[str]) -> bool:
         if not symbols:
-            self._last_runtime_pool_refresh_at = now
             logger.info("동적풀 갱신 생략: 등락률 후보 없음, 기존 감시풀 유지")
             return False
 
-        strategy.update_runtime_pool(symbols)
-        self._last_runtime_pool_refresh_at = now
-        active_dynamic_pool = strategy._pool
+        self.strategy.update_runtime_pool(symbols)
+        active_dynamic_pool = self.strategy._pool
         logger.info(
-            "동적풀 갱신: %d개 (%s)",
+            "동적풀 갱신: 후보=%d 동적=%d (%s)",
+            len(symbols),
             len(active_dynamic_pool),
             ", ".join(active_dynamic_pool[:5]),
         )
+        return True
+
+    def _refresh_runtime_pool_if_needed(self, now: datetime, *, force: bool = False) -> bool:
+        if self._pool_read is not None:
+            return False
+        params = self._pool_refresh_params(now, force=force)
+        if params is None:
+            return False
+        if self._market_reader is None:
+            self._market_reader = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kis-io")
+        self._pool_read = self._market_reader.submit(self.market_data.get_fluctuation_symbols, **params)
+        self._last_runtime_pool_refresh_at = now
         return True
 
     def _log_tick_activity(self, now: datetime, watchlist: List[str], refresh_batch: List[str], quotes: List) -> None:
@@ -300,13 +330,13 @@ class TradingScheduler:
         if not should_log:
             return
         positions = self.strategy.positions
-        long_candidates = int(self.strategy._last_evaluation_count)
+        evaluated = int(self.strategy._last_evaluation_count)
         logger.info(
-            "틱 상태: 감시=%d 배치=%d 수신=%d 롱후보=%d 보유=%d",
+            "틱 상태: 감시=%d 배치=%d 수신=%d 평가=%d 보유=%d",
             len(watchlist),
             len(refresh_batch),
             len(quotes),
-            long_candidates,
+            evaluated,
             len(positions),
         )
         self._last_tick_activity_log_at = now
@@ -316,54 +346,40 @@ class TradingScheduler:
         cfg = strategy.config
         positions = strategy.positions
         return self._normalize_symbols(
-            list(positions)
-            + list(strategy._pool)
-            + list(cfg.inverse_etfs)
-            + list(cfg.static_watchlist)
-            + list(watchlist)
+            list(positions) + list(strategy._pending_entry_meta)
+            + list(strategy._pool) + list(cfg.inverse_etfs)
+            + list(cfg.static_watchlist) + list(watchlist)
         )
 
-    def _supplemental_watchlist_quotes(
+    def _supplemental_watchlist_symbols(
         self,
-        now: datetime,
         prioritized_symbols: List[str],
         subscribed_symbols: List[str],
-    ) -> List:
-        last_refresh = self._last_supplemental_quote_refresh_at
-        refresh_interval = max(
-            2.0,
-            float(self.strategy.config.quote_freshness_seconds or 5),
-        )
-        if (
-            last_refresh is not None
-            and (now - last_refresh).total_seconds()
-            < refresh_interval
-        ):
-            return []
-
+        now: datetime,
+    ) -> List[str]:
         subscribed = set(subscribed_symbols)
         held = set(self.strategy.positions)
-        stale_stream = [
-            symbol
-            for symbol in self._quote_stream.stale_symbols(
-                subscribed_symbols,
-                now=now,
-            )
-            if symbol not in held
-        ]
-        excluded = [
+        stream_candidates = [s for s in subscribed_symbols if s not in held]
+        # The loop schedules at most one 30-symbol batch per second. Start before
+        # expiry, leaving one pool rotation plus a tick to receive the response.
+        refresh_age = max(0.0, self.strategy.config.quote_freshness_seconds
+                          - math.ceil(len(prioritized_symbols) / MAX_SUPPLEMENTAL_QUOTE_SYMBOLS) - 1.0)
+        stale = set(self._quote_stream.stale_symbols(
+            stream_candidates, now=now, max_age_seconds=refresh_age)) if stream_candidates else set()
+        candidates = self._normalize_symbols([
             symbol
             for symbol in prioritized_symbols
-            if symbol not in subscribed and symbol not in held
-        ]
-        symbols = self._normalize_symbols(stale_stream + excluded)[:30]
-        if not symbols:
-            return []
+            if symbol not in held and (symbol not in subscribed or symbol in stale)
+        ])
+        watchlist = set(prioritized_symbols)
+        self._last_supplemental_read_at = {
+            s: at for s, at in self._last_supplemental_read_at.items() if s in watchlist}
+        # Rotate aging stream symbols and non-stream symbols together so neither
+        # group monopolizes the REST batch, including after failed/empty reads.
+        candidates.sort(key=lambda s: self._last_supplemental_read_at.get(s, 0.0))
+        return candidates[:MAX_SUPPLEMENTAL_QUOTE_SYMBOLS]
 
-        self._last_supplemental_quote_refresh_at = now
-        return self.market_data.get_multi_price(symbols)
-
-    def _emergency_position_quotes(self, now: datetime) -> List:
+    def _emergency_position_symbols(self, now: datetime) -> List[str]:
         positions = self.strategy.positions
         if not positions:
             return []
@@ -374,24 +390,208 @@ class TradingScheduler:
         if last_refresh is not None and (now - last_refresh).total_seconds() < 5.0:
             return []
         self._last_emergency_position_refresh_at = now
-        quotes = []
-        for index in range(0, len(symbols), 30):
-            quotes.extend(
-                self.market_data.get_multi_price(
-                    symbols[index:index + 30],
-                )
-            )
         should_log = (
             self._last_stream_stale_log_at is None
             or (now - self._last_stream_stale_log_at).total_seconds() >= 60
         )
         if should_log:
             logger.warning(
-                "실시간 시세 stale: 보유종목 %d개만 REST 비상 조회했습니다.",
+                "실시간 시세 stale: 보유종목 %d개 REST 비상 조회 요청",
                 len(symbols),
             )
             self._last_stream_stale_log_at = now
+        return symbols
+
+    def _read_supplemental_quotes(self, symbols: List[str]) -> List:
+        quotes = []
+        for index in range(0, len(symbols), MAX_SUPPLEMENTAL_QUOTE_SYMBOLS):
+            quotes.extend(self.market_data.get_multi_price(symbols[index:index + MAX_SUPPLEMENTAL_QUOTE_SYMBOLS]))
         return quotes
+
+    def _collect_market_reads(self) -> List:
+        # Only the scheduler thread applies results to strategy state.
+        pool_pending = self._pool_read
+        if pool_pending is not None and pool_pending.done():
+            self._pool_read = None
+            try:
+                pool = pool_pending.result()
+            except requests.exceptions.RequestException as exc:
+                logger.warning("동적풀 조회 네트워크 오류: %s (기존 감시풀 유지)", exc)
+            except Exception:
+                logger.exception("동적풀 조회 실패: 기존 감시풀과 실시간 평가를 유지합니다.")
+            else:
+                self._apply_runtime_pool(pool)
+
+        pending = self._market_read
+        if pending is None or not pending.done():
+            return []
+        self._market_read = None
+        try:
+            return pending.result()
+        except requests.exceptions.RequestException as exc:
+            logger.warning("시장 조회 네트워크 오류: %s (실시간 시세 평가는 계속합니다.)", exc)
+            return []
+        except Exception:
+            logger.exception("보완 시세 조회 실패: 실시간 시세 평가는 계속합니다.")
+            return []
+
+    def _schedule_market_reads(self, prioritized_symbols: List[str], subscribed_symbols: List[str], now: datetime) -> None:
+        # Submission and fill reconciliation take priority over new REST reads.
+        # Stream draining and strategy ticks continue while either is in flight.
+        if self._shutdown or self._order_execution is not None or self._account_read is not None:
+            return
+        symbols = []
+        if self._market_read is None:
+            emergency = self._emergency_position_symbols(now)
+            supplemental = self._supplemental_watchlist_symbols(prioritized_symbols, subscribed_symbols, now)
+            # Preserve all emergency holdings; ordinary reads use the remaining batch capacity.
+            symbols = self._normalize_symbols(
+                emergency + supplemental[:max(0, MAX_SUPPLEMENTAL_QUOTE_SYMBOLS - len(emergency))])
+        self._refresh_runtime_pool_if_needed(now)
+        if not symbols:
+            return
+        if self._market_reader is None:
+            # Quote, discovery, order and recovery I/O share the client's rate limiter,
+            # but never run strategy state changes on a worker.
+            self._market_reader = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kis-io")
+        if symbols:
+            self._market_read = self._market_reader.submit(self._read_supplemental_quotes, symbols)
+            self._last_supplemental_read_at.update((s, now.timestamp()) for s in symbols)
+
+    def _stop_market_reads(self) -> None:
+        # An accepted order must not disappear when its session ends.
+        try:
+            self._collect_order_execution(wait=True)
+            self._reconcile_pending_orders(wait=True)
+        finally:
+            self._stop_quote_reads()
+
+    def _stop_quote_reads(self) -> None:
+        if self._market_reader is not None:
+            self._market_reader.shutdown(wait=True, cancel_futures=True)
+        self._market_reader = None
+        # A completed result from an ended session must not replace the next
+        # session's pool or be submitted again as fresh quotes.
+        self._market_read = None
+        self._pool_read = None
+        self._last_supplemental_read_at.clear()
+
+    def _read_quote_batch(self) -> tuple[List[str], List[str], List]:
+        rest_quotes = self._collect_market_reads()
+        watchlist = self.strategy.get_watchlist()
+        prioritized_symbols = self._prioritized_stream_symbols(watchlist)
+        self._quote_stream.update_symbols(prioritized_symbols)
+        stream_symbols = self._quote_stream.subscribed_symbols()
+        if not isinstance(stream_symbols, (list, tuple, set)):
+            stream_symbols = prioritized_symbols
+        stream_symbols = list(stream_symbols)
+        quotes = self._quote_stream.drain_quotes()
+        quotes.extend(rest_quotes)
+        self._quote_stream.observe_quotes(rest_quotes)
+        return watchlist, stream_symbols, quotes
+
+    def _collect_quotes_until_close(self, trading_day: date) -> None:
+        now = datetime.now()
+        if self._shutdown or now.date() != trading_day or not self._is_trading_time(now):
+            return
+        close_at = datetime.combine(trading_day, clock_time(*MARKET_CLOSE))
+        last_log_at = None
+        logger.info("매매 종료 후 전체 감시풀 시세 기록을 장 마감까지 유지합니다. 주문은 제출하지 않습니다.")
+        try:
+            self._quote_stream.start(self._prioritized_stream_symbols(self.strategy.get_watchlist()))
+            while not self._shutdown:
+                now = datetime.now()
+                if now.date() != trading_day or now >= close_at:
+                    break
+                try:
+                    watchlist, stream_symbols, quotes = self._read_quote_batch()
+                    recorded_at = datetime.now()
+                    if self._shutdown or recorded_at.date() != trading_day or recorded_at >= close_at:
+                        break
+                    valid_quotes = [q for q in quotes if q.has_valid_prices
+                                    and q.timestamp.date() == trading_day and q.timestamp <= recorded_at]
+                    # Archiving must not enter the strategy, reset its halt or reconcile orders.
+                    self.strategy._quote_archive.record(valid_quotes, now=recorded_at, universe=watchlist)
+                    self._schedule_market_reads(
+                        self._prioritized_stream_symbols(watchlist), stream_symbols, recorded_at)
+                    if last_log_at is None or (recorded_at - last_log_at).total_seconds() >= 60:
+                        logger.info("시세 수집 중 (매매 종료): 감시=%d WebSocket=%d 수신=%d 기록=%d",
+                                    len(watchlist), len(stream_symbols), len(quotes), len(valid_quotes))
+                        last_log_at = recorded_at
+                    self._interruptible_sleep(1)
+                except requests.exceptions.RequestException as exc:
+                    logger.warning("종료 후 시세 수집 네트워크 오류: %s (10초 후 재시도)", exc)
+                    self._interruptible_sleep(10)
+                except Exception:
+                    logger.exception("종료 후 시세 수집 오류 (10초 후 재시도)")
+                    self._interruptible_sleep(10)
+        finally:
+            self._quote_stream.stop()
+            self._stop_quote_reads()
+            logger.info("매매 종료 후 시세 기록 종료")
+
+    def _start_order_execution(self, orders: List[Order]) -> bool:
+        if (not orders or self._shutdown or self._order_execution is not None
+                or (self._account_read is not None and any(o.side == OrderSide.BUY for o in orders))):
+            return False
+        if self._market_reader is None:
+            self._market_reader = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kis-io")
+        # Reserve only execution state; this is not a fill or a notification.
+        pending = [OrderResult(
+            success=True, symbol=o.symbol, side=o.side, quantity=0, price=0,
+            requested_quantity=o.quantity, requested_price=o.price,
+            reference_price=o.reference_price, requested_reason=o.requested_reason,
+            fill_mode="order_result_pending",
+        ) for o in orders]
+        for result in pending:
+            self.strategy.on_order_filled(result)
+        self._remember_pending_order_results(pending)
+        self._executing_orders = list(orders)
+        try:
+            self._order_execution = self._market_reader.submit(self.executor.submit_orders, list(orders))
+            self._order_sequence += 1
+        except Exception:
+            self._executing_orders = []
+            for result in pending:
+                result.success = False
+                result.message = "주문 작업을 시작하지 못했습니다."
+            self._handle_order_results(pending)
+            raise
+        logger.info("주문 %d건 제출", len(orders))
+        return True
+
+    def _submit_strategy_orders(self, orders: List[Order]) -> bool:
+        filtered = self._filter_pending_duplicate_orders(orders, datetime.now())
+        started = self._start_order_execution(filtered)
+        submitted_buys = {o.symbol for o in self._executing_orders if o.side == OrderSide.BUY}
+        for order in orders:
+            if order.side == OrderSide.BUY and order.symbol not in submitted_buys:
+                # The strategy reserves a proposal before the scheduler admits it.
+                # A filtered or busy-worker rejection is definitively not submitted.
+                self.strategy.on_order_filled(OrderResult(
+                    False, symbol=order.symbol, side=order.side,
+                    message="미제출 매수 예약 해제",
+                ))
+        return started
+
+    def _collect_order_execution(self, *, wait: bool = False) -> List[OrderResult]:
+        pending = getattr(self, "_order_execution", None)
+        if pending is None or (not wait and not pending.done()):
+            return []
+        orders = self._executing_orders
+        try:
+            results = pending.result()
+        except Exception:
+            logger.exception("주문 처리 결과 미확정: 기존 주문 대기를 유지합니다.")
+            results = [OrderResult(
+                success=True, symbol=o.symbol, side=o.side, requested_quantity=o.quantity,
+                requested_price=o.price, reference_price=o.reference_price,
+                requested_reason=o.requested_reason, fill_mode="order_result_pending",
+            ) for o in orders]
+        self._order_execution = None
+        self._executing_orders = []
+        self._handle_order_results(results)
+        return results
 
     @staticmethod
     def _order_block_side_value(side) -> str:
@@ -475,6 +675,8 @@ class TradingScheduler:
         requested_price = int(result.requested_price or 0)
         if fill_mode in {"market_pending", "partial_fill_pending"}:
             return True
+        if result.side == OrderSide.BUY and fill_mode in {"limit", "limit_partial"} and price > 0:
+            return False
         requested_quantity = max(0, int(result.requested_quantity or 0))
         if (
             requested_quantity > 0
@@ -515,213 +717,122 @@ class TradingScheduler:
             if key is not None and not self._result_requires_balance_reconcile(result):
                 self._pending_order_blocks.pop(key, None)
 
-    def _pending_sell_block_symbols_for_positions(self, positions, now: Optional[datetime] = None) -> List[str]:
-        if not positions:
-            return []
-        now = now or datetime.now()
-        self._purge_expired_pending_order_blocks(now)
-        position_symbols = {str(symbol or "").strip() for symbol in positions}
-        position_symbols.discard("")
-        if not position_symbols:
-            return []
-        blocked_symbols = []
-        for key in self._pending_order_blocks:
-            if not isinstance(key, tuple) or len(key) < 2:
+    def _read_order_reconciliation(self, entries: List[OrderResult], read_sells: bool):
+        confirmed = []
+        for result in entries:
+            if not result.order_no:
                 continue
-            symbol, side_value = key[0], key[1]
-            if side_value == OrderSide.SELL.value and symbol in position_symbols:
-                blocked_symbols.append(symbol)
-        return sorted(set(blocked_symbols))
+            try:
+                resolved = self.trading.resolve_pending_entry(result)
+                if resolved is not None:
+                    confirmed.append(resolved)
+            except Exception:
+                logger.exception("매수 주문 복구 조회 실패: %s", result.symbol)
+        terminal_entries = {r.symbol for r in confirmed if r.fill_mode != "entry_reconciled_partial"}
+        balance = None
+        if read_sells or not entries or any(r.symbol not in terminal_entries for r in entries):
+            balance = self._fetch_balance_with_retry(
+                "주문 상태 재동기화", max_attempts=1, base_delay_seconds=1,
+            )
+        history = None
+        if read_sells:
+            try:
+                today = datetime.now().strftime("%Y%m%d")
+                history = self.account.get_order_history(today, today, side="01")
+            except Exception:
+                logger.exception("매도 체결 복구 조회 실패: 기존 주문 대기를 유지합니다.")
+        return confirmed, balance, history
 
-    def _reconcile_pending_exit_positions(self) -> bool:
-        positions = self.strategy.positions
-        position_symbols = [
-            str(symbol or "").strip()
-            for symbol, position in positions.items()
-            if position.pending_exit_started_at is not None
-            and int(position.pending_exit_quantity or 0) > 0
-        ]
-        pending_fills = self.strategy._pending_sell_fills
-        pending_symbols = sorted(
-            {
-                symbol
-                for symbol in position_symbols + [str(symbol or "").strip() for symbol in pending_fills]
-                if symbol
-            }
-        )
-        if not pending_symbols:
-            self._last_pending_exit_reconcile_at = None
+    def _reconcile_pending_orders(self, results: Optional[List[OrderResult]] = None, *, wait: bool = False) -> bool:
+        # A single read snapshot prevents stale balances racing a new submission.
+        for result in results or []:
+            if self._result_requires_balance_reconcile(result) or (
+                not result.success and result.side == OrderSide.SELL
+                and self._is_rate_limited_message(result.message)
+            ):
+                self._account_reconcile_results.append(result)
+        if self._order_execution is not None:
             return False
-
-        now = datetime.now()
-        last_checked = self._last_pending_exit_reconcile_at
-        if last_checked is not None and (now - last_checked).total_seconds() < 5.0:
+        if self._account_read is None:
+            now = datetime.now()
+            entries = []
+            for symbol, meta in self.strategy._pending_entry_meta.items():
+                plan = meta.get("plan")
+                if plan is None:
+                    continue
+                entries.append(OrderResult(
+                    True, symbol=symbol, side=OrderSide.BUY, order_no=str(meta.get("order_no") or ""),
+                    requested_quantity=plan.quantity, requested_price=plan.entry_limit_price,
+                    requested_reason="price_breakout", fill_mode="order_result_pending",
+                    timestamp=meta.get("created_at") or now,
+                ))
+            read_sells = bool(self.strategy._pending_sell_fills) or any(
+                getattr(p, "pending_exit_started_at", None) is not None
+                for p in self.strategy.positions.values()
+            ) or any(r.side == OrderSide.SELL for r in self._account_reconcile_results)
+            entry_due = bool(entries) and (
+                self._last_pending_entry_reconcile_at is None
+                or (now - self._last_pending_entry_reconcile_at).total_seconds() >= 30
+            ) and (now - min(r.timestamp for r in entries)).total_seconds() >= 2
+            exit_due = read_sells and (
+                self._last_pending_exit_reconcile_at is None
+                or (now - self._last_pending_exit_reconcile_at).total_seconds() >= 5
+            )
+            if not self._account_reconcile_results and not entry_due and not exit_due:
+                return False
+            if entries:
+                self._last_pending_entry_reconcile_at = now
+            if read_sells:
+                self._last_pending_exit_reconcile_at = now
+            self._account_reconcile_results.extend(r for r in entries if r.symbol not in {
+                item.symbol for item in self._account_reconcile_results if item.side == OrderSide.BUY
+            })
+            if self._market_reader is None:
+                self._market_reader = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kis-io")
+            self._account_read = self._market_reader.submit(self._read_order_reconciliation, entries, read_sells)
+            self._account_snapshot_results = self._account_reconcile_results
+            self._account_reconcile_results = []
+            self._account_order_sequence = self._order_sequence
+        if not wait and not self._account_read.done():
             return False
-        self._last_pending_exit_reconcile_at = now
-
-        balance = self._fetch_balance_with_retry(
-            "pending 매도 잔고 확인",
-            max_attempts=1,
-            base_delay_seconds=1,
-        )
-        if balance is None:
+        try:
+            confirmed, balance, history = self._account_read.result()
+        except Exception:
+            logger.exception("주문 복구 미확정: 상태와 예약 위험을 유지합니다.")
+            self._account_reconcile_results = self._account_snapshot_results + self._account_reconcile_results
+            self._account_snapshot_results = []
             return False
-        self.strategy.sync_positions_from_account(balance.positions)
-        self._confirm_reconciled_sell_prices()
-        logger.debug(
-            "pending 매도 잔고 재동기화 완료: %s",
-            ",".join(sorted(pending_symbols)),
-        )
-        return True
-
-    def _reconcile_pending_entry_positions(self) -> bool:
-        pending = self.strategy._pending_entry_meta
-        if not pending:
-            self._last_pending_entry_reconcile_at = None
-            return False
-
-        now = datetime.now()
-        created_times = [
-            payload.get("created_at")
-            for payload in pending.values()
-            if isinstance(payload, dict) and isinstance(payload.get("created_at"), datetime)
-        ]
-        if created_times and (now - min(created_times)).total_seconds() < 2.0:
-            return False
-        last_checked = self._last_pending_entry_reconcile_at
-        if last_checked is not None and (now - last_checked).total_seconds() < 30.0:
-            return False
-        self._last_pending_entry_reconcile_at = now
-
-        balance = self._fetch_balance_with_retry(
-            "pending 매수 잔고 확인",
-            max_attempts=1,
-            base_delay_seconds=1,
-        )
-        if balance is None:
-            return False
-
-        pending_results: List[OrderResult] = []
-        for symbol, payload in list(pending.items()):
-            if not isinstance(payload, dict):
+        finally:
+            self._account_read = None
+        recovery_results = self._account_snapshot_results
+        self._account_snapshot_results = []
+        if balance is not None and self._account_order_sequence != self._order_sequence:
+            # An urgent sell may overtake this read. Its older balance must not
+            # resurrect sold shares or shrink a newly confirmed holding.
+            balance = None
+            self._account_reconcile_results.extend(recovery_results)
+        for result in confirmed:
+            if self.strategy.on_order_filled(result) is False:
                 continue
-            plan = payload.get("plan")
-            pending_results.append(
-                OrderResult(
-                    success=True,
-                    order_no=str(payload.get("order_no") or ""),
-                    symbol=str(symbol),
-                    side=OrderSide.BUY,
-                    quantity=0,
-                    price=0,
-                    requested_price=max(0, int(plan.entry_limit_price or 0)),
-                    reference_price=max(0, int(payload.get("signal_price", 0) or 0)),
-                    requested_quantity=max(0, int(plan.quantity or 0)),
-                    fill_mode="order_result_pending",
-                    requested_reason="expected_value",
-                    timestamp=now,
-                )
-            )
-
-        inferred_results: List[OrderResult] = []
-        inferred_results = list(
-            self.strategy.reconcile_pending_fills_from_account(
-                pending_results,
-                balance.positions,
-            ) or []
-        )
-        self.strategy.sync_positions_from_account(balance.positions)
-
-        remaining = self.strategy._pending_entry_meta
-        blocks = self._pending_order_blocks
-        for result in pending_results:
-            if result.symbol not in remaining and isinstance(blocks, dict):
-                blocks.pop((result.symbol, OrderSide.BUY.value), None)
-        for inferred in inferred_results:
-            after_position = self.strategy.positions.get(inferred.symbol)
-            self._send_order_result_alert(inferred, after_position=after_position)
-        if inferred_results:
-            logger.info(
-                "pending 매수 체결 확정: %s",
-                ",".join(sorted(result.symbol for result in inferred_results)),
-            )
-        elif any(
-            str(position.symbol or "") in remaining
-            for position in balance.positions
-        ):
-            # A quote is needed to reprice the restored plan. Retry next tick
-            # instead of waiting the normal 30-second account poll interval.
-            self._last_pending_entry_reconcile_at = None
+            self._remember_pending_order_results([result])
+            self._send_order_result_alert(result)
+            if result.symbol not in self.strategy._pending_entry_meta:
+                self._pending_order_blocks.pop((result.symbol, OrderSide.BUY.value), None)
+        if balance is not None:
+            confirmed_symbols = {r.symbol for r in confirmed}
+            inferred = list(self.strategy.reconcile_pending_fills_from_account(
+                [r for r in recovery_results if r.symbol not in confirmed_symbols], balance.positions,
+            ) or [])
+            self.strategy.reconcile_no_holding_sell_failures_from_account(recovery_results, balance.positions)
+            self.strategy.sync_positions_from_account(balance.positions)
+            for result in inferred:
+                if result.side == OrderSide.BUY and result.symbol not in self.strategy._pending_entry_meta:
+                    self._pending_order_blocks.pop((result.symbol, OrderSide.BUY.value), None)
+                self._send_order_result_alert(result)
+        if history is not None:
+            self._confirm_reconciled_sell_prices(history=history)
+        self._send_daily_halt_alert_if_needed()
         return True
-
-    def _reconcile_positions_after_order_failures(self, results: List[OrderResult], before_positions=None) -> List[OrderResult]:
-        if not results:
-            return []
-        has_sell_rate_limit_failure = any(
-            (not result.success)
-            and result.side == OrderSide.SELL
-            and self._is_rate_limited_message(result.message)
-            for result in results
-        )
-        has_sell_no_position_failure = any(
-            (not result.success)
-            and result.side == OrderSide.SELL
-            and str(result.error_category or "") == "no_holding"
-            for result in results
-        )
-        has_uncertain_fill = any(self._result_requires_balance_reconcile(result) for result in results)
-        if not has_sell_rate_limit_failure and not has_sell_no_position_failure and not has_uncertain_fill:
-            return []
-        context = "주문 결과 확인 후 잔고 재동기화"
-        if has_sell_rate_limit_failure or has_sell_no_position_failure:
-            context = "매도 실패 후 잔고 재동기화"
-        balance = self._fetch_balance_with_retry(
-            context,
-            max_attempts=2,
-            base_delay_seconds=1,
-        )
-        if balance is None:
-            logger.warning("%s 실패: 기존 포지션 상태를 유지합니다.", context)
-            return []
-        inferred_results = []
-        try:
-            inferred_results = list(
-                self.strategy.reconcile_pending_fills_from_account(
-                    results,
-                    balance.positions,
-                ) or []
-            )
-        except Exception:
-            logger.exception("pending 체결 계좌 보정 실패")
-        try:
-            inferred_results.extend(
-                list(
-                    self.strategy.reconcile_no_holding_sell_failures_from_account(
-                        results,
-                        balance.positions,
-                    ) or []
-                )
-            )
-        except Exception:
-            logger.exception("무보유 매도 실패 계좌 보정 실패")
-        self.strategy.sync_positions_from_account(balance.positions)
-        logger.debug(
-            "계좌 기준 재동기화 완료: 보유 %d종목",
-            len(balance.positions),
-        )
-        self._confirm_reconciled_sell_prices(inferred_results)
-        for inferred in inferred_results:
-            symbol = str(inferred.symbol or "")
-            before_position = None
-            if inferred.side == OrderSide.SELL and before_positions:
-                before_position = before_positions.get(symbol)
-            after_position = self.strategy.positions.get(symbol)
-            self._send_order_result_alert(
-                inferred,
-                before_position=before_position,
-                after_position=after_position,
-            )
-        return inferred_results
 
     def _stop_session_on_market_closed_order_failure(self, results: List[OrderResult]) -> bool:
         if not any(
@@ -735,7 +846,7 @@ class TradingScheduler:
         self._market_closed_session_date = date_key
         self._last_session_end_reason = "market_holiday"
         logger.warning("주문 API가 비영업일/휴장 응답을 반환했습니다. date=%s 세션을 중단합니다.", date_key)
-        self._alerts.send(
+        self._send_alert(
             event_key=f"market_closed_order_{date_key}",
             title="휴장일 주문 차단",
             message=f"{date_key} 주문 API가 비영업일을 반환해 오늘 거래 세션을 중단했습니다.",
@@ -759,7 +870,7 @@ class TradingScheduler:
             "계좌/API 키 조합이 주문 불가 상태입니다. date=%s 오늘 세션의 추가 주문을 중단합니다.",
             date_key,
         )
-        self._alerts.send(
+        self._send_alert(
             event_key=f"account_order_unavailable_{date_key}",
             title="계좌 주문 불가",
             message=(
@@ -771,12 +882,13 @@ class TradingScheduler:
         )
         return True
 
-    def _confirm_reconciled_sell_prices(self, results: Optional[List[OrderResult]] = None) -> None:
+    def _confirm_reconciled_sell_prices(self, results: Optional[List[OrderResult]] = None, *, history=None) -> None:
         try:
             corrections = list(
                 self.strategy.confirm_reconciled_sell_fills(
                     self.account,
                     results=results,
+                    history=history,
                 ) or []
             )
         except Exception:
@@ -795,8 +907,6 @@ class TradingScheduler:
                 int(correction.get("delta_net_pnl", 0) or 0),
                 int(correction.get("remaining_quantity", 0) or 0),
             )
-            if not bool(correction.get("notify", True)):
-                continue
             confirmed_result = OrderResult(
                 success=True,
                 order_no=str(correction.get("order_no", "") or ""),
@@ -804,7 +914,13 @@ class TradingScheduler:
                 side=OrderSide.SELL,
                 quantity=int(correction.get("alert_quantity", correction.get("quantity", 0)) or 0),
                 price=int(correction.get("alert_price", correction.get("corrected_price", 0)) or 0),
-                requested_quantity=int(correction.get("alert_quantity", correction.get("quantity", 0)) or 0),
+                requested_quantity=int(
+                    correction.get(
+                        "requested_quantity",
+                        correction.get("alert_quantity", correction.get("quantity", 0)),
+                    )
+                    or 0
+                ),
                 fill_mode=(
                     "account_reconciled_partial"
                     if partial
@@ -814,6 +930,9 @@ class TradingScheduler:
                 fill_id=str(correction.get("fill_id", "") or ""),
                 remaining_quantity=int(correction.get("remaining_quantity", 0) or 0),
             )
+            self._clear_pending_order_blocks_for_results([confirmed_result])
+            if not bool(correction.get("notify", True)):
+                continue
             self._send_order_result_alert(
                 confirmed_result,
                 confirmed_trade_net_pnl=int(
@@ -824,21 +943,35 @@ class TradingScheduler:
     def _handle_order_results(self, results: List[OrderResult]) -> None:
         if not results:
             return
-        self._remember_pending_order_results(results, datetime.now())
-        before_positions = {}
+        accepted = []
         for result in results:
-            before_position = self.strategy.positions.get(result.symbol)
-            if before_position is not None:
-                before_positions.setdefault(result.symbol, copy.copy(before_position))
-            self.strategy.on_order_filled(result)
-            after_position = self.strategy.positions.get(result.symbol)
-            self._send_order_result_alert(result, before_position=before_position, after_position=after_position)
-        inferred_results = self._reconcile_positions_after_order_failures(results, before_positions=before_positions)
-        self._clear_pending_order_blocks_for_results(inferred_results)
+            if self.strategy.on_order_filled(result) is False:
+                continue
+            accepted.append(result)
+            self._send_order_result_alert(result)
+        self._remember_pending_order_results(accepted, datetime.now())
+        self._reconcile_pending_orders(accepted)
         self._send_daily_halt_alert_if_needed()
 
     def _alert_daily_net_pnl(self) -> int:
         return int(self.strategy.daily_pnl.realized_net_pnl)
+
+    def _send_alert(self, **payload) -> None:
+        if self._alert_sender is None:
+            self._alert_sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kis-alert")
+        # Freeze the text after ledger application; delivery never touches strategy state.
+        self._alert_sender.submit(self._deliver_alert, payload)
+
+    def _deliver_alert(self, payload) -> None:
+        try:
+            self._alerts.send(**payload)
+        except Exception:
+            logger.exception("알림 전송 작업 실패: event=%s", payload.get("event_key", ""))
+
+    def _stop_alerts(self) -> None:
+        if self._alert_sender is not None:
+            self._alert_sender.shutdown(wait=True)
+            self._alert_sender = None
 
     def _confirmed_sell_fill_net_pnl(self, result: OrderResult) -> Optional[int]:
         ledger = self.strategy._sell_fill_ledger
@@ -924,7 +1057,7 @@ class TradingScheduler:
                 fill_identity = str(
                     int(result.timestamp.timestamp()) if result.timestamp else 0
                 )
-            self._alerts.send(
+            self._send_alert(
                 event_key=f"order_fill_{side.value}_{symbol}_{fill_identity}",
                 title=title,
                 message=message,
@@ -945,7 +1078,7 @@ class TradingScheduler:
             return
         self._last_halt_alert_day = day_key
         realized = int(self.strategy.daily_pnl.realized_net_pnl)
-        self._alerts.send(
+        self._send_alert(
             event_key=f"strategy_halted_{day_key}",
             title="당일 거래 중지",
             message=f"전략이 당일 거래를 중지했습니다.\n누적 순손익: {realized:,}원",
@@ -959,7 +1092,7 @@ class TradingScheduler:
         if last_sent_at is not None and (now - last_sent_at).total_seconds() < 300:
             return
         self._last_loop_error_alert_at = now
-        self._alerts.send(
+        self._send_alert(
             event_key=f"{scope}_loop_error",
             title="봇 오류 감지",
             message=f"{scope} 오류가 발생했습니다.\n{message}",
@@ -975,7 +1108,7 @@ class TradingScheduler:
         win_count = int(daily_pnl.win_count)
         loss_count = int(daily_pnl.loss_count)
         positions = self.strategy.positions
-        self._alerts.send(
+        self._send_alert(
             event_key=f"trading_session_summary_{datetime.now().date().isoformat()}_{self._last_session_end_reason}",
             title="트레이딩 세션 종료",
             message=(
@@ -1031,12 +1164,13 @@ class TradingScheduler:
             return False
 
         # 전략 초기화
+        self.market_data.refresh_instruments()
         self._reset_strategy_simulated_clock()
         self.strategy.initialize()
         session_start_delay = self._session_start_balance_delay_seconds()
         if session_start_delay > 0:
             self._interruptible_sleep(session_start_delay)
-        balance = self._fetch_balance_with_retry("세션 시작 잔고 조회")
+        balance = self._fetch_balance_with_retry("세션 시작 잔고 조회", timeout=(10.0, 60.0))
         if balance:
             self.strategy.sync_positions_from_account(balance.positions)
             logger.info(
@@ -1054,7 +1188,6 @@ class TradingScheduler:
 
         # A saved same-day pool is only a fallback. Every new process/session
         # starts by discovering the current movers again.
-        self._refresh_runtime_pool_if_needed(datetime.now(), force=True)
         watchlist = self.strategy.get_watchlist()
         prioritized_symbols = self._prioritized_stream_symbols(watchlist)
         self._quote_stream.start(prioritized_symbols)
@@ -1062,13 +1195,14 @@ class TradingScheduler:
         if not isinstance(stream_symbols, (list, tuple, set)):
             stream_symbols = prioritized_symbols
         stream_symbols = list(stream_symbols)
+        self._refresh_runtime_pool_if_needed(datetime.now(), force=True)
         logger.info(
             "감시 종목: 전체=%d WebSocket=%d KIS멀티보완=%d",
             len(watchlist),
             len(stream_symbols),
             max(0, len(prioritized_symbols) - len(stream_symbols)),
         )
-        self._alerts.send(
+        self._send_alert(
             event_key=f"trading_session_started_{datetime.now().date().isoformat()}",
             title="트레이딩 세션 시작",
             message=(
@@ -1086,94 +1220,38 @@ class TradingScheduler:
         # 틱 루프
         while not self._shutdown and self._is_trading_time(datetime.now()):
             try:
-                self._reconcile_pending_entry_positions()
-                self._reconcile_pending_exit_positions()
-                if not self.strategy.should_continue():
-                    halted_for_day = True
-                    strategy_halt_observed = True
-                    positions = self.strategy.positions
-                    if positions:
-                        logger.warning(
-                            "전략 중지 상태지만 보유 포지션 %d종목이 남아 즉시 청산을 시도합니다.",
-                            len(positions),
-                        )
-                        halt_orders = self.strategy._liquidate_all()
-                        if halt_orders:
-                            halt_orders = self._filter_pending_duplicate_orders(halt_orders, datetime.now())
-                        if halt_orders:
-                            results = self.executor.submit_orders(halt_orders)
-                            self._handle_order_results(results)
-                            if self._stop_session_on_market_closed_order_failure(results):
-                                break
-                            if self._stop_session_on_account_order_unavailable(results):
-                                halted_for_day = True
-                                break
-                            self._interruptible_sleep(max(2, tick_interval))
-                            continue
-                        pending_exit_symbols = self._pending_sell_block_symbols_for_positions(positions, datetime.now())
-                        pending_balance = self._fetch_balance_with_retry(
-                            "전략 중지 청산 잔고 확인",
-                            max_attempts=1,
-                            base_delay_seconds=1,
-                        )
-                        if pending_balance is not None:
-                            self.strategy.sync_positions_from_account(pending_balance.positions)
-                        remaining_positions = self.strategy.positions
-                        if remaining_positions:
-                            waiting_symbols = pending_exit_symbols or sorted(str(symbol) for symbol in remaining_positions)
-                            logger.warning(
-                                "전략 중지 청산 잔고 확인 대기: %s",
-                                ",".join(waiting_symbols),
-                            )
-                            self._interruptible_sleep(max(2, tick_interval))
-                            continue
-                    logger.info("전략이 종료를 요청했습니다.")
+                results = self._collect_order_execution()
+                if self._stop_session_on_market_closed_order_failure(results):
                     break
+                if self._stop_session_on_account_order_unavailable(results):
+                    halted_for_day = True
+                    break
+                self._reconcile_pending_orders()
+                if self._order_execution is None and not self.strategy.should_continue():
+                    halted_for_day = True
+                    if not strategy_halt_observed:
+                        logger.info("전략 중지: 신규 매수 없이 시세 수신과 잔여 청산/체결 확인을 계속합니다.")
+                        strategy_halt_observed = True
+                    if (not self.strategy.positions and self._account_read is None
+                            and not self.strategy._pending_entry_meta and not self.strategy._pending_sell_fills):
+                        logger.info("전략이 종료를 요청했습니다.")
+                        break
 
-                # 동적 발견은 KIS 순위를, 예측 시세는 WebSocket과 저빈도
+                # 동적 발견은 KIS 순위를, 신호 시세는 WebSocket과
                 # KIS 멀티시세 보완을 함께 사용한다.
-                self._refresh_runtime_pool_if_needed(datetime.now())
-                watchlist = self.strategy.get_watchlist()
-                prioritized_symbols = self._prioritized_stream_symbols(watchlist)
-                self._quote_stream.update_symbols(prioritized_symbols)
-                stream_symbols = self._quote_stream.subscribed_symbols()
-                if not isinstance(stream_symbols, (list, tuple, set)):
-                    stream_symbols = prioritized_symbols
-                stream_symbols = list(stream_symbols)
-                all_quotes = self._quote_stream.drain_quotes()
-                tick_now = datetime.now()
-                all_quotes.extend(
-                    self._supplemental_watchlist_quotes(
-                        tick_now,
-                        prioritized_symbols,
-                        stream_symbols,
-                    )
-                )
-                all_quotes.extend(self._emergency_position_quotes(tick_now))
+                watchlist, stream_symbols, all_quotes = self._read_quote_batch()
 
-                if all_quotes:
-                    for q in all_quotes:
-                        logger.debug(
-                            "[%s] %s원",
-                            q.symbol,
-                            f"{q.current_price:,}",
-                        )
+                for q in all_quotes:
+                    logger.debug("[%s] %s원", q.symbol, f"{q.current_price:,}")
 
-                    orders = self.strategy.on_batch_tick(all_quotes)
-                    self._log_tick_activity(datetime.now(), watchlist, stream_symbols, all_quotes)
-                    if orders:
-                        orders = self._filter_pending_duplicate_orders(orders, datetime.now())
-                    if orders:
-                        logger.info("주문 %d건 제출", len(orders))
-                        results = self.executor.submit_orders(orders)
-                        self._handle_order_results(results)
-                        if self._stop_session_on_market_closed_order_failure(results):
-                            break
-                        if self._stop_session_on_account_order_unavailable(results):
-                            halted_for_day = True
-                            break
-                else:
-                    self._log_tick_activity(datetime.now(), watchlist, stream_symbols, all_quotes)
+                # The same batch route archives quotes and liquidates halted holdings.
+                # Pending fills must not bypass it or freeze the last executable book.
+                orders = self.strategy.on_batch_tick(all_quotes)
+                self._log_tick_activity(datetime.now(), watchlist, stream_symbols, all_quotes)
+                if orders:
+                    self._submit_strategy_orders(orders)
+                self._schedule_market_reads(
+                    self._prioritized_stream_symbols(watchlist), stream_symbols, datetime.now())
 
                 self._interruptible_sleep(1)
             except requests.exceptions.RequestException as e:
@@ -1192,10 +1270,10 @@ class TradingScheduler:
                 self._interruptible_sleep(max(10, tick_interval))
 
         self._quote_stream.stop()
+        self._stop_market_reads()
         logger.info("--- 트레이딩 세션 종료 ---")
         self._session_started_at = None
 
-        self._confirm_reconciled_sell_prices()
         if strategy_halt_observed and halted_for_day:
             try:
                 strategy_resumed = bool(self.strategy.should_continue())
@@ -1224,6 +1302,7 @@ class TradingScheduler:
         else:
             logger.warning("세션 종료 잔고 조회 실패: 오늘 요약 로그를 생략합니다.")
         self._reset_strategy_simulated_clock()
+        self._stop_alerts()
         return halted_for_day
 
     def _write_performance_reports(self, balance, session_pnl: int):
@@ -1295,6 +1374,8 @@ class TradingScheduler:
         context: str,
         max_attempts: int = None,
         base_delay_seconds: int = None,
+        *,
+        timeout: tuple[float, float] | None = None,
     ):
         """잔고 조회를 실패 시 재시도한다."""
         attempts = max_attempts or self._balance_retry_attempts
@@ -1303,7 +1384,7 @@ class TradingScheduler:
         for i in range(1, attempts + 1):
             failure_detail = ""
             try:
-                balance = self.account.get_balance()
+                balance = self.account.get_balance(timeout=timeout)
             except requests.exceptions.RequestException as exc:
                 balance = None
                 failure_detail = f" 네트워크 오류: {exc}"

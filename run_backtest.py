@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the daily-bar smoke backtest for the expected-value strategy."""
+"""Daily-bar smoke test only; executable breakout replay needs intraday quotes."""
 
 import argparse
 import os
@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> None:
             static_watchlist=list(data),
             inverse_etfs=[symbol for symbol in DEFAULT_INVERSE_ETFS if symbol in data],
             daily_state_path=os.path.join(directory, "state.json"),
-            forecast_outcome_root=os.path.join(directory, "forecasts"),
+            quote_archive_root=os.path.join(directory, "quotes"),
         )
         strategy = MomentumScalpStrategy(
             market_data=None,

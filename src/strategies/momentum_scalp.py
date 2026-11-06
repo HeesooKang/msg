@@ -2,22 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import defaultdict, deque
-from dataclasses import dataclass, fields
+from collections import Counter, defaultdict, deque
+from dataclasses import fields, replace
 from datetime import datetime, timedelta
 from math import ceil, floor
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
-from src.analytics.forecast_outcomes import ForecastOutcomeLedger
-from src.analytics.price_prediction import (
-    PREDICTION_HORIZONS_SECONDS,
-    Prediction,
-    build_feature_rows,
-    fit_model,
-    predict_batch,
-)
+from src.analytics.quote_archive import QuoteArchive
 from src.models import Order, OrderResult, OrderSide, OrderType, Position, Quote
+from src.instruments import is_stock_symbol, tick_size, transaction_tax_rate
 from src.strategy import BaseStrategy
 from src.strategies.momentum_scalp_pnl import (
     TradePnL,
@@ -37,21 +31,14 @@ from src.strategies.momentum_scalp_types import (
 logger = logging.getLogger("kis_trader.strategy.momentum_scalp")
 order_logger = logging.getLogger("kis_trader.orders")
 
-STATE_SCHEMA_VERSION = 4
+STATE_SCHEMA_VERSION = 5
+BREAKOUT_LOOKBACK_SECONDS = 60
+MAX_HOLD_SECONDS = 180
 KRX_CLOSING_AUCTION_START = (15, 20)
 
 
-@dataclass
-class ExpectedValueCandidate:
-    quote: Quote
-    prediction: Prediction
-    plan: TradePlan
-    forecast_payload: Dict[str, Any]
-    forecast_id: str = ""
-
-
 class MomentumScalpStrategy(BaseStrategy):
-    """One execution-price prediction and one EV plan for every symbol."""
+    """One breakout entry with a frozen drawdown stop, target and expiry."""
 
     def __init__(
         self,
@@ -60,6 +47,8 @@ class MomentumScalpStrategy(BaseStrategy):
         fixed_pool: Optional[List[str]] = None,
     ):
         self.market_data = market_data
+        groups = getattr(market_data, "instrument_groups", {})
+        self.instrument_groups = groups if isinstance(groups, dict) else {}
         self.config = config
         self.fixed_pool = self._normalize_symbols(fixed_pool or [])
 
@@ -74,13 +63,10 @@ class MomentumScalpStrategy(BaseStrategy):
         self._recent_quotes: Dict[str, deque[Quote]] = {}
         self._last_evaluation_count = 0
         self._entry_window_closed_log_day = ""
-        self._prediction_model: Any = None
-        self._prediction_training_signature: tuple[int, str] | None = None
+        self._last_submitted_signal_at: Dict[str, datetime] = {}
         self._last_batch_summary_at: Optional[datetime] = None
 
-        self._forecast_outcomes = ForecastOutcomeLedger(
-            Path(self.config.forecast_outcome_root)
-        )
+        self._quote_archive = QuoteArchive(self.config.quote_archive_root)
         self._simulated_now: Optional[datetime] = None
         self._active_day = ""
         self._last_daily_state_save_at: Optional[datetime] = None
@@ -100,7 +86,7 @@ class MomentumScalpStrategy(BaseStrategy):
         seen = set()
         for symbol in symbols:
             value = str(symbol or "").strip()
-            if len(value) != 6 or not value.isdigit() or value in seen:
+            if not is_stock_symbol(value) or value in seen:
                 continue
             seen.add(value)
             normalized.append(value)
@@ -130,8 +116,7 @@ class MomentumScalpStrategy(BaseStrategy):
         self._recent_quotes = {}
         self._entry_window_closed_log_day = ""
         self._last_batch_summary_at = None
-        self._prediction_model = None
-        self._prediction_training_signature = None
+        self._last_submitted_signal_at = {}
         self._pool = list(self.fixed_pool)
         self._halted = False
         self._halt_reason = ""
@@ -159,7 +144,7 @@ class MomentumScalpStrategy(BaseStrategy):
         if self._hard_stop_bypass_active:
             self._save_daily_state_if_due(force=True)
         logger.info(
-            "EV 전략 초기화: schema=%d 고정=%d 동적=%d 보유=%d 누적실현=%+d원 세션실현=%+d원 손실한도=%+d원",
+            "가격 돌파 전략 초기화: schema=%d 고정=%d 동적=%d 보유=%d 누적실현=%+d원 세션실현=%+d원 손실한도=%+d원",
             STATE_SCHEMA_VERSION,
             len(self.config.static_watchlist),
             len(self._pool),
@@ -225,7 +210,7 @@ class MomentumScalpStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     @staticmethod
     def _serialize_datetime(value: Optional[datetime]) -> str:
-        return value.isoformat(timespec="seconds") if value is not None else ""
+        return value.isoformat() if value is not None else ""
 
     @staticmethod
     def _deserialize_datetime(value: Any) -> Optional[datetime]:
@@ -248,18 +233,20 @@ class MomentumScalpStrategy(BaseStrategy):
             "reason": plan.reason,
             "quantity": plan.quantity,
             "entry_limit_price": plan.entry_limit_price,
-            "expected_exit_bid": plan.expected_exit_bid,
-            "lower_exit_bid": plan.lower_exit_bid,
-            "expected_net": plan.expected_net,
-            "lower_net": plan.lower_net,
+            "breakout_price": plan.breakout_price,
             "committed_risk_net_abs": plan.committed_risk_net_abs,
             "signal_at": self._serialize_datetime(plan.signal_at),
             "expires_at": self._serialize_datetime(plan.expires_at),
+            "target_price": plan.target_price,
+            "stop_price": plan.stop_price,
+            "exit_price_allowance": plan.exit_price_allowance,
         }
 
     def _deserialize_plan(
         self,
         payload: Mapping[str, Any] | None,
+        *,
+        fill_price: Optional[int] = None,
     ) -> Optional[TradePlan]:
         if not isinstance(payload, Mapping):
             return None
@@ -274,18 +261,30 @@ class MomentumScalpStrategy(BaseStrategy):
                 reason=str(payload["reason"]),
                 quantity=int(payload["quantity"]),
                 entry_limit_price=int(payload["entry_limit_price"]),
-                expected_exit_bid=int(payload["expected_exit_bid"]),
-                lower_exit_bid=int(payload["lower_exit_bid"]),
-                expected_net=float(payload["expected_net"]),
-                lower_net=int(payload["lower_net"]),
+                # A legacy forecast is not a price-breakout plan. Keep its
+                # order identity for reconciliation, then liquidate on a quote.
+                breakout_price=max(0, int(payload.get("breakout_price", 0))),
                 committed_risk_net_abs=int(payload["committed_risk_net_abs"]),
                 signal_at=signal_at,
                 expires_at=expires_at,
+                target_price=max(0, int(payload.get("target_price", 0))),
+                stop_price=max(0, int(payload.get("stop_price", 0))),
+                exit_price_allowance=max(0, int(payload.get("exit_price_allowance", 0))),
             )
         except (KeyError, TypeError, ValueError):
             return None
         if not plan.symbol or plan.quantity <= 0:
             return None
+        if "target_price" not in payload and plan.breakout_price > 0:
+            # Preserve the old risk-sized profit exit only when restoring an old plan.
+            rate = 1 - self.config.commission_rate - self._sell_tax_rate_for_symbol(plan.symbol)
+            if rate <= 0:
+                return None
+            price = ((plan.entry_limit_price if fill_price is None else fill_price)
+                     * (1 + self.config.commission_rate)
+                     + plan.committed_risk_net_abs / plan.quantity) / rate
+            tick = tick_size(price, self.instrument_groups.get(plan.symbol, ""))
+            plan = replace(plan, target_price=int(ceil(price / tick) * tick))
         return plan
 
     def _serialize_position(self, position: PositionState) -> Dict[str, Any]:
@@ -296,12 +295,12 @@ class MomentumScalpStrategy(BaseStrategy):
             "buy_time": self._serialize_datetime(position.buy_time),
             "plan": self._serialize_plan(position.plan),
             "trade_key": position.trade_key,
-            "forecast_id": position.forecast_id,
             "pending_exit_started_at": self._serialize_datetime(
                 position.pending_exit_started_at
             ),
             "pending_exit_quantity": position.pending_exit_quantity,
             "pending_exit_reason": position.pending_exit_reason,
+            "stop_triggered": position.stop_triggered,
         }
 
     def _deserialize_position(self, payload: Mapping[str, Any]) -> Optional[PositionState]:
@@ -311,7 +310,7 @@ class MomentumScalpStrategy(BaseStrategy):
         if len(symbol) != 6 or quantity <= 0 or buy_price <= 0:
             return None
         buy_time = self._deserialize_datetime(payload.get("buy_time")) or self._now()
-        plan = self._deserialize_plan(payload.get("plan"))
+        plan = self._deserialize_plan(payload.get("plan"), fill_price=buy_price)
         if plan is not None and (plan.symbol != symbol or plan.quantity != quantity):
             plan = None
         return PositionState(
@@ -321,7 +320,6 @@ class MomentumScalpStrategy(BaseStrategy):
             buy_time=buy_time,
             plan=plan,
             trade_key=str(payload.get("trade_key") or ""),
-            forecast_id=str(payload.get("forecast_id") or ""),
             pending_exit_started_at=self._deserialize_datetime(
                 payload.get("pending_exit_started_at")
             ),
@@ -329,15 +327,17 @@ class MomentumScalpStrategy(BaseStrategy):
                 0, int(payload.get("pending_exit_quantity", 0) or 0)
             ),
             pending_exit_reason=str(payload.get("pending_exit_reason") or ""),
+            stop_triggered=bool(payload.get("stop_triggered", False)),
         )
 
     def _serialize_pending_entry(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         return {
             "plan": self._serialize_plan(payload.get("plan")),
-            "forecast_id": str(payload.get("forecast_id") or ""),
             "signal_price": int(payload.get("signal_price", 0) or 0),
             "created_at": self._serialize_datetime(payload.get("created_at")),
             "order_no": str(payload.get("order_no") or ""),
+            "confirmed_quantity": int(payload.get("confirmed_quantity", 0) or 0),
+            "confirmed_amount": int(payload.get("confirmed_amount", 0) or 0),
         }
 
     def _deserialize_pending_entry(
@@ -354,10 +354,11 @@ class MomentumScalpStrategy(BaseStrategy):
             return None
         return {
             "plan": plan,
-            "forecast_id": str(payload.get("forecast_id") or ""),
             "signal_price": int(payload.get("signal_price", 0) or 0),
             "created_at": created_at,
             "order_no": str(payload.get("order_no") or ""),
+            "confirmed_quantity": int(payload.get("confirmed_quantity", 0) or 0),
+            "confirmed_amount": int(payload.get("confirmed_amount", 0) or 0),
         }
 
     def _save_daily_state_if_due(self, *, force: bool = False) -> None:
@@ -450,6 +451,10 @@ class MomentumScalpStrategy(BaseStrategy):
                 continue
             restored = self._deserialize_pending_entry(str(symbol), item)
             if restored is not None:
+                position = self.positions.get(str(symbol))
+                if "confirmed_quantity" not in item and position is not None:
+                    restored["confirmed_quantity"] = position.quantity
+                    restored["confirmed_amount"] = position.quantity * position.buy_price
                 self._pending_entry_meta[str(symbol)] = restored
 
         self._pending_sell_fills = {}
@@ -510,10 +515,9 @@ class MomentumScalpStrategy(BaseStrategy):
             )
         if repriced_fills:
             logger.info(
-                "확정 매도체결 원장 비용 재계산: %d건 수수료율=%.6f%% 매도비용률=%.4f%%",
+                "확정 매도체결 원장 비용 재계산: %d건 수수료율=%.6f%% 종목별 매도비용 적용",
                 repriced_fills,
                 float(self.config.commission_rate) * 100.0,
-                float(self.config.sell_tax_rate) * 100.0,
             )
 
     # ------------------------------------------------------------------
@@ -530,7 +534,9 @@ class MomentumScalpStrategy(BaseStrategy):
             exit_price=sell_price,
             quantity=quantity,
             commission_rate=self.config.commission_rate,
-            sell_tax_rate=self.config.sell_tax_rate,
+            sell_tax_rate=self._sell_tax_rate_for_symbol(
+                str(fill.get("symbol") or "")
+            ),
         )
         recalculated = {
             "gross_pnl": pnl.gross_pnl,
@@ -592,50 +598,6 @@ class MomentumScalpStrategy(BaseStrategy):
                 pnl.breakeven_count += 1
         self.daily_pnl = pnl
 
-    def _trade_is_closed(self, trade_key: str) -> bool:
-        fills = [
-            item
-            for item in self._sell_fill_ledger
-            if str(item.get("trade_key") or "") == str(trade_key or "")
-        ]
-        if not fills:
-            return False
-        sold = sum(max(0, int(item.get("quantity", 0) or 0)) for item in fills)
-        entered = max(max(0, int(item.get("entry_quantity", 0) or 0)) for item in fills)
-        return entered > 0 and sold >= entered
-
-    def _record_execution_outcome_if_closed(self, trade_key: str) -> None:
-        fills = [
-            item
-            for item in self._sell_fill_ledger
-            if str(item.get("trade_key") or "") == str(trade_key or "")
-        ]
-        if not fills or not self._trade_is_closed(trade_key):
-            return
-        if any(bool(item.get("execution_outcome_recorded")) for item in fills):
-            return
-        quantity = sum(max(0, int(item.get("quantity", 0) or 0)) for item in fills)
-        sell_notional = sum(
-            max(0, int(item.get("sell_price", 0) or 0))
-            * max(0, int(item.get("quantity", 0) or 0))
-            for item in fills
-        )
-        first = fills[0]
-        if quantity <= 0 or sell_notional <= 0:
-            return
-        recorded = self._forecast_outcomes.record_execution_outcome(
-            symbol=str(first.get("symbol") or ""),
-            forecast_id=str(first.get("forecast_id") or ""),
-            entry_price=max(0, int(first.get("buy_price", 0) or 0)),
-            exit_price=int(round(sell_notional / quantity)),
-            quantity=quantity,
-            net_pnl=sum(int(item.get("net_pnl", 0) or 0) for item in fills),
-            now=self._now(),
-        )
-        if recorded:
-            for item in fills:
-                item["execution_outcome_recorded"] = True
-
     def _append_confirmed_sell_fill(
         self,
         *,
@@ -643,7 +605,7 @@ class MomentumScalpStrategy(BaseStrategy):
         position: PositionState,
         quantity: int,
         sell_price: int,
-        apply_to_position: bool,
+        remaining_quantity: Optional[int] = None,
         clear_pending: bool = True,
         fill_id: str = "",
     ) -> Optional[Dict[str, Any]]:
@@ -665,7 +627,7 @@ class MomentumScalpStrategy(BaseStrategy):
             exit_price=resolved_price,
             quantity=resolved_quantity,
             commission_rate=self.config.commission_rate,
-            sell_tax_rate=self.config.sell_tax_rate,
+            sell_tax_rate=self._sell_tax_rate_for_symbol(position.symbol),
         )
         previously_sold = sum(
             max(0, int(item.get("quantity", 0) or 0))
@@ -680,6 +642,7 @@ class MomentumScalpStrategy(BaseStrategy):
         record = {
             "fill_id": resolved_fill_id,
             "order_no": order_no,
+            "order_complete": clear_pending,
             "symbol": position.symbol,
             "trade_key": position.trade_key,
             "quantity": resolved_quantity,
@@ -692,30 +655,43 @@ class MomentumScalpStrategy(BaseStrategy):
             "taxes": pnl.taxes,
             "timestamp": self._serialize_datetime(self._now()),
             "requested_reason": str(result.requested_reason or position.pending_exit_reason),
-            "forecast_id": position.forecast_id,
-            "planned_expected_net": float(position.plan.expected_net if position.plan else 0.0),
-            "planned_expected_exit_bid": int(position.plan.expected_exit_bid if position.plan else 0),
-            "planned_lower_net": int(position.plan.lower_net if position.plan else 0),
+            "breakout_price": position.plan.breakout_price if position.plan else 0,
+            "planned_risk": position.plan.committed_risk_net_abs if position.plan else 0,
+            "target_price": position.plan.target_price if position.plan else 0,
+            "stop_price": (position.plan.stop_price or position.plan.breakout_price) if position.plan else 0,
         }
         self._sell_fill_ledger.append(record)
 
-        if apply_to_position:
-            current = self.positions.get(position.symbol)
-            if current is not None and current.trade_key == position.trade_key:
-                current.quantity = max(0, current.quantity - resolved_quantity)
-                if clear_pending:
-                    current.pending_exit_started_at = None
-                    current.pending_exit_quantity = 0
-                    current.pending_exit_reason = ""
-                else:
-                    current.pending_exit_quantity = current.quantity
-                if current.quantity <= 0:
-                    self.positions.pop(current.symbol, None)
+        current = self.positions.get(position.symbol)
+        if current is not None and current.trade_key == position.trade_key:
+            # History is cumulative; balance may already include some or all
+            # of the fill. Never subtract the same sold shares twice.
+            current.quantity = (
+                max(0, current.quantity - resolved_quantity)
+                if remaining_quantity is None
+                else min(current.quantity, max(0, int(remaining_quantity)))
+            )
+            if clear_pending:
+                current.pending_exit_started_at = None
+                current.pending_exit_quantity = 0
+                current.pending_exit_reason = ""
+            else:
+                current.pending_exit_quantity = current.quantity
+            if current.quantity <= 0:
+                self.positions.pop(current.symbol, None)
+            elif current.plan is not None and current.plan.quantity > 0:
+                current.plan = replace(
+                    current.plan,
+                    quantity=current.quantity,
+                    committed_risk_net_abs=int(ceil(
+                        current.plan.committed_risk_net_abs
+                        * current.quantity / current.plan.quantity
+                    )),
+                )
 
         if clear_pending:
             self._pending_sell_fills.pop(position.symbol, None)
         self._rebuild_daily_pnl()
-        self._record_execution_outcome_if_closed(position.trade_key)
         self._update_daily_halt_state()
         self._save_daily_state_if_due(force=True)
         fill_label = "체결" if clear_pending else "부분체결"
@@ -744,24 +720,19 @@ class MomentumScalpStrategy(BaseStrategy):
     def _recent_window(self, symbol: str) -> deque[Quote]:
         window = self._recent_quotes.get(symbol)
         if window is None:
-            window = deque(
-                maxlen=max(
-                    240,
-                    PREDICTION_HORIZONS_SECONDS[-1] + 30,
-                )
-            )
+            window = deque()
             self._recent_quotes[symbol] = window
         return window
 
     def _ingest_quotes(self, quotes: Sequence[Quote]) -> None:
         now = self._now()
-        history_seconds = max(
-            240,
-            PREDICTION_HORIZONS_SECONDS[-1] + 60,
-        )
+        # Retain the anchor before the lookback plus the latest quote's allowed
+        # delivery lag. Neither allowance extends executable quote freshness.
+        history_seconds = BREAKOUT_LOOKBACK_SECONDS + 2 * self.config.quote_freshness_seconds
         oldest_allowed = now - timedelta(seconds=history_seconds)
-        newest_allowed = now + timedelta(seconds=1)
-        for quote in quotes:
+        newest_allowed = now
+        for incoming in sorted(quotes, key=lambda item: (item.timestamp, item.symbol)):
+            quote = replace(incoming)
             symbol = str(quote.symbol or "").strip()
             if (
                 len(symbol) != 6
@@ -771,14 +742,32 @@ class MomentumScalpStrategy(BaseStrategy):
                 or quote.timestamp > newest_allowed
             ):
                 continue
-            self._quotes_cache[symbol] = quote
+            previous = self._quotes_cache.get(symbol)
+            if previous is not None:
+                if quote.timestamp < previous.timestamp:
+                    previous.observe_price_peaks(quote)
+                else:
+                    quote.observe_price_peaks(previous)
+            if previous is None or quote.timestamp >= previous.timestamp:
+                self._quotes_cache[symbol] = quote
             window = self._recent_window(symbol)
             while window and window[0].timestamp < oldest_allowed:
                 window.popleft()
-            if window and window[-1].timestamp == quote.timestamp:
-                window[-1] = quote
-            else:
+            if not window or window[-1].timestamp < quote.timestamp:
                 window.append(quote)
+                continue
+            # A late REST/stream observation belongs in history, not in the
+            # current execution book. Never manufacture the missing timestamps.
+            for index in range(len(window) - 1, -1, -1):
+                if window[index].timestamp == quote.timestamp:
+                    quote.observe_price_peaks(window[index])
+                    window[index] = quote
+                    break
+                if window[index].timestamp < quote.timestamp:
+                    window.insert(index + 1, quote)
+                    break
+            else:
+                window.appendleft(quote)
 
     def _fresh_quotes(self) -> List[Quote]:
         now = self._now()
@@ -786,7 +775,7 @@ class MomentumScalpStrategy(BaseStrategy):
         fresh = []
         for quote in self._quotes_cache.values():
             age = (now - quote.timestamp).total_seconds()
-            if age < -1.0 or age > maximum_age:
+            if age < 0.0 or age > maximum_age:
                 continue
             if int(quote.current_price or 0) > 0:
                 fresh.append(quote)
@@ -801,487 +790,227 @@ class MomentumScalpStrategy(BaseStrategy):
             microsecond=0,
         )
 
-    def _available_prediction_horizons(self, now: datetime) -> tuple[int, ...]:
-        closing_auction = self._closing_auction_start(now)
-        return tuple(
-            horizon
-            for horizon in PREDICTION_HORIZONS_SECONDS
-            if now + timedelta(seconds=horizon) < closing_auction
-        )
-
-    def _continuous_quote_phase(self, now: datetime) -> bool:
-        return now < self._closing_auction_start(now)
-
-    @staticmethod
-    def _krx_tick_size(price: int) -> int:
-        value = max(1, int(price or 0))
-        if value < 2_000:
-            return 1
-        if value < 5_000:
-            return 5
-        if value < 20_000:
-            return 10
-        if value < 50_000:
-            return 50
-        if value < 200_000:
-            return 100
-        if value < 500_000:
-            return 500
-        return 1_000
-
     def _observed_tick_size(self, quote: Quote) -> int:
-        current = max(1, int(quote.current_price or 0))
-        ask = max(0, int(quote.ask_price or 0))
-        bid = max(0, int(quote.bid_price or 0))
-        candidates = [
-            value
-            for value in (ask - bid, abs(ask - current), abs(current - bid))
-            if value > 0
-        ]
-        observed = min(candidates) if candidates else 0
-        if observed > 0 and observed <= max(1, int(current * 0.01)):
-            return observed
-        return self._krx_tick_size(current)
-
-    def _entry_limit_price(self, quote: Quote) -> int:
-        current = max(1, int(quote.current_price or 0))
-        ask = max(0, int(quote.ask_price or 0))
-        if ask > 0:
-            return ask
-        if bool(getattr(quote, "book_available", False)):
-            return 0
-        return current + self._observed_tick_size(quote)
+        return tick_size(quote.current_price, self.instrument_groups.get(quote.symbol, quote.security_group))
 
     def _current_exit_price(self, quote: Quote) -> int:
         current = max(1, int(quote.current_price or 0))
         bid = max(0, int(quote.bid_price or 0))
         return bid if bid > 0 else max(1, current - self._observed_tick_size(quote))
 
-    def _trade_pnl(self, entry_price: int, exit_price: int, quantity: int) -> TradePnL:
+    def _sell_tax_rate_for_symbol(self, symbol: str) -> float:
+        return transaction_tax_rate(self.instrument_groups.get(symbol, ""), self.config.sell_tax_rate)
+
+    def _trade_pnl(
+        self,
+        symbol: str,
+        entry_price: int,
+        exit_price: int,
+        quantity: int,
+    ) -> TradePnL:
         return calculate_trade_pnl_from_prices(
             entry_price=entry_price,
             exit_price=exit_price,
             quantity=quantity,
             commission_rate=self.config.commission_rate,
-            sell_tax_rate=self.config.sell_tax_rate,
+            sell_tax_rate=self._sell_tax_rate_for_symbol(symbol),
         )
 
     # ------------------------------------------------------------------
-    # Risk, prediction and one TradePlan
+    # Observed breakout and cost-based position risk
     # ------------------------------------------------------------------
-    def _open_capital(self, *, exclude_symbol: str = "") -> int:
+    def _open_capital(self) -> int:
         return sum(
             max(0, int(position.buy_price or 0) * int(position.quantity or 0))
-            for symbol, position in self.positions.items()
-            if symbol != exclude_symbol
+            for position in self.positions.values()
         )
 
-    def _pending_entry_capital(self, *, exclude_symbol: str = "") -> int:
+    def _pending_entry_capital(self) -> int:
         return sum(
-            max(0, int(item["plan"].entry_limit_price) * int(item["plan"].quantity))
-            for symbol, item in self._pending_entry_meta.items()
-            if symbol != exclude_symbol and isinstance(item.get("plan"), TradePlan)
+            max(0, int(item["plan"].entry_limit_price) *
+                (int(item["plan"].quantity) - int(item.get("confirmed_quantity", 0))))
+            for item in self._pending_entry_meta.values()
+            if isinstance(item.get("plan"), TradePlan)
         )
 
-    def _open_committed_risk(self, *, exclude_symbol: str = "") -> int:
+    def _open_committed_risk(self) -> int:
         total = 0
         hard_limit = abs(int(self.config.daily_loss_limit))
-        for symbol, position in self.positions.items():
-            if symbol == exclude_symbol:
-                continue
-            if position.plan is None:
+        for position in self.positions.values():
+            if position.plan is None or position.plan.breakout_price <= 0:
                 total += hard_limit
             else:
                 total += max(0, int(position.plan.committed_risk_net_abs))
         for symbol, payload in self._pending_sell_fills.items():
-            if symbol == exclude_symbol or symbol in self.positions:
+            if symbol in self.positions:
                 continue
             snapshot = payload.get("position")
-            if isinstance(snapshot, PositionState) and snapshot.plan is not None:
-                total += max(0, int(snapshot.plan.committed_risk_net_abs))
+            if isinstance(snapshot, PositionState):
+                total += (max(0, snapshot.plan.committed_risk_net_abs)
+                          if snapshot.plan is not None and snapshot.plan.breakout_price > 0 else hard_limit)
         return total
 
-    def _pending_entry_risk(self, *, exclude_symbol: str = "") -> int:
+    def _pending_entry_risk(self) -> int:
         return sum(
-            max(0, int(item["plan"].committed_risk_net_abs))
-            for symbol, item in self._pending_entry_meta.items()
-            if symbol != exclude_symbol and isinstance(item.get("plan"), TradePlan)
+            max(0, int(ceil(item["plan"].committed_risk_net_abs *
+                max(0, item["plan"].quantity - int(item.get("confirmed_quantity", 0))) /
+                max(1, item["plan"].quantity))))
+            for item in self._pending_entry_meta.values()
+            if isinstance(item.get("plan"), TradePlan)
         )
 
-    def _available_capital(self, *, exclude_symbol: str = "") -> int:
+    def _available_capital(self) -> int:
         return max(
             0,
             int(self.config.seed_money)
-            - self._open_capital(exclude_symbol=exclude_symbol)
-            - self._pending_entry_capital(exclude_symbol=exclude_symbol),
+            - self._open_capital()
+            - self._pending_entry_capital(),
         )
 
-    def _remaining_daily_loss_room(self, *, exclude_symbol: str = "") -> int:
+    def _remaining_daily_loss_room(self) -> int:
         return max(
             0,
             abs(int(self.config.daily_loss_limit))
             + self._realized_net_pnl_for_loss_guard()
-            - self._open_committed_risk(exclude_symbol=exclude_symbol)
-            - self._pending_entry_risk(exclude_symbol=exclude_symbol),
+            - self._open_committed_risk()
+            - self._pending_entry_risk(),
         )
 
-    def _rejected_plan(
-        self,
-        *,
-        symbol: str,
-        reason: str,
-        now: datetime,
-        entry_price: int = 0,
-        prediction: Optional[Prediction] = None,
-        evaluated_quantity: int = 0,
-        values: Optional[Mapping[str, float | int]] = None,
-    ) -> TradePlan:
-        evaluated = values or {}
-        horizon = (
-            max(30, int(prediction.horizon_seconds))
-            if prediction is not None
-            else PREDICTION_HORIZONS_SECONDS[-1]
-        )
-        return TradePlan(
-            symbol=symbol,
-            allowed=False,
-            reason=reason,
-            quantity=max(0, int(evaluated_quantity)),
-            entry_limit_price=max(0, int(entry_price or 0)),
-            expected_exit_bid=max(0, int(evaluated.get("expected_exit_bid", 0) or 0)),
-            lower_exit_bid=max(0, int(evaluated.get("lower_exit_bid", 0) or 0)),
-            expected_net=round(float(evaluated.get("expected_net", 0.0)), 2),
-            lower_net=int(evaluated.get("lower_net", 0) or 0),
-            committed_risk_net_abs=max(
-                0,
-                int(evaluated.get("committed_risk_net_abs", 0) or 0),
-            ),
-            signal_at=now,
-            expires_at=now + timedelta(seconds=horizon),
-        )
+    def _breakout_window(self, quote: Quote) -> List[Quote]:
+        cutoff = quote.timestamp - timedelta(seconds=BREAKOUT_LOOKBACK_SECONDS)
+        history = [q for q in self._recent_window(quote.symbol)
+                   if q.timestamp < quote.timestamp and q.has_valid_prices
+                   and (q.ask_high_price > 0 or
+                        (q.book_available and 0 < q.bid_price <= q.ask_price))]
+        anchors = [q for q in history if q.timestamp <= cutoff]
+        if not anchors or (cutoff - anchors[-1].timestamp).total_seconds() > self.config.quote_freshness_seconds:
+            return []
+        window = [q for q in history if q.timestamp >= anchors[-1].timestamp]
+        # A fresh last quote cannot fill a missing interval in the lookback.
+        if any((right.timestamp - left.timestamp).total_seconds() > self.config.quote_freshness_seconds
+               for left, right in zip(window, window[1:] + [quote])):
+            return []
+        return window
 
-    def _exit_price_for_net_return(self, entry_price: int, net_return_pct: float) -> int:
-        entry = max(1, int(entry_price or 0))
-        commission = max(0.0, float(self.config.commission_rate))
-        tax = max(0.0, float(self.config.sell_tax_rate))
-        denominator = max(1e-9, 1.0 - commission - tax)
-        desired_net = float(entry) * float(net_return_pct) / 100.0
-        raw_exit = (desired_net + float(entry) * (1.0 + commission)) / denominator
-        tick = self._krx_tick_size(max(1, int(raw_exit)))
-        return max(tick, int(floor(raw_exit / tick) * tick))
+    def _exit_price_allowance(self, quote: Quote, stop_price: int,
+                              *, window: Optional[Sequence[Quote]] = None) -> int:
+        tick = tick_size(stop_price, self.instrument_groups.get(quote.symbol, quote.security_group))
+        cutoff = quote.timestamp - timedelta(seconds=BREAKOUT_LOOKBACK_SECONDS)
+        window = [q for q in (self._recent_window(quote.symbol) if window is None else window)
+                  if cutoff <= q.timestamp < quote.timestamp and q.has_valid_prices
+                  and q.book_available and 0 < q.bid_price <= q.ask_price] + [quote]
+        # A tight signal book must not erase recent spreads or adverse bid steps.
+        # This remains a planning allowance, not a guaranteed market fill.
+        adverse_step = max((left.bid_price - right.bid_price
+                            for left, right in zip(window, window[1:])
+                            if 0 < (right.timestamp - left.timestamp).total_seconds()
+                            <= self.config.quote_freshness_seconds), default=0)
+        observed_spread = max(q.ask_price - q.bid_price for q in window)
+        return max(tick, observed_spread, adverse_step)
 
-    def _plan_values_for_quantity(
-        self,
-        *,
-        quote: Quote,
-        entry_price: int,
-        prediction: Prediction,
-        quantity: int,
-        expected_exit_bid: int = 0,
-        lower_exit_bid: int = 0,
-    ) -> Dict[str, float | int]:
-        expected_exit = max(
-            1,
-            int(expected_exit_bid or 0)
-            or self._exit_price_for_net_return(
-                entry_price,
-                prediction.expected_net_return_pct,
-            ),
-        )
-        lower_exit = max(
-            1,
-            int(lower_exit_bid or 0)
-            or self._exit_price_for_net_return(
-                entry_price,
-                prediction.lower_net_return_pct,
-            ),
-        )
-        flat_exit = self._current_exit_price(quote)
-        expected_net = estimate_trade_net_pnl_unrounded(
-            entry_price=entry_price,
-            exit_price=expected_exit,
-            quantity=quantity,
-            commission_rate=self.config.commission_rate,
-            sell_tax_rate=self.config.sell_tax_rate,
-        )
-        lower_net = self._trade_pnl(entry_price, lower_exit, quantity).net_pnl
-        flat_net = self._trade_pnl(entry_price, flat_exit, quantity).net_pnl
-        committed_risk = max(0, -lower_net, -flat_net)
-        return {
-            "expected_exit_bid": expected_exit,
-            "lower_exit_bid": lower_exit,
-            "expected_net": expected_net,
-            "lower_net": lower_net,
-            "flat_net": flat_net,
-            "committed_risk_net_abs": committed_risk,
-        }
+    def _risk_per_share(self, quote: Quote, entry_price: int, stop_price: int,
+                        *, window: Optional[Sequence[Quote]] = None,
+                        exit_allowance: Optional[int] = None) -> float:
+        tick = tick_size(stop_price, self.instrument_groups.get(quote.symbol, quote.security_group))
+        allowance = (self._exit_price_allowance(quote, stop_price, window=window)
+                     if exit_allowance is None else exit_allowance)
+        stop_fill = max(tick, int(floor((stop_price - allowance) / tick) * tick))
+        return max(0.0, -estimate_trade_net_pnl_unrounded(
+            entry_price=entry_price, exit_price=min(stop_fill, self._current_exit_price(quote)),
+            quantity=1, commission_rate=self.config.commission_rate,
+            sell_tax_rate=self._sell_tax_rate_for_symbol(quote.symbol)))
 
-    def _build_trade_plan(
-        self,
-        quote: Quote,
-        prediction: Prediction,
-        *,
-        now: datetime,
-        fixed_quantity: Optional[int] = None,
-        exclude_symbol: str = "",
-    ) -> TradePlan:
-        symbol = str(quote.symbol)
-        entry_price = self._entry_limit_price(quote)
-        if entry_price <= 0:
-            return self._rejected_plan(
-                symbol=symbol,
-                reason="no_executable_ask",
-                now=now,
-                entry_price=0,
-                prediction=prediction,
-            )
-        if not prediction.ready:
-            return self._rejected_plan(
-                symbol=symbol,
-                reason=prediction.reason,
-                now=now,
-                entry_price=entry_price,
-                prediction=prediction,
-            )
-        available_capital = self._available_capital(exclude_symbol=exclude_symbol)
-        if fixed_quantity is None and entry_price > available_capital:
-            return self._rejected_plan(
-                symbol=symbol,
-                reason="unaffordable_one_share",
-                now=now,
-                entry_price=entry_price,
-                prediction=prediction,
-            )
+    def _target_net_pnl(self, plan: TradePlan) -> int:
+        # A target bid is a sell trigger, not a guaranteed market execution.
+        price = max(1, plan.target_price - plan.exit_price_allowance)
+        tick = tick_size(price, self.instrument_groups.get(plan.symbol, ""))
+        price = max(tick, int(price // tick * tick))
+        return self._trade_pnl(plan.symbol, plan.entry_limit_price, price, plan.quantity).net_pnl
 
-        per_share = self._plan_values_for_quantity(
-            quote=quote,
-            entry_price=entry_price,
-            prediction=prediction,
-            quantity=1,
-        )
-        loss_room = self._remaining_daily_loss_room(exclude_symbol=exclude_symbol)
-        per_share_risk = max(1.0, float(per_share["committed_risk_net_abs"]))
-        if fixed_quantity is None:
-            max_by_capital = available_capital // max(1, entry_price)
-            max_by_risk = int(floor(float(loss_room) / per_share_risk))
-            quantity = max(0, min(max_by_capital, max_by_risk))
-        else:
-            quantity = max(0, int(fixed_quantity))
+    def _build_trade_plan(self, quote: Quote, *, now: datetime) -> TradePlan:
+        window = self._breakout_window(quote)
+        # Keep observed trade/ask peaks for the signal, executable bids for the target.
+        level = max((max(q.current_price, q.trade_high_price, q.ask_high_price,
+                         q.ask_price if q.book_available and 0 < q.bid_price <= q.ask_price else 0)
+                     for q in window), default=0)
+        entry = max(0, int(quote.ask_price or 0))
+        plan = TradePlan(quote.symbol, False, "no_breakout", 0, entry, level, 0,
+                         quote.timestamp, quote.timestamp + timedelta(seconds=MAX_HOLD_SECONDS))
+        if not 0 <= (now - quote.timestamp).total_seconds() <= self.config.quote_freshness_seconds:
+            return replace(plan, reason="stale_quote")
+        if (not quote.book_available or not 0 < quote.bid_price <= quote.ask_price
+                or (quote.book_depth_available and min(quote.ask_size, quote.bid_size) <= 0)):
+            return replace(plan, reason="no_executable_book")
+        if entry * (1 + self.config.commission_rate) > self._available_capital():
+            return replace(plan, reason="unaffordable_one_share")
+        if not level:
+            return replace(plan, reason="price_window_incomplete")
+        if not quote.is_price_breakout(level):
+            return plan
+        books = [q for q in window if q.book_available and 0 < q.bid_price <= q.ask_price]
+        cutoff = quote.timestamp - timedelta(seconds=BREAKOUT_LOOKBACK_SECONDS)
+        weighted_bid = duration = 0.0
+        for left, right in zip(books, books[1:] + [quote]):
+            if (right.timestamp - left.timestamp).total_seconds() > self.config.quote_freshness_seconds:
+                return replace(plan, reason="price_window_incomplete")
+            seconds = max(0.0, (right.timestamp - max(cutoff, left.timestamp)).total_seconds())
+            weighted_bid += left.bid_price * seconds
+            duration += seconds
+        if not books or books[0].timestamp > cutoff or duration <= 0:
+            return replace(plan, reason="price_window_incomplete")
+        # Project one displacement from the time-weighted price, not the full high/low range.
+        # The current spike is excluded; an isolated low has only its observed time weight.
+        target = max(0.0, 2 * books[-1].bid_price - weighted_bid / duration)
+        tick = tick_size(target, self.instrument_groups.get(quote.symbol, quote.security_group))
+        target = int(target // tick * tick)
+        # Separate observed pullbacks from the completed rise; freeze this exit at entry.
+        # The drawdown is a stop policy, not a bound on future market losses.
+        peak = drawdown = 0
+        for book in books:
+            peak = max(peak, book.bid_price)
+            drawdown = max(drawdown, peak - book.bid_price)
+        group = self.instrument_groups.get(quote.symbol, quote.security_group)
+        stop = quote.bid_price - max(drawdown, tick_size(quote.bid_price, group))
+        stop_tick = tick_size(stop, group)
+        stop = max(stop_tick, int(stop // stop_tick * stop_tick))
+        allowance = self._exit_price_allowance(quote, stop, window=window)
+        plan = replace(plan, target_price=target, stop_price=stop, exit_price_allowance=allowance)
+        risk = self._risk_per_share(quote, entry, stop, window=window, exit_allowance=allowance)
+        capital = int(self._available_capital() // (entry * (1 + self.config.commission_rate)))
+        loss_room = self._remaining_daily_loss_room()
+        # Size the limit order by capital and risk; confirmed fills determine inventory.
+        quantity = min(capital, int(loss_room / risk)) if risk > 0 else capital
         if quantity <= 0:
-            return self._rejected_plan(
-                symbol=symbol,
-                reason="insufficient_capital_or_loss_room",
-                now=now,
-                entry_price=entry_price,
-                prediction=prediction,
-            )
+            return replace(plan, reason="insufficient_capital_or_loss_room")
+        # Round risk up, rather than rounding a one-share fee down.
+        committed = int(ceil(risk * quantity))
+        if committed > loss_room:
+            return replace(plan, reason="risk_exceeds_remaining_loss_room")
+        plan = replace(plan, quantity=quantity, committed_risk_net_abs=committed)
+        # Judge the whole risk-sized order, not a positive one-share projection.
+        target_net = self._target_net_pnl(plan)
+        if target_net <= 0:
+            return replace(plan, reason="target_not_profitable")
+        return replace(plan, allowed=True, reason="price_breakout")
 
-        values = self._plan_values_for_quantity(
-            quote=quote,
-            entry_price=entry_price,
-            prediction=prediction,
-            quantity=quantity,
-        )
-        if float(values["expected_net"]) <= 0.0:
-            return self._rejected_plan(
-                symbol=symbol,
-                reason="non_positive_expected_net",
-                now=now,
-                entry_price=entry_price,
-                prediction=prediction,
-                evaluated_quantity=quantity,
-                values=values,
-            )
-        committed_risk = int(values["committed_risk_net_abs"])
-        if committed_risk > loss_room:
-            if fixed_quantity is not None:
-                return self._rejected_plan(
-                    symbol=symbol,
-                    reason="risk_exceeds_remaining_loss_room",
-                    now=now,
-                    entry_price=entry_price,
-                    prediction=prediction,
-                    evaluated_quantity=quantity,
-                    values=values,
-                )
-            overrun = committed_risk - loss_room
-            quantity = max(0, quantity - int(ceil(overrun / per_share_risk)))
-            if quantity <= 0:
-                return self._rejected_plan(
-                    symbol=symbol,
-                    reason="risk_rounding_exceeds_loss_room",
-                    now=now,
-                    entry_price=entry_price,
-                    prediction=prediction,
-                )
-            values = self._plan_values_for_quantity(
-                quote=quote,
-                entry_price=entry_price,
-                prediction=prediction,
-                quantity=quantity,
-            )
-            committed_risk = int(values["committed_risk_net_abs"])
-        if float(values["expected_net"]) <= 0.0 or committed_risk > loss_room:
-            return self._rejected_plan(
-                symbol=symbol,
-                reason="final_plan_not_positive_or_safe",
-                now=now,
-                entry_price=entry_price,
-                prediction=prediction,
-                evaluated_quantity=quantity,
-                values=values,
-            )
-
-        signal_at = quote.timestamp
-        return TradePlan(
-            symbol=symbol,
-            allowed=True,
-            reason="positive_expected_value",
-            quantity=quantity,
-            entry_limit_price=entry_price,
-            expected_exit_bid=max(1, int(values["expected_exit_bid"])),
-            lower_exit_bid=max(1, int(values["lower_exit_bid"])),
-            expected_net=round(float(values["expected_net"]), 2),
-            lower_net=int(values["lower_net"]),
-            committed_risk_net_abs=committed_risk,
-            signal_at=signal_at,
-            expires_at=signal_at + timedelta(seconds=prediction.horizon_seconds),
-        )
-
-    def _build_predictions(
-        self,
-        quotes: Sequence[Quote],
-        *,
-        now: datetime,
-        evaluated_candidate_count: int,
-        horizons: Sequence[int],
-    ) -> Dict[int, Dict[str, Prediction]]:
-        recent_by_symbol = {
-            str(quote.symbol): list(self._recent_window(str(quote.symbol)))
-            for quote in quotes
-        }
-        feature_rows = build_feature_rows(
-            quotes,
-            recent_quotes_by_symbol=recent_by_symbol,
-        )
-        outcomes = self._forecast_outcomes.training_outcomes(as_of=now)
-        resolved_horizons = tuple(sorted({max(30, int(value)) for value in horizons}))
-        joint_candidate_count = max(
-            1,
-            int(evaluated_candidate_count) * max(1, len(resolved_horizons)),
-        )
-        last_outcome = outcomes[-1] if outcomes else {}
-        training_signature = (
-            len(outcomes),
-            f"{last_outcome.get('forecast_id', '')}:"
-            f"{last_outcome.get('outcome_timestamp', '')}",
-        )
-        if self._prediction_training_signature != training_signature:
-            self._prediction_model = fit_model(
-                outcomes,
-                as_of=now,
-            )
-            self._prediction_training_signature = training_signature
-        predictions: Dict[int, Dict[str, Prediction]] = {}
-        for horizon in resolved_horizons:
-            predictions[horizon] = predict_batch(
-                feature_rows,
-                model=self._prediction_model,
-                evaluated_candidate_count=joint_candidate_count,
-                horizon_seconds=horizon,
-            )
-        return predictions
-
-    def _forecast_payload(
-        self,
-        candidate: ExpectedValueCandidate,
-    ) -> Dict[str, Any]:
-        prediction = candidate.prediction
-        plan = candidate.plan
-        return {
-            "symbol": candidate.quote.symbol,
-            "signal_timestamp": self._serialize_datetime(plan.signal_at),
-            "signal_entry_ask": plan.entry_limit_price,
-            "horizon_seconds": prediction.horizon_seconds,
-            "sample_count": prediction.sample_count,
-            "ready": prediction.ready,
-            "reason": prediction.reason,
-            "compact_features": dict(prediction.compact_features),
-            "unavailable_features": list(prediction.unavailable_features),
-            "expected_net_return_pct": prediction.expected_net_return_pct,
-            "lower_net_return_pct": prediction.lower_net_return_pct,
-            "commission_rate": float(self.config.commission_rate),
-            "sell_tax_rate": float(self.config.sell_tax_rate),
-            "allowed": plan.allowed,
-            "decision_reason": plan.reason,
-            "quantity": plan.quantity,
-            "entry_limit_price": plan.entry_limit_price,
-            "expected_exit_bid": plan.expected_exit_bid,
-            "lower_exit_bid": plan.lower_exit_bid,
-            "expected_net": plan.expected_net,
-            "lower_net": plan.lower_net,
-            "committed_risk_net_abs": plan.committed_risk_net_abs,
-        }
-
-    @staticmethod
-    def _candidate_sort_key(candidate: ExpectedValueCandidate) -> tuple[float, float, str]:
-        risk = max(1, int(candidate.plan.committed_risk_net_abs))
-        return (
-            -float(candidate.plan.expected_net),
-            -(float(candidate.plan.expected_net) / float(risk)),
-            str(candidate.quote.symbol),
-        )
-
-    # ------------------------------------------------------------------
-    # Position adoption and planned exits
-    # ------------------------------------------------------------------
     def _reprice_plan_for_fill(
-        self,
-        *,
-        plan: TradePlan,
-        quote: Quote,
-        fill_price: int,
-        quantity: int,
+        self, *, plan: TradePlan, fill_price: int, quantity: int,
+        previous_entry_price: Optional[int] = None,
     ) -> TradePlan:
-        resolved_entry = max(1, int(fill_price))
-        resolved_quantity = max(1, int(quantity))
-        expected_net = estimate_trade_net_pnl_unrounded(
-            entry_price=resolved_entry,
-            exit_price=max(1, int(plan.expected_exit_bid)),
-            quantity=resolved_quantity,
-            commission_rate=self.config.commission_rate,
-            sell_tax_rate=self.config.sell_tax_rate,
-        )
-        lower_net = self._trade_pnl(
-            resolved_entry,
-            max(1, int(plan.lower_exit_bid)),
-            resolved_quantity,
-        ).net_pnl
-        flat_net = self._trade_pnl(
-            resolved_entry,
-            self._current_exit_price(quote),
-            resolved_quantity,
-        ).net_pnl
-        committed_risk = max(0, -lower_net, -flat_net)
-        return TradePlan(
-            symbol=plan.symbol,
-            allowed=expected_net > 0.0,
-            reason="recalculated_for_fill" if expected_net > 0.0 else "unfavorable_fill_non_positive_ev",
-            quantity=resolved_quantity,
-            entry_limit_price=resolved_entry,
-            expected_exit_bid=plan.expected_exit_bid,
-            lower_exit_bid=plan.lower_exit_bid,
-            expected_net=round(expected_net, 2),
-            lower_net=lower_net,
-            committed_risk_net_abs=committed_risk,
-            signal_at=plan.signal_at,
-            expires_at=plan.expires_at,
-        )
+        if plan.breakout_price <= 0:
+            return replace(plan, allowed=False, reason="legacy_plan", quantity=quantity)
+        entry_basis = plan.entry_limit_price if previous_entry_price is None else previous_entry_price
+        # Keep the signal's exit allowance. Later spreads must not move risk or the profit target.
+        risk = (plan.committed_risk_net_abs / max(1, plan.quantity)
+                + (fill_price - entry_basis) * (1 + self.config.commission_rate))
+        return replace(plan, allowed=fill_price <= plan.entry_limit_price,
+                       reason="confirmed_fill", quantity=quantity,
+                       committed_risk_net_abs=max(0, int(ceil(risk * quantity))))
 
     def _adopt_unplanned_position(
         self,
         position: PositionState,
-        quote: Quote,
+        quote: Optional[Quote],
     ) -> Optional[Order]:
         return self._make_market_sell(
             position,
@@ -1292,17 +1021,47 @@ class MomentumScalpStrategy(BaseStrategy):
     def _position_exit_order(
         self,
         position: PositionState,
-        quote: Quote,
+        quote: Optional[Quote],
         *,
         now: datetime,
+        observed_quotes: Sequence[Quote] = (),
     ) -> Optional[Order]:
         if position.pending_exit_started_at is not None:
             return None
         plan = position.plan
         if plan is None:
             return None
+        if plan.breakout_price <= 0 or not plan.allowed:
+            return self._make_market_sell(position, quote, reason="invalid_entry_plan")
+        stop = plan.stop_price or plan.breakout_price
+        # A rebound later in the same batch must not erase an observed stop.
+        # Old/pre-fill observations cannot trigger a new holding's stop.
+        observed_stop = any(
+            item.symbol == position.symbol and item.book_available
+            and 0 < item.bid_price <= min(item.ask_price, stop)
+            and position.buy_time <= item.timestamp
+            and 0 <= (now - item.timestamp).total_seconds() <= self.config.quote_freshness_seconds
+            for item in observed_quotes
+        )
+        if (position.stop_triggered or observed_stop
+                or (quote is not None and quote.book_available and 0 < quote.bid_price <= stop)):
+            # Preserve the exit decision across submission failures and restarts;
+            # pending_exit_started_at still means an actually submitted order.
+            position.stop_triggered = True
+            return self._make_market_sell(position, quote, reason="breakout_failed")
+        if (
+            self.market_data is not None and self.market_data.client.config.is_paper
+            and quote is not None and quote.book_available and quote.book_depth_available
+            and 0 < quote.bid_price <= quote.ask_price
+            and quote.bid_size >= position.quantity
+            and 0 <= (now - quote.timestamp).total_seconds() <= self.config.quote_freshness_seconds
+            and plan.target_price > 0 and quote.bid_price >= plan.target_price
+            and self._trade_pnl(position.symbol, position.buy_price, quote.bid_price,
+                                position.quantity).net_pnl > 0
+        ):
+            return self._make_market_sell(position, quote, reason="planned_profit")
         if now >= plan.expires_at:
-            return self._make_market_sell(position, quote, reason="horizon_expiry")
+            return self._make_market_sell(position, quote, reason="holding_expiry")
         return None
 
     def _make_market_sell(
@@ -1319,21 +1078,6 @@ class MomentumScalpStrategy(BaseStrategy):
             if quote is not None
             else max(1, int(position.buy_price or 0))
         )
-        now = self._now()
-        position.pending_exit_started_at = now
-        position.pending_exit_quantity = position.quantity
-        position.pending_exit_reason = reason
-        self._pending_sell_fills[position.symbol] = {
-            "position": self._deserialize_position(self._serialize_position(position)) or position,
-            "order_no": "",
-            "requested_quantity": position.quantity,
-            "requested_at": now,
-            "reference_price": reference_price,
-            "reason": reason,
-            "account_remaining_quantity": position.quantity,
-            "confirmed_quantity": 0,
-            "confirmed_amount": 0,
-        }
         logger.info(
             "계획 청산: %s reason=%s %d주 기준가=%d원",
             position.symbol,
@@ -1374,6 +1118,7 @@ class MomentumScalpStrategy(BaseStrategy):
             if quote is None:
                 continue
             total += self._trade_pnl(
+                symbol,
                 position.buy_price,
                 self._current_exit_price(quote),
                 position.quantity,
@@ -1413,7 +1158,7 @@ class MomentumScalpStrategy(BaseStrategy):
     def _entry_submission_available(self) -> bool:
         if self._halted:
             return False
-        if self._pending_entry_meta:
+        if self._pending_entry_meta or self._pending_sell_fills:
             return False
         if any(
             position.pending_exit_started_at is not None
@@ -1425,174 +1170,107 @@ class MomentumScalpStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     # Single batch route
     # ------------------------------------------------------------------
+    def _entry_plan_priority(self, plan: TradePlan) -> tuple:
+        return (-self._target_net_pnl(plan), plan.committed_risk_net_abs, plan.symbol)
+
     def on_batch_tick(self, quotes: List[Quote]) -> List[Order]:
         self._ensure_active_day()
         now = self._now()
-
-        if self._continuous_quote_phase(now):
-            self._forecast_outcomes.settle(quotes, now=now)
+        quotes = [q for q in quotes if q.has_valid_prices and q.timestamp <= now]
+        for quote in quotes:
+            if quote.security_group:
+                self.instrument_groups[quote.symbol] = quote.security_group
+            else:
+                quote.security_group = self.instrument_groups.get(quote.symbol, "")
         self._ingest_quotes(quotes)
-        fresh_quotes = self._fresh_quotes()
-
+        self._quote_archive.record(quotes, now=now, universe=self.get_watchlist())
+        fresh = self._fresh_quotes()
+        self._last_evaluation_count = 0
         self._update_daily_halt_state()
         if self._halted:
             orders = self._liquidate_all()
             self._save_daily_state_if_due(force=True)
             return orders
 
-        available_capital = self._available_capital()
-        purchasable_quotes = []
-        for quote in fresh_quotes:
-            entry_price = self._entry_limit_price(quote)
-            if (
-                str(quote.symbol) not in self.positions
-                and 0 < entry_price <= available_capital
-            ):
-                purchasable_quotes.append(quote)
-        quote_by_symbol = {str(quote.symbol): quote for quote in fresh_quotes}
-        exit_orders: List[Order] = []
-        for symbol, position in list(self.positions.items()):
-            quote = quote_by_symbol.get(symbol)
-            if quote is None:
-                continue
+        by_symbol = {q.symbol: q for q in fresh}
+        # A realizable daily target is an exit, not a realized-profit event.
+        # Keep the session running until confirmed fills actually meet it.
+        take_daily_profit = (
+            bool(self.positions)
+            and not self._pending_entry_meta
+            and not self._pending_sell_fills
+            and all(
+                (quote := by_symbol.get(symbol)) is not None
+                and quote.book_available and 0 < quote.bid_price <= quote.ask_price
+                and quote.book_depth_available and quote.bid_size >= position.quantity
+                for symbol, position in self.positions.items()
+            )
+            and self.daily_pnl.realized_net_pnl + self._unrealized_net_pnl()
+            >= int(self.config.daily_profit_target)
+        )
+        exits = []
+        for symbol, position in self.positions.items():
+            quote = by_symbol.get(symbol)
             if position.plan is None:
-                adoption_exit = self._adopt_unplanned_position(
-                    position,
-                    quote,
-                )
-                if adoption_exit is not None:
-                    exit_orders.append(adoption_exit)
-                continue
-            order = self._position_exit_order(position, quote, now=now)
+                order = self._adopt_unplanned_position(position, quote)
+            elif take_daily_profit:
+                order = self._make_market_sell(position, quote, reason="daily_profit_target")
+            else:
+                order = self._position_exit_order(position, quote, now=now, observed_quotes=quotes)
             if order is not None:
-                exit_orders.append(order)
-
-        available_horizons = self._available_prediction_horizons(now)
-        if not available_horizons:
-            self._last_evaluation_count = 0
-            day_key = now.date().isoformat()
-            if self._entry_window_closed_log_day != day_key:
-                self._entry_window_closed_log_day = day_key
-                logger.info(
-                    "신규 진입 종료: 최단 %d초 예측 만료가 KRX 마감 동시호가 시작 "
-                    "15:20을 넘습니다. 보유 포지션 청산만 계속합니다.",
-                    PREDICTION_HORIZONS_SECONDS[0],
-                )
-            self._save_daily_state_if_due(force=bool(exit_orders))
-            return exit_orders
-
-        predictions_by_horizon = self._build_predictions(
-            fresh_quotes,
-            now=now,
-            evaluated_candidate_count=len(purchasable_quotes),
-            horizons=available_horizons,
-        )
-        candidates: List[ExpectedValueCandidate] = []
-        for quote in purchasable_quotes:
-            symbol = str(quote.symbol)
-            for horizon in available_horizons:
-                prediction = predictions_by_horizon[horizon][symbol]
-                plan = self._build_trade_plan(quote, prediction, now=now)
-                candidate = ExpectedValueCandidate(
-                    quote=quote,
-                    prediction=prediction,
-                    plan=plan,
-                    forecast_payload={},
-                )
-                candidate.forecast_payload = self._forecast_payload(candidate)
-                candidates.append(candidate)
-
-        allowed = sorted(
-            (candidate for candidate in candidates if candidate.plan.allowed),
-            key=self._candidate_sort_key,
-        )
-        selected = allowed[0] if allowed else None
-        selected_for_execution = None
-        if not exit_orders and self._entry_submission_available():
-            selected_for_execution = next(
-                (
-                    candidate
-                    for candidate in allowed
-                    if not self._forecast_outcomes.has_pending_selected(
-                        candidate.quote.symbol,
-                        now=now,
-                    )
-                ),
-                None,
-            )
-        if selected_for_execution is not None:
-            selected_for_execution.forecast_id = self._forecast_outcomes.record(
-                selected_for_execution.forecast_payload,
-                now=now,
-                selected=True,
-            ) or ""
-        self._forecast_outcomes.record_observation_sets(
-            [candidate.forecast_payload for candidate in candidates],
-            now=now,
-        )
-
-        self._last_evaluation_count = len(purchasable_quotes)
-        if (
-            self._last_batch_summary_at is None
-            or (now - self._last_batch_summary_at).total_seconds() >= 30.0
-        ):
-            positive_symbols = len(
-                {candidate.quote.symbol for candidate in allowed}
-            )
-            logger.info(
-                "EV 배치: 최신=%d 종목=%d 계획=%d 양수종목=%d 보유=%d best=%s",
-                len(fresh_quotes),
-                len(purchasable_quotes),
-                len(candidates),
-                positive_symbols,
-                len(self.positions),
-                (
-                    f"{selected.quote.symbol}/{selected.prediction.horizon_seconds}s"
-                    if selected is not None
-                    else "-"
-                ),
-            )
-            self._last_batch_summary_at = now
-
-        if exit_orders:
+                exits.append(order)
+        if exits:
             self._save_daily_state_if_due(force=True)
-            return exit_orders
-        if selected_for_execution is None:
+            return exits
+
+        if now + timedelta(seconds=MAX_HOLD_SECONDS) >= self._closing_auction_start(now):
+            day = now.date().isoformat()
+            if self._entry_window_closed_log_day != day:
+                self._entry_window_closed_log_day = day
+                logger.info("신규 진입 종료: 최대 보유 %d초가 15:20 동시호가를 넘습니다.", MAX_HOLD_SECONDS)
             self._save_daily_state_if_due()
             return []
 
-        selected = selected_for_execution
-        plan = selected.plan
-        self._pending_entry_meta[plan.symbol] = {
-            "plan": plan,
-            "forecast_id": selected.forecast_id,
-            "signal_price": int(selected.quote.current_price or 0),
-            "created_at": now,
-            "order_no": "",
-        }
-        logger.info(
-            "EV 매수 선택: %s %d주 @ %d원 horizon=%d초 exit_bid=%d "
-            "EV=%+.0f원 risk=%d원",
-            plan.symbol,
-            plan.quantity,
-            plan.entry_limit_price,
-            selected.prediction.horizon_seconds,
-            plan.expected_exit_bid,
-            plan.expected_net,
-            plan.committed_risk_net_abs,
-        )
+        watchlist = set(self.get_watchlist())
+        candidates = [(q, self._build_trade_plan(q, now=now)) for q in fresh
+                      if q.symbol in watchlist and q.symbol not in self.positions]
+        self._last_evaluation_count = len(candidates)
+        # Use the same execution-adjusted proceeds as the plan's cost check.
+        allowed = sorted(((q, p) for q, p in candidates if p.allowed),
+                         key=lambda item: self._entry_plan_priority(item[1]))
+        if self._last_batch_summary_at is None or (now - self._last_batch_summary_at).total_seconds() >= 30:
+            reasons = Counter(p.reason for _, p in candidates)
+            breakouts = sum(q.is_price_breakout(p.breakout_price) for q, p in candidates)
+            logger.info("돌파 배치: 평가=%d 돌파=%d 계획=%d 보유=%d 손실여유=%d원 사유=%s",
+                        len(candidates), breakouts, len(allowed), len(self.positions),
+                        self._remaining_daily_loss_room(),
+                        ",".join(f"{k}:{v}" for k, v in sorted(reasons.items())) or "-")
+            self._last_batch_summary_at = now
+        selected = None
+        if self._entry_submission_available():
+            fresh_symbols = {q.symbol for q in self._fresh_quotes()}
+            selected = next(((q, p) for q, p in allowed
+                             if q.symbol in fresh_symbols
+                             and self._last_submitted_signal_at.get(q.symbol) != q.timestamp), None)
+        if selected is None:
+            self._save_daily_state_if_due()
+            return []
+
+        quote, plan = selected
+        self._last_submitted_signal_at[plan.symbol] = plan.signal_at
+        self._pending_entry_meta[plan.symbol] = dict(
+            plan=plan, signal_price=quote.current_price, created_at=now, order_no="")
         self._save_daily_state_if_due(force=True)
-        return [
-            Order(
-                symbol=plan.symbol,
-                side=OrderSide.BUY,
-                order_type=OrderType.LIMIT,
-                quantity=plan.quantity,
-                price=plan.entry_limit_price,
-                reference_price=int(selected.quote.current_price or plan.entry_limit_price),
-                requested_reason="expected_value",
-            )
-        ]
+        logger.info("돌파 매수 선택: %s %d주 @ %d원 돌파선=%d원 손절선=%d원 계획위험=%d원 만료=%s 체결시세=%d bid=%d 목표가=%d 목표순익=%d원 체결여유=%d원/주",
+                    plan.symbol, plan.quantity, plan.entry_limit_price, plan.breakout_price,
+                    plan.stop_price, plan.committed_risk_net_abs, plan.expires_at.strftime("%H:%M:%S"),
+                    quote.current_price, quote.bid_price, plan.target_price,
+                    self._target_net_pnl(plan), plan.exit_price_allowance)
+        return [Order(symbol=plan.symbol, side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                      quantity=plan.quantity, price=plan.entry_limit_price,
+                      reference_price=quote.current_price, requested_reason="price_breakout",
+                      submit_before=quote.timestamp.timestamp() + self.config.quote_freshness_seconds,
+                      breakout_price=plan.breakout_price)]
 
     # ------------------------------------------------------------------
     # Fills and account reconciliation
@@ -1607,6 +1285,46 @@ class MomentumScalpStrategy(BaseStrategy):
         )
         return copied
 
+    def _track_submitted_sell(
+        self,
+        result: OrderResult,
+        position: PositionState,
+    ) -> Dict[str, Any]:
+        existing = self._pending_sell_fills.get(position.symbol)
+        if existing is not None:
+            if result.order_no:
+                existing["order_no"] = str(result.order_no)
+            return existing
+
+        requested_quantity = min(
+            position.quantity,
+            max(1, int(result.requested_quantity or position.quantity)),
+        )
+        requested_at = self._now()
+        reason = str(result.requested_reason or "sell")
+        reference_price = max(
+            1,
+            int(result.reference_price or result.requested_price or position.buy_price),
+        )
+        snapshot = self._copy_position(position)
+        for target in (position, snapshot):
+            target.pending_exit_started_at = requested_at
+            target.pending_exit_quantity = requested_quantity
+            target.pending_exit_reason = reason
+        pending = {
+            "position": snapshot,
+            "order_no": str(result.order_no or ""),
+            "requested_quantity": requested_quantity,
+            "requested_at": requested_at,
+            "reference_price": reference_price,
+            "reason": reason,
+            "account_remaining_quantity": position.quantity,
+            "confirmed_quantity": 0,
+            "confirmed_amount": 0,
+        }
+        self._pending_sell_fills[position.symbol] = pending
+        return pending
+
     def _apply_buy_fill(
         self,
         result: OrderResult,
@@ -1619,40 +1337,28 @@ class MomentumScalpStrategy(BaseStrategy):
         if meta is None or not isinstance(meta.get("plan"), TradePlan):
             return None
         plan: TradePlan = meta["plan"]
-        quote = self._quotes_cache.get(symbol)
-        if quote is None:
-            return None
         resolved_quantity = max(0, int(quantity or 0))
         resolved_price = max(0, int(price or 0))
         if resolved_quantity <= 0 or resolved_price <= 0:
             return None
         repriced = self._reprice_plan_for_fill(
             plan=plan,
-            quote=quote,
             fill_price=resolved_price,
             quantity=resolved_quantity,
         )
         existing = self.positions.get(symbol)
         if existing is not None:
-            if str(result.fill_mode or "") == "account_reconciled":
-                combined_quantity = resolved_quantity
-                combined_price = resolved_price
-            else:
-                combined_quantity = existing.quantity + resolved_quantity
-                combined_price = int(
-                    round(
-                        (
-                            existing.buy_price * existing.quantity
-                            + resolved_price * resolved_quantity
-                        )
-                        / max(1, combined_quantity)
-                    )
+            combined_quantity = existing.quantity + resolved_quantity
+            combined_price = int(
+                round(
+                    (existing.buy_price * existing.quantity + resolved_price * resolved_quantity)
+                    / max(1, combined_quantity)
                 )
+            )
             existing.buy_price = combined_price
             existing.quantity = combined_quantity
             existing.plan = self._reprice_plan_for_fill(
                 plan=plan,
-                quote=quote,
                 fill_price=combined_price,
                 quantity=combined_quantity,
             )
@@ -1664,79 +1370,137 @@ class MomentumScalpStrategy(BaseStrategy):
                 quantity=resolved_quantity,
                 buy_time=self._now(),
                 plan=repriced,
-                forecast_id=str(meta.get("forecast_id") or ""),
             )
             self.positions[symbol] = position
-        self._pending_entry_meta.pop(symbol, None)
+        meta["confirmed_quantity"] = int(meta.get("confirmed_quantity", 0)) + resolved_quantity
+        meta["confirmed_amount"] = int(meta.get("confirmed_amount", 0)) + resolved_price * resolved_quantity
+        if result.fill_mode != "partial_fill_pending":
+            self._pending_entry_meta.pop(symbol, None)
         self._save_daily_state_if_due(force=True)
         logger.info(
-            "매수 체결 확정: %s %d주 @ %d원 EV=%+.0f원 expiry=%s",
+            "매수 체결 확정: %s %d주 @ %d원 돌파선=%d원 만료=%s",
             symbol,
             resolved_quantity,
             resolved_price,
-            position.plan.expected_net if position.plan is not None else 0.0,
+            position.plan.breakout_price if position.plan is not None else 0,
             position.plan.expires_at.strftime("%H:%M:%S") if position.plan is not None else "-",
         )
-        if str(result.fill_mode or "") == "account_reconciled":
-            order_logger.info(
-                "매수 체결: buy %s %d주 @ 체결가 %d원 (계좌 재동기화)",
-                symbol,
-                resolved_quantity,
-                resolved_price,
-            )
+        order_logger.info(
+            "매수 체결: buy %s %d주 @ 체결가 %d원 order_no=%s",
+            symbol, resolved_quantity, resolved_price, result.order_no or "-",
+        )
         return position
 
-    def on_order_filled(self, result: OrderResult) -> None:
+    def on_order_filled(self, result: OrderResult) -> bool:
         symbol = str(result.symbol or "").strip()
         side = result.side
         if not symbol or side is None:
-            return
+            return False
+        pending = (self._pending_entry_meta.get(symbol) if side == OrderSide.BUY
+                   else self._pending_sell_fills.get(symbol))
+        active_order_no = str((pending or {}).get("order_no") or "")
+        if active_order_no and result.order_no and active_order_no != str(result.order_no):
+            logger.warning("다른 주문 결과 무시: %s %s order_no=%s active=%s",
+                           side.value, symbol, result.order_no, active_order_no)
+            return False
+        if side == OrderSide.SELL and result.order_no and any(
+            str(item.get("order_no") or "") == str(result.order_no)
+            and bool(item.get("order_complete", item.get("fill_id") == result.order_no))
+            for item in self._sell_fill_ledger
+        ):
+            return False
         if not result.success:
             if side == OrderSide.BUY:
+                if pending is None:
+                    return False
                 self._pending_entry_meta.pop(symbol, None)
+                if result.fill_mode == "limit_cancelled" and result.error_category == "not_filled":
+                    order_logger.info(
+                        "매수 미체결 취소: buy %s %d주 @ 주문가 %d원 order_no=%s",
+                        symbol, result.requested_quantity, result.requested_price, result.order_no or "-",
+                    )
             elif side == OrderSide.SELL:
+                if result.error_category == "no_holding":
+                    # No inventory is not proof of a failed sell: its execution may already exist.
+                    position = self.positions.get(symbol)
+                    if pending is None and position is not None:
+                        self._track_submitted_sell(replace(result, order_no=""), position)
+                    self._save_daily_state_if_due(force=True)
+                    return True
                 self._pending_sell_fills.pop(symbol, None)
                 position = self.positions.get(symbol)
                 if position is not None:
                     position.pending_exit_started_at = None
                     position.pending_exit_quantity = 0
+                    position.pending_exit_reason = ""
             self._save_daily_state_if_due(force=True)
-            return
+            return True
 
         if side == OrderSide.BUY:
             meta = self._pending_entry_meta.get(symbol)
-            if meta is not None:
-                meta["order_no"] = str(result.order_no or "")
-            price = max(0, int(result.price or result.requested_price or 0))
-            quantity = max(0, int(result.quantity or 0))
-            if quantity > 0 and price > 0:
-                self._apply_buy_fill(result, quantity=quantity, price=price)
-            else:
+            if meta is None:
+                return False
+            identity_changed = bool(result.order_no and str(result.order_no) != active_order_no)
+            if result.order_no:
+                meta["order_no"] = str(result.order_no)
+            price = max(0, int(result.price or 0))
+            cumulative_quantity = max(0, int(result.quantity or 0))
+            if cumulative_quantity <= 0 or price <= 0:
                 self._save_daily_state_if_due(force=True)
-            return
+                return True
+            previous_quantity = max(0, int(meta.get("confirmed_quantity", 0)))
+            terminal = (result.fill_mode not in {"partial_fill_pending", "entry_reconciled_partial",
+                                                 "account_reconciled"}
+                        or cumulative_quantity >= meta["plan"].quantity)
+            # History and account recovery both supply cumulative quantities and costs.
+            result.quantity = max(0, cumulative_quantity - previous_quantity)
+            amount = cumulative_quantity * price
+            if result.quantity > 0:
+                result.price = int(round((amount - int(meta.get("confirmed_amount", 0))) / result.quantity))
+            result.fill_id = f"{result.order_no or symbol}:{cumulative_quantity}"
+            result.fill_mode = "limit" if terminal else "partial_fill_pending"
+            if result.quantity == 0:
+                if terminal:
+                    self._pending_entry_meta.pop(symbol, None)
+                self._save_daily_state_if_due(force=True)
+                applied = terminal or identity_changed
+            else:
+                applied = self._apply_buy_fill(result, quantity=result.quantity, price=result.price) is not None
+            if applied and terminal and result.requested_quantity > cumulative_quantity:
+                order_logger.info(
+                    "매수 잔량 취소 확정: buy %s order_no=%s 취소=%d주 누적체결=%d주",
+                    symbol, result.order_no or "-", result.requested_quantity - cumulative_quantity,
+                    cumulative_quantity,
+                )
+            return applied
 
-        pending = self._pending_sell_fills.get(symbol)
         position = self.positions.get(symbol)
-        if pending is not None:
-            pending["order_no"] = str(result.order_no or "")
+        pending = self._pending_sell_fills.get(symbol)
         requested = max(0, int(result.requested_quantity or 0))
         quantity = max(0, int(result.quantity or 0))
         price = max(0, int(result.price or 0))
+        complete = requested <= 0 or quantity >= requested
+        fill_id = str(result.fill_id or "") or (str(result.order_no or "") if complete
+                                               else f"{str(result.order_no or symbol)}:{quantity}")
+        if quantity > 0 and any(str(item.get("fill_id") or "") == fill_id
+                                for item in self._sell_fill_ledger):
+            return False
+        if position is not None and pending is None:
+            pending = self._track_submitted_sell(result, position)
+        elif pending is not None and result.order_no:
+            pending["order_no"] = str(result.order_no)
         if position is not None and quantity > 0 and price > 0:
-            complete = requested <= 0 or quantity >= requested
-            self._append_confirmed_sell_fill(
+            record = self._append_confirmed_sell_fill(
                 result=result,
                 position=self._copy_position(position),
                 quantity=quantity,
                 sell_price=price,
-                apply_to_position=True,
                 clear_pending=complete,
-                fill_id=(
-                    str(result.order_no or "")
-                    if complete
-                    else f"{str(result.order_no or symbol)}:{quantity}"
-                ),
+                fill_id=fill_id,
             )
+            if record is None:
+                return False
+            result.fill_id = str(record["fill_id"])
             if not complete and pending is not None:
                 pending["confirmed_quantity"] = quantity
                 pending["confirmed_amount"] = quantity * price
@@ -1748,6 +1512,8 @@ class MomentumScalpStrategy(BaseStrategy):
                 self._save_daily_state_if_due(force=True)
         else:
             self._save_daily_state_if_due(force=True)
+            return pending is not None
+        return True
 
     def sync_positions_from_account(self, account_positions: List[Position]) -> None:
         account_map = {
@@ -1757,16 +1523,6 @@ class MomentumScalpStrategy(BaseStrategy):
         }
         now = self._now()
 
-        for symbol, meta in list(self._pending_entry_meta.items()):
-            account_position = account_map.get(symbol)
-            if account_position is None:
-                created_at = meta.get("created_at")
-                if isinstance(created_at, datetime) and (
-                    now - created_at
-                ).total_seconds() > max(30, int(self.config.pending_order_block_seconds)):
-                    self._pending_entry_meta.pop(symbol, None)
-                continue
-
         for symbol, position in list(self.positions.items()):
             account_position = account_map.get(symbol)
             if account_position is None:
@@ -1774,7 +1530,7 @@ class MomentumScalpStrategy(BaseStrategy):
                     pending = self._pending_sell_fills.get(symbol)
                     if pending is not None:
                         pending["account_remaining_quantity"] = 0
-                else:
+                elif position.buy_time.date() == now.date():
                     self._pending_sell_fills[symbol] = {
                         "position": self._copy_position(position),
                         "order_no": "",
@@ -1790,25 +1546,82 @@ class MomentumScalpStrategy(BaseStrategy):
             account_price = max(1, int(round(float(account_position.avg_price or 0))))
             if position.pending_exit_started_at is not None:
                 pending = self._pending_sell_fills.get(symbol)
-                if pending is not None:
+                if pending is None:
+                    logger.warning(
+                        "청산 주문 정보 없는 대기 상태 해제: %s %d주 "
+                        "(계좌 보유 확인, 다음 틱 재주문)",
+                        symbol,
+                        account_quantity,
+                    )
+                    position.pending_exit_started_at = None
+                    position.pending_exit_quantity = 0
+                    position.pending_exit_reason = ""
+                else:
                     pending["account_remaining_quantity"] = account_quantity
                     position.pending_exit_quantity = account_quantity
-            if account_quantity != position.quantity or account_price != position.buy_price:
+                    confirmed_quantity = max(
+                        0,
+                        int(pending.get("confirmed_quantity", 0) or 0),
+                    )
+                    snapshot = pending.get("position")
+                    if (
+                        isinstance(snapshot, PositionState)
+                        and snapshot.trade_key == position.trade_key
+                    ):
+                        account_quantity = min(
+                            account_quantity,
+                            max(0, snapshot.quantity - confirmed_quantity),
+                        )
+                        position.pending_exit_quantity = account_quantity
+            if account_quantity != position.quantity:
+                # A holding's aggregate average is not a correction to this buy fill.
+                # Reductions keep the remaining shares' cost; only additions rebase it.
+                previous_entry_price = position.buy_price
+                if account_quantity > position.quantity:
+                    position.buy_price = account_price
                 position.quantity = account_quantity
-                position.buy_price = account_price
-                quote = self._quotes_cache.get(symbol)
-                if position.plan is not None and quote is not None:
+                if position.plan is not None:
                     position.plan = self._reprice_plan_for_fill(
                         plan=position.plan,
-                        quote=quote,
-                        fill_price=account_price,
+                        fill_price=position.buy_price,
                         quantity=account_quantity,
+                        previous_entry_price=previous_entry_price,
                     )
+
+        for symbol, pending in list(self._pending_sell_fills.items()):
+            if symbol in self.positions or symbol in account_map:
+                continue
+            snapshot = pending.get("position")
+            if (
+                isinstance(snapshot, PositionState)
+                and snapshot.buy_time.date() < now.date()
+            ):
+                logger.info(
+                    "전일 미보유 청산 원장 정리: %s %d주",
+                    symbol,
+                    max(0, int(pending.get("requested_quantity", 0) or 0)),
+                )
+                self._pending_sell_fills.pop(symbol, None)
 
         for symbol, account_position in account_map.items():
             if symbol in self.positions:
                 continue
             if symbol in self._pending_entry_meta:
+                continue
+            pending = self._pending_sell_fills.get(symbol)
+            snapshot = pending.get("position") if pending is not None else None
+            if isinstance(snapshot, PositionState):
+                quantity = min(
+                    max(0, int(account_position.quantity or 0)),
+                    max(0, snapshot.quantity - int(pending.get("confirmed_quantity", 0) or 0)),
+                )
+                if quantity > 0:
+                    restored = self._copy_position(snapshot)
+                    restored.quantity = quantity
+                    restored.pending_exit_started_at = pending.get("requested_at") or now
+                    restored.pending_exit_quantity = quantity
+                    restored.pending_exit_reason = str(pending.get("reason") or "")
+                    self.positions[symbol] = restored
                 continue
             buy_price = max(1, int(round(float(account_position.avg_price or 0))))
             self.positions[symbol] = PositionState(
@@ -1831,6 +1644,9 @@ class MomentumScalpStrategy(BaseStrategy):
             symbol = str(result.symbol or "")
             account_position = account_map.get(symbol)
             if result.side == OrderSide.BUY and symbol in self._pending_entry_meta and account_position is not None:
+                previous_quantity = int(self._pending_entry_meta[symbol].get("confirmed_quantity", 0))
+                if account_position.quantity <= previous_quantity:
+                    continue
                 inferred_result = OrderResult(
                     success=True,
                     order_no=str(result.order_no or ""),
@@ -1840,14 +1656,9 @@ class MomentumScalpStrategy(BaseStrategy):
                     price=max(1, int(round(float(account_position.avg_price or 0)))),
                     requested_quantity=max(0, int(result.requested_quantity or 0)),
                     fill_mode="account_reconciled",
-                    requested_reason="expected_value",
+                    requested_reason="price_breakout",
                 )
-                applied = self._apply_buy_fill(
-                    inferred_result,
-                    quantity=inferred_result.quantity,
-                    price=inferred_result.price,
-                )
-                if applied is not None:
+                if self.on_order_filled(inferred_result):
                     inferred.append(inferred_result)
             elif result.side == OrderSide.SELL and symbol in self._pending_sell_fills:
                 self._pending_sell_fills[symbol]["account_remaining_quantity"] = (
@@ -1954,10 +1765,12 @@ class MomentumScalpStrategy(BaseStrategy):
         account_api,
         *,
         results: Optional[List[OrderResult]] = None,
+        history=None,
     ) -> List[Dict[str, Any]]:
         if not self._pending_sell_fills:
             return []
-        history = account_api.get_order_history(self._today(), self._today(), side="01")
+        if history is None:
+            history = account_api.get_order_history(self._today(), self._today(), side="01")
         if history.empty:
             return []
         rows = [item for item in history.to_dict("records") if isinstance(item, dict)]
@@ -1981,14 +1794,32 @@ class MomentumScalpStrategy(BaseStrategy):
             amount = account_api._coerce_int(row.get("tot_ccld_amt")) or 0
             if quantity > 0 and price <= 0 and amount > 0:
                 price = int(round(amount / quantity))
-            account_remaining = pending.get("account_remaining_quantity")
             cumulative_quantity = min(requested_quantity, max(0, int(quantity)))
             confirmed_quantity = min(
                 cumulative_quantity,
                 max(0, int(pending.get("confirmed_quantity", 0) or 0)),
             )
+            complete = cumulative_quantity >= requested_quantity or (
+                str(row.get("rmn_qty", "")).strip() == "0" and (
+                    str(row.get("cncl_yn", "")).strip().upper() == "Y"
+                    or cumulative_quantity + (account_api._coerce_int(row.get("cnc_cfrm_qty")) or 0)
+                    + (account_api._coerce_int(row.get("rjct_qty")) or 0) >= requested_quantity
+                )
+            )
             incremental_quantity = cumulative_quantity - confirmed_quantity
             if incremental_quantity <= 0:
+                if complete:
+                    for fill in reversed(self._sell_fill_ledger):
+                        if str(fill.get("order_no") or "") == resolved_order_no:
+                            fill["order_complete"] = True
+                            break
+                    self._pending_sell_fills.pop(symbol, None)
+                    position = self.positions.get(symbol)
+                    if position is not None:
+                        position.pending_exit_started_at = None
+                        position.pending_exit_quantity = 0
+                        position.pending_exit_reason = ""
+                    self._save_daily_state_if_due(force=True)
                 continue
             confirmed_amount = max(0, int(pending.get("confirmed_amount", 0) or 0))
             if amount > confirmed_amount:
@@ -2002,7 +1833,8 @@ class MomentumScalpStrategy(BaseStrategy):
             snapshot = pending.get("position")
             if not isinstance(snapshot, PositionState):
                 continue
-            complete = account_remaining == 0 or cumulative_quantity >= requested_quantity
+            # An empty balance can arrive before the final execution price.
+            # Keep the order until every requested share is in fill history.
             fill_id = (
                 resolved_order_no
                 if complete and confirmed_quantity == 0
@@ -2023,14 +1855,14 @@ class MomentumScalpStrategy(BaseStrategy):
                 ),
                 requested_reason=str(pending.get("reason") or ""),
                 fill_id=fill_id,
-                remaining_quantity=max(0, requested_quantity - cumulative_quantity),
+                remaining_quantity=0 if complete else max(0, requested_quantity - cumulative_quantity),
             )
             record = self._append_confirmed_sell_fill(
                 result=confirmed_result,
                 position=snapshot,
                 quantity=incremental_quantity,
                 sell_price=incremental_price,
-                apply_to_position=False,
+                remaining_quantity=max(0, snapshot.quantity - cumulative_quantity),
                 clear_pending=complete,
                 fill_id=fill_id,
             )
@@ -2067,7 +1899,8 @@ class MomentumScalpStrategy(BaseStrategy):
                     "delta_net_pnl": int(record.get("net_pnl", 0) or 0),
                     "net_pnl": int(record.get("net_pnl", 0) or 0),
                     "fill_id": fill_id,
-                    "remaining_quantity": max(0, requested_quantity - cumulative_quantity),
+                    "remaining_quantity": 0 if complete else max(0, requested_quantity - cumulative_quantity),
+                    "requested_quantity": requested_quantity,
                     "partial": not complete,
                     "notify": confirmed_quantity == 0 or complete,
                     "alert_quantity": cumulative_quantity,

@@ -26,8 +26,8 @@ class BaseStrategy(ABC):
         pass
 
     @abstractmethod
-    def on_order_filled(self, result: OrderResult):
-        """확정되거나 재조정이 필요한 주문 결과를 반영한다."""
+    def on_order_filled(self, result: OrderResult) -> bool:
+        """주문 결과를 반영한다. 중복/다른 주문 결과를 무시하면 False를 반환한다."""
         pass
 
     @abstractmethod

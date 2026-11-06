@@ -39,15 +39,16 @@ def calculate_trade_pnl_from_prices(
 
 def estimate_trade_net_pnl_unrounded(
     *,
-    entry_price: int,
-    exit_price: int,
+    entry_price: float,
+    exit_price: float,
     quantity: int,
     commission_rate: float,
     sell_tax_rate: float,
 ) -> float:
+    """Keep fractional costs for sizing; only confirmed fills use won rounding."""
     qty = max(0, int(quantity or 0))
-    buy_amount = float(max(0, int(entry_price or 0)) * qty)
-    sell_amount = float(max(0, int(exit_price or 0)) * qty)
+    buy_amount = max(0.0, float(entry_price or 0)) * qty
+    sell_amount = max(0.0, float(exit_price or 0)) * qty
     fees = (buy_amount + sell_amount) * max(0.0, float(commission_rate))
     taxes = sell_amount * max(0.0, float(sell_tax_rate))
     return sell_amount - buy_amount - fees - taxes

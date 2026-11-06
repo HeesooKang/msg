@@ -54,7 +54,7 @@ class PerformanceReportingTests(unittest.TestCase):
         )
         self.assertEqual(card["pnl"]["realized_net_pnl"], 3_200)
         self.assertEqual(card["pnl"]["source"], "confirmed_sell_fill_ledger")
-        self.assertEqual(card["strategy"]["name"], "expected_value_long")
+        self.assertEqual(card["strategy"]["name"], "price_breakout")
         self.assertEqual(card["strategy"]["halt_reason"], "daily_profit_target")
         self.assertNotIn("log_analysis", card)
 

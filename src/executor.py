@@ -2,8 +2,6 @@ import logging
 import time
 from typing import List, Tuple
 
-import requests
-
 from src.api_client import is_kis_rate_limited_message
 from src.models import Order, OrderResult
 from src.trading import TradingAPI
@@ -65,7 +63,9 @@ class OrderExecutor:
 
             try:
                 result = self.trading.place_order(order)
-            except requests.exceptions.RequestException as exc:
+            except Exception as exc:
+                # A malformed response after acceptance is just as uncertain as
+                # a disconnect. Preserve earlier batch results and never resend it.
                 reference_price = int(order.reference_price or order.price or 0)
                 requested_price = int(order.price or 0)
                 requested_label = (

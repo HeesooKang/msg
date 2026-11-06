@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger("kis_trader.config")
 
+PAPER_RATE_LIMIT_INTERVAL = 1.10  # One REST request per second, with gateway margin.
+
 @dataclass
 class Config:
     # 트레이딩 모드
@@ -50,7 +52,7 @@ class Config:
             account_number = os.getenv("PAPER_ACCOUNT_NUMBER", "")
             base_url = "https://openapivts.koreainvestment.com:29443"
             ws_url = "ws://ops.koreainvestment.com:31000"
-            rate_limit_interval = 0.5
+            rate_limit_interval = PAPER_RATE_LIMIT_INTERVAL
         else:
             api_key = os.getenv("REAL_API_KEY", "")
             api_secret = os.getenv("REAL_API_SECRET", "")

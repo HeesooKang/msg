@@ -23,6 +23,7 @@ class AccountAPI:
         tr_id: str,
         params: dict,
         max_pages: int = 20,
+        timeout: tuple[float, float] | None = None,
     ) -> list:
         responses = []
         page_params = dict(params or {})
@@ -35,6 +36,7 @@ class AccountAPI:
                 params=page_params,
                 tr_cont=tr_cont,
                 log_timeout=False,
+                timeout=timeout,
             )
             if not res.success:
                 return responses + [res]
@@ -74,7 +76,9 @@ class AccountAPI:
         except ValueError:
             return None
 
-    def get_balance(self) -> Optional[AccountBalance]:
+    def get_balance(
+        self, *, timeout: tuple[float, float] | None = None
+    ) -> Optional[AccountBalance]:
         """주식 잔고를 조회한다 (보유종목 + 계좌 요약)."""
         params = {
             "CANO": "",
@@ -94,6 +98,7 @@ class AccountAPI:
             api_url="/uapi/domestic-stock/v1/trading/inquire-balance",
             tr_id="TTTC8434R",
             params=params,
+            timeout=timeout,
         )
         if not responses:
             return None

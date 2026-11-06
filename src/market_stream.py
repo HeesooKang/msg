@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import threading
+from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime
+from time import monotonic
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import requests
@@ -17,7 +20,8 @@ logger = logging.getLogger("kis_trader.market_stream")
 
 TRADE_TR_ID = "H0STCNT0"
 MAX_SYMBOLS_PER_CONNECTION = 40
-TRADE_ROW_WIDTH = 46
+# MARKET_CLS_CODE was appended to the original 46-field H0STCNT0 row.
+TRADE_ROW_WIDTH = 47
 
 def _integer(value: Any) -> int:
     try:
@@ -26,20 +30,35 @@ def _integer(value: Any) -> int:
         return 0
 
 
-def _exchange_timestamp(date_text: str, time_text: str, fallback: datetime) -> datetime:
-    normalized_date = "".join(character for character in str(date_text or "") if character.isdigit())
-    normalized_time = "".join(character for character in str(time_text or "") if character.isdigit())
-    if len(normalized_date) != 8:
-        normalized_date = fallback.strftime("%Y%m%d")
-    if len(normalized_time) < 6:
-        return fallback.replace(microsecond=0)
+def _number(value: Any) -> float:
     try:
-        return datetime.strptime(normalized_date + normalized_time[:6], "%Y%m%d%H%M%S")
+        return float(str(value or "0").replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _exchange_timestamp(date_text: str, time_text: str) -> datetime | None:
+    normalized_date = str(date_text or "").strip()
+    normalized_time = str(time_text or "").strip()
+    if (
+        len(normalized_date) != 8
+        or len(normalized_time) != 6
+        or not normalized_date.isascii()
+        or not normalized_date.isdigit()
+        or not normalized_time.isascii()
+        or not normalized_time.isdigit()
+    ):
+        return None
+    try:
+        return datetime.strptime(normalized_date + normalized_time, "%Y%m%d%H%M%S")
     except ValueError:
-        return fallback.replace(microsecond=0)
+        return None
 
 
 def _quote_from_trade(values: Sequence[str], received_at: datetime) -> Quote | None:
+    if len(values) not in (TRADE_ROW_WIDTH - 1, TRADE_ROW_WIDTH):
+        return None
+
     def value(index: int) -> str:
         return values[index] if index < len(values) else ""
 
@@ -47,16 +66,22 @@ def _quote_from_trade(values: Sequence[str], received_at: datetime) -> Quote | N
     current_price = max(0, _integer(value(2)))
     ask_price = max(0, _integer(value(10)))
     bid_price = max(0, _integer(value(11)))
-    if not symbol or current_price <= 0:
+    open_price = max(0, _integer(value(7)))
+    high_price = max(0, _integer(value(8)))
+    low_price = max(0, _integer(value(9)))
+    timestamp = _exchange_timestamp(value(33), value(1))
+    if (
+        len(symbol) != 6
+        or not symbol.isalnum()
+        or not symbol.isascii()
+        or timestamp is None
+        or timestamp.date() != received_at.date()
+    ):
         return None
-    return Quote(
+    quote = Quote(
         symbol=symbol,
         current_price=current_price,
-        timestamp=_exchange_timestamp(
-            str(value(33) or ""),
-            str(value(1) or ""),
-            received_at,
-        ),
+        timestamp=timestamp,
         ask_price=ask_price,
         bid_price=bid_price,
         trade_volume=max(0, _integer(value(12))),
@@ -64,6 +89,10 @@ def _quote_from_trade(values: Sequence[str], received_at: datetime) -> Quote | N
         cumulative_trade_amount=max(0, _integer(value(14))),
         cumulative_sell_volume=max(0, _integer(value(19))),
         cumulative_buy_volume=max(0, _integer(value(20))),
+        open_price=open_price,
+        high_price=high_price,
+        low_price=low_price,
+        day_change_pct=_number(value(5)),
         ask_size=max(0, _integer(value(36))),
         bid_size=max(0, _integer(value(37))),
         total_ask_size=max(0, _integer(value(38))),
@@ -74,7 +103,14 @@ def _quote_from_trade(values: Sequence[str], received_at: datetime) -> Quote | N
             str(value(index)).strip()
             for index in (36, 37, 38, 39)
         ),
+        day_summary_available=bool(
+            str(value(5)).strip()
+            and open_price > 0
+            and high_price > 0
+            and low_price > 0
+        ),
     )
+    return quote if quote.has_valid_prices else None
 
 
 class MarketQuoteStream:
@@ -88,10 +124,11 @@ class MarketQuoteStream:
         self._thread: threading.Thread | None = None
         self._symbols: List[str] = []
         self._snapshots: Dict[tuple[str, datetime], Quote] = {}
-        self._latest_exchange_at: Dict[str, datetime] = {}
-        self._received_at_by_symbol: Dict[str, datetime] = {}
+        self._latest_quotes: Dict[str, Quote] = {}
+        self._stream_observed_at: Dict[str, datetime] = {}
         self._connection_error = ""
         self._next_subscription_send_at = 0.0
+        self._last_frame_warning_at = float("-inf")
 
     @staticmethod
     def _normalize_symbols(symbols: Iterable[str]) -> List[str]:
@@ -112,8 +149,8 @@ class MarketQuoteStream:
             removed = set(self._symbols) - desired
             self._symbols = desired_order
             for symbol in removed:
-                self._latest_exchange_at.pop(symbol, None)
-                self._received_at_by_symbol.pop(symbol, None)
+                self._latest_quotes.pop(symbol, None)
+                self._stream_observed_at.pop(symbol, None)
             if removed:
                 self._snapshots = {
                     key: quote
@@ -146,15 +183,17 @@ class MarketQuoteStream:
         self._stop_event.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=5.0)
+            # Approval HTTP may outlive five seconds. Never clear its stop event
+            # or start another producer while that old session is still alive.
+            thread.join()
         self._thread = None
         self._clear_quote_state()
 
     def _clear_quote_state(self) -> None:
         with self._lock:
             self._snapshots = {}
-            self._latest_exchange_at = {}
-            self._received_at_by_symbol = {}
+            self._latest_quotes = {}
+            self._stream_observed_at = {}
             self._connection_error = ""
 
     def _approval_key(self) -> str:
@@ -168,8 +207,8 @@ class MarketQuoteStream:
             data=json.dumps(payload),
             headers={"content-type": "application/json; charset=utf-8"},
             timeout=(
-                float(self.config.request_connect_timeout),
-                float(self.config.request_read_timeout),
+                max(10.0, float(self.config.request_connect_timeout)),
+                max(60.0, float(self.config.request_read_timeout)),
             ),
         )
         response.raise_for_status()
@@ -288,21 +327,30 @@ class MarketQuoteStream:
                         self._connection_error = ""
                     logger.info("KIS 실시간 시세 연결: 대상=%d종목", len(self._desired_symbols()))
                     backoff = 1.0
-                    while not self._stop_event.is_set():
-                        desired = self._desired_symbols()
-                        await self._sync_subscriptions(
-                            websocket,
-                            approval_key,
-                            subscribed,
-                            desired,
-                        )
-                        if not desired:
-                            return
-                        try:
-                            raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            continue
-                        await self._handle_message(websocket, raw)
+                    subscription_task = None
+                    try:
+                        while not self._stop_event.is_set():
+                            desired = self._desired_symbols()
+                            if not desired:
+                                return
+                            if subscription_task is not None and subscription_task.done():
+                                subscription_task.result()
+                                subscription_task = None
+                            if subscription_task is None and subscribed != desired:
+                                # Sending up to 40 subscriptions takes seconds;
+                                # prices and PINGPONG must keep draining meanwhile.
+                                subscription_task = asyncio.create_task(self._sync_subscriptions(
+                                    websocket, approval_key, subscribed, desired))
+                            try:
+                                raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            except asyncio.TimeoutError:
+                                continue
+                            await self._handle_message(websocket, raw)
+                    finally:
+                        if subscription_task is not None:
+                            subscription_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await subscription_task
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -346,43 +394,83 @@ class MarketQuoteStream:
 
     def feed_realtime_message(self, raw: str, *, received_at: datetime) -> int:
         parts = str(raw or "").split("|", 3)
-        if len(parts) != 4:
+        if len(parts) != 4 or parts[0] != "0":
             return 0
         tr_id = parts[1]
         if tr_id != TRADE_TR_ID:
             return 0
         values = parts[3].split("^")
-        declared_count = max(1, _integer(parts[2]))
+        if not parts[2].isascii() or not parts[2].isdigit():
+            return 0
+        declared_count = int(parts[2])
+        if declared_count <= 0:
+            return 0
+        row_width, remainder = divmod(len(values), declared_count)
+        if remainder or row_width not in (TRADE_ROW_WIDTH - 1, TRADE_ROW_WIDTH):
+            now = monotonic()
+            if now - self._last_frame_warning_at >= 30.0:
+                logger.warning(
+                    "KIS trade frame shape mismatch: rows=%d fields=%d",
+                    declared_count,
+                    len(values),
+                )
+                self._last_frame_warning_at = now
+            return 0
         parsed_count = 0
         for index in range(declared_count):
-            start = index * TRADE_ROW_WIDTH
-            if start >= len(values):
-                break
-            self._merge_row(
-                values[start:start + TRADE_ROW_WIDTH],
+            start = index * row_width
+            parsed_count += self._merge_row(
+                values[start:start + row_width],
                 received_at,
             )
-            parsed_count += 1
         return parsed_count
 
-    def _merge_row(self, values: Sequence[str], received_at: datetime) -> None:
+    def _merge_row(self, values: Sequence[str], received_at: datetime) -> int:
         quote = _quote_from_trade(values, received_at)
         if quote is None:
-            return
+            return 0
         symbol = quote.symbol
         with self._lock:
             if symbol not in self._symbols:
-                return
-            previous = self._latest_exchange_at.get(symbol)
-            if previous is not None and quote.timestamp < previous:
-                return
-            self._latest_exchange_at[symbol] = quote.timestamp
-            self._received_at_by_symbol[symbol] = received_at
+                return 0
+            previous = self._latest_quotes.get(symbol)
+            # A new REST book must not make a delayed stream event look current.
+            observed_at = min(received_at, quote.timestamp)
+            self._stream_observed_at[symbol] = max(
+                observed_at, self._stream_observed_at.get(symbol, observed_at))
             key = (symbol, quote.timestamp)
+            previous_snapshot = self._snapshots.get(key)
+            quote.observe_price_peaks(quote)
+            for observed in (previous, previous_snapshot):
+                if observed is not None and observed.timestamp <= quote.timestamp:
+                    quote.observe_price_peaks(observed)
             self._snapshots[key] = quote
+            latest = replace(quote if previous is None or quote.timestamp >= previous.timestamp else previous)
+            if previous is not None:
+                latest.observe_price_peaks(previous if latest.timestamp == quote.timestamp else quote)
+            self._latest_quotes[symbol] = latest
             if len(self._snapshots) > 20_000:
                 oldest = min(self._snapshots, key=lambda item: item[1])
                 self._snapshots.pop(oldest, None)
+            return 1
+
+    def observe_quotes(self, quotes: Iterable[Quote]) -> None:
+        """Publish REST books for execution without marking the stream healthy."""
+        with self._lock:
+            for quote in quotes:
+                previous = self._latest_quotes.get(quote.symbol)
+                latest = replace(quote if previous is None or quote.timestamp >= previous.timestamp else previous)
+                if previous is not None:
+                    latest.observe_price_peaks(previous if latest.timestamp == quote.timestamp else quote)
+                self._latest_quotes[quote.symbol] = latest
+
+    def latest_quote(self, symbol: str, *, now: datetime | None = None) -> Quote | None:
+        current = now or datetime.now()
+        with self._lock:
+            quote = self._latest_quotes.get(symbol)
+            if quote is None or not 0 <= (current - quote.timestamp).total_seconds() <= self.stale_seconds:
+                return None
+            return replace(quote)
 
     def drain_quotes(self) -> List[Quote]:
         with self._lock:
@@ -398,13 +486,18 @@ class MarketQuoteStream:
         symbols: Iterable[str],
         *,
         now: datetime | None = None,
+        max_age_seconds: float | None = None,
     ) -> List[str]:
         current = now or datetime.now()
+        age_limit = self.stale_seconds if max_age_seconds is None else min(
+            self.stale_seconds, max(0.0, float(max_age_seconds)))
         normalized = self._normalize_symbols(symbols)
         with self._lock:
             return [
                 symbol
                 for symbol in normalized
-                if symbol not in self._received_at_by_symbol
-                or (current - self._received_at_by_symbol[symbol]).total_seconds() > self.stale_seconds
+                if symbol not in self._stream_observed_at
+                or symbol not in self._latest_quotes
+                or not 0 <= (current - self._stream_observed_at[symbol]).total_seconds() <= age_limit
+                or not 0 <= (current - self._latest_quotes[symbol].timestamp).total_seconds() <= age_limit
             ]

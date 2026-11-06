@@ -34,6 +34,28 @@ class _RaisingTrading:
 
 
 class OrderExecutorTests(unittest.TestCase):
+    def test_unexpected_response_error_keeps_prior_fill_and_other_batch_orders(self):
+        class Trading(_FakeTrading):
+            def place_order(self, order):
+                if order.symbol == "000660":
+                    self.calls.append(order.symbol)
+                    raise ValueError("malformed response after submission")
+                return super().place_order(order)
+
+        first = OrderResult(True, symbol="005930", side=OrderSide.SELL, quantity=1,
+                            price=10000, fill_mode="filled")
+        last = OrderResult(True, symbol="035420", side=OrderSide.SELL, quantity=1,
+                           price=10000, fill_mode="filled")
+        trading = Trading([first, last])
+        with patch("src.executor.time.sleep"):
+            results = OrderExecutor(trading, RiskManager()).submit_orders([
+                Order(symbol, OrderSide.SELL, quantity=1) for symbol in ("005930", "000660", "035420")])
+        self.assertIs(results[0], first)
+        self.assertEqual(results[1].fill_mode, "order_result_pending")
+        self.assertEqual((results[1].quantity, results[1].price), (0, 0))
+        self.assertIs(results[2], last)
+        self.assertEqual(trading.calls, ["005930", "000660", "035420"])
+
     def test_submit_orders_continues_after_rate_limited_failure(self):
         trading = _FakeTrading(
             [
@@ -129,7 +151,7 @@ class OrderExecutorTests(unittest.TestCase):
             quantity=39,
             price=0,
             reference_price=14360,
-            requested_reason="expected_value",
+            requested_reason="price_breakout",
         )
 
         with self.assertLogs("kis_trader.orders", level="WARNING") as captured:
@@ -143,7 +165,7 @@ class OrderExecutorTests(unittest.TestCase):
         self.assertEqual(result.quantity, 0)
         self.assertEqual(result.reference_price, 14360)
         self.assertEqual(result.fill_mode, "order_result_pending")
-        self.assertEqual(result.requested_reason, "expected_value")
+        self.assertEqual(result.requested_reason, "price_breakout")
         message = "\n".join(captured.output)
         self.assertIn(
             "주문 결과 미확정: buy 457370 MARKET 39주 @ 시장가 "

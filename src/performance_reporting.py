@@ -147,7 +147,7 @@ def build_daily_scorecard(
         },
         "trades": _compute_trade_metrics(snapshot),
         "strategy": {
-            "name": "expected_value_long",
+            "name": "price_breakout",
             "halted": snapshot["halted"],
             "halt_reason": snapshot["halt_reason"],
             "open_positions_count": snapshot["open_positions_count"],

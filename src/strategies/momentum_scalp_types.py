@@ -1,4 +1,4 @@
-"""State and configuration for the single expected-value trading path."""
+"""State and configuration for the single price-breakout trading path."""
 
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ class MomentumScalpConfig:
     pool_refresh_interval: int = 120
     quote_freshness_seconds: int = 5
 
-    forecast_outcome_root: str = "reports/forecast-outcomes"
+    quote_archive_root: str = "reports/market-quotes"
     daily_state_path: str = "state/momentum_scalp_daily_state.json"
     state_save_interval_seconds: int = 5
     pending_order_block_seconds: int = 180
@@ -83,13 +83,13 @@ class TradePlan:
     reason: str
     quantity: int
     entry_limit_price: int
-    expected_exit_bid: int
-    lower_exit_bid: int
-    expected_net: float
-    lower_net: int
+    breakout_price: int
     committed_risk_net_abs: int
     signal_at: datetime
     expires_at: datetime
+    target_price: int = 0
+    stop_price: int = 0  # Zero preserves the breakout stop of an existing plan.
+    exit_price_allowance: int = 0  # Frozen per-share execution allowance, not a profit floor.
 
 
 @dataclass
@@ -100,11 +100,11 @@ class PositionState:
     buy_time: datetime = field(default_factory=datetime.now)
     plan: Optional[TradePlan] = None
     trade_key: str = ""
-    forecast_id: str = ""
 
     pending_exit_started_at: Optional[datetime] = None
     pending_exit_quantity: int = 0
     pending_exit_reason: str = ""
+    stop_triggered: bool = False
 
     def __post_init__(self) -> None:
         self.quantity = max(0, int(self.quantity or 0))

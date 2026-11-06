@@ -1,27 +1,47 @@
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import List
 
 import pandas as pd
 import requests
 
 from src.api_client import KISClient, is_kis_rate_limited_message
+from src.analytics.quote_archive import QuoteArchive
 from src.market_calendar import is_known_krx_closed_date, normalize_trading_date
 from src.models import Quote
+from src.instruments import is_stock_symbol, load_instrument_groups
 
 logger = logging.getLogger("kis_trader.market")
+
+
+def _integer(value, default=0):
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(str(value).replace(",", "")))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _number(value) -> float:
+    try:
+        return float(str(value or "0").replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class MarketDataAPI:
     """국내주식 시세 조회 API."""
 
-    def __init__(self, client: KISClient):
+    def __init__(self, client: KISClient, *, discovery_archive: QuoteArchive | None = None):
         self.client = client
+        self._discovery_archive = discovery_archive
+        self.instrument_groups: dict[str, str] = {}
         self._market_open_cache: dict[str, bool] = {}
         self._holiday_warned_dates: set[str] = set()
         self._multi_price_backoff_until: float = 0.0
-        self._multi_price_rate_limit_streak: int = 0
         self._multi_price_transport_error_streak: int = 0
         self._fluctuation_cache: dict[tuple[int, float], tuple[float, list[str]]] = {}
         self._fluctuation_backoff_until: float = 0.0
@@ -31,6 +51,11 @@ class MarketDataAPI:
     @staticmethod
     def _is_rate_limited_message(message: str) -> bool:
         return is_kis_rate_limited_message(message)
+
+    def refresh_instruments(self) -> None:
+        self.instrument_groups.update(load_instrument_groups(
+            Path("state/instruments.json"), today=datetime.now().date(),
+        ))
 
     @staticmethod
     def _cache_valid(cached_at: float, ttl_seconds: float) -> bool:
@@ -66,22 +91,6 @@ class MarketDataAPI:
         backoff_cap = 8.0 if is_paper else 4.0
         backoff = max(base_backoff, min(backoff_cap, client_cooldown + 1.0))
         self._fluctuation_backoff_until = max(self._fluctuation_backoff_until, time.time() + backoff)
-        return backoff
-
-    def _note_multi_price_rate_limit(self, *, minimum_cooldown: float = 0.0) -> float:
-        is_paper = self.client.config.is_paper
-        self._multi_price_rate_limit_streak = min(3, int(self._multi_price_rate_limit_streak) + 1)
-        if is_paper:
-            staged_backoff = (8.0, 15.0, 30.0)
-        else:
-            staged_backoff = (2.0, 4.0, 8.0)
-        base_cooldown = staged_backoff[self._multi_price_rate_limit_streak - 1]
-        client_cooldown = self._client_cooldown()
-        backoff = max(base_cooldown, minimum_cooldown, client_cooldown + 1.0)
-        self._multi_price_backoff_until = max(
-            self._multi_price_backoff_until,
-            time.time() + backoff,
-        )
         return backoff
 
     def _note_multi_price_transport_error(self) -> float:
@@ -210,8 +219,9 @@ class MarketDataAPI:
         count: int = 20,
         min_change_rate: float = 0.0,
     ) -> List[str]:
-        """등락률 상위 응답에서 감시할 종목코드만 반환한다."""
-        cache_key = (int(count), float(min_change_rate))
+        """전일 종가 대비 상승률 순위에서 감시할 종목코드를 반환한다."""
+        count = max(1, int(count))
+        cache_key = (count, float(min_change_rate))
         cached = self._fluctuation_cache.get(cache_key)
         if cached and self._cache_valid(cached[0], 45.0):
             return list(cached[1])[:count]
@@ -221,29 +231,29 @@ class MarketDataAPI:
                 return list(cached[1])[:count]
             return []
 
+        # KIS official Postman: input_cnt=0 is all; prc_cls=1 is previous
+        # close, while 0 ranks rebounds from the intraday low instead.
+        params = {
+            "fid_cond_mrkt_div_code": "J",
+            "fid_cond_scr_div_code": "20170",
+            "fid_input_iscd": "0000",
+            "fid_rank_sort_cls_code": "0",
+            "fid_input_cnt_1": "0",
+            "fid_prc_cls_code": "1",
+            "fid_input_price_1": "",
+            "fid_input_price_2": "",
+            "fid_vol_cnt": "",
+            "fid_trgt_cls_code": "0",
+            "fid_trgt_exls_cls_code": "0000000100",  # Exclude ETNs.
+            "fid_div_cls_code": "0",
+            "fid_rsfl_rate1": str(min_change_rate) if min_change_rate else "",
+            "fid_rsfl_rate2": "",
+        }
         try:
             res = self.client.get(
                 api_url="/uapi/domestic-stock/v1/ranking/fluctuation",
                 tr_id="FHPST01700000",
-                params={
-                    "fid_cond_mrkt_div_code": "J",
-                    "fid_cond_scr_div_code": "20170",
-                    "fid_input_iscd": "0000",
-                    "fid_rank_sort_cls_code": "0",
-                    "fid_input_cnt_1": str(max(1, int(count))),
-                    "fid_prc_cls_code": "0",
-                    "fid_input_price_1": "",
-                    "fid_input_price_2": "",
-                    "fid_vol_cnt": "",
-                    "fid_trgt_cls_code": "0",
-                    # KIS exclusion bitmap position 8 is ETN. Ranking responses
-                    # otherwise contain Q-prefixed issue identifiers that cannot
-                    # be sent to the six-character domestic-stock quote route.
-                    "fid_trgt_exls_cls_code": "0000000100",
-                    "fid_div_cls_code": "0",
-                    "fid_rsfl_rate1": str(min_change_rate) if min_change_rate else "",
-                    "fid_rsfl_rate2": "30",
-                },
+                params=params,
                 log_timeout=False,
             )
         except requests.exceptions.RequestException as exc:
@@ -262,11 +272,21 @@ class MarketDataAPI:
             logger.error("등락률 순위 조회 실패: %s", res.error_message)
             return []
 
+        rows = res.output or []
         symbols = []
-        for row in (res.output or [])[:count]:
+        for row in rows:
             symbol = str(row.get("stck_shrn_iscd", "") or "").strip()
-            if len(symbol) == 6 and symbol.isdigit() and symbol not in symbols:
+            if is_stock_symbol(symbol) and symbol not in symbols:
                 symbols.append(symbol)
+        eligible_count = len(symbols)
+        symbols = symbols[:count]
+        if self._discovery_archive is not None:
+            self._discovery_archive.record_discovery(
+                now=datetime.now(), environment="paper" if self.client.config.is_paper else "real",
+                params=params, rows=rows, symbols=symbols,
+            )
+        logger.info("등락률 조회: 전일종가 기준 응답=%d 유효=%d 반환=%d",
+                    len(rows), eligible_count, len(symbols))
         if symbols:
             self._fluctuation_cache[cache_key] = (time.time(), list(symbols))
             self._fluctuation_backoff_until = 0.0
@@ -298,6 +318,7 @@ class MarketDataAPI:
             params[f"FID_COND_MRKT_DIV_CODE_{i}"] = "J"
             params[f"FID_INPUT_ISCD_{i}"] = sym
 
+        observed_at = datetime.now()
         try:
             res = self.client.get(
                 api_url="/uapi/domestic-stock/v1/quotations/intstock-multprice",
@@ -318,9 +339,11 @@ class MarketDataAPI:
                 self._last_multi_price_rate_limit_log_at = now_ts
             return []
         if not res.success:
-            error_message = res.error_message or ""
+            error_message = f"{getattr(res, 'error_code', '')} {res.error_message or ''}".strip()
             if self._is_rate_limited_message(error_message):
-                backoff = self._note_multi_price_rate_limit()
+                # KISClient owns quota pacing for quotes, accounts and orders.
+                # Only transport failures need a separate endpoint backoff.
+                backoff = self._client_cooldown()
                 now_ts = time.time()
                 if now_ts - self._last_multi_price_rate_limit_log_at >= 30.0:
                     logger.warning(
@@ -333,27 +356,64 @@ class MarketDataAPI:
             logger.error("멀티시세 조회 실패: %s", error_message)
             return []
 
+        # Age a quote from transmission, not from the earlier authentication/quota wait.
+        # Keep network/server delay in its age; never stamp a slow response as fresh.
+        observed_at = getattr(res, "request_started_at", None) or observed_at
         quotes = []
         for row in (res.output or []):
             sym = row.get("inter_shrn_iscd", "")
             if not sym:
                 continue
             try:
+                open_price = max(0, _integer(row.get("inter2_oprc")))
+                high_price = max(0, _integer(row.get("inter2_hgpr")))
+                low_price = max(0, _integer(row.get("inter2_lwpr")))
+                day_change_value = row.get("prdy_ctrt")
+                if day_change_value in (None, ""):
+                    day_change_value = row.get("inter2_prdy_ctrt")
+                trade_amount = row.get("acml_tr_pbmn")
+                if trade_amount in (None, ""):
+                    trade_amount = row.get("inter2_acml_tr_pbmn")
+                top_sizes = tuple(
+                    _integer(row.get(name), default=None)
+                    for name in ("seln_rsqn", "shnu_rsqn")
+                )
+                total_sizes = tuple(
+                    _integer(row.get(name), default=None)
+                    for name in ("total_askp_rsqn", "total_bidp_rsqn")
+                )
+                top_available = all(value is not None and value >= 0 for value in top_sizes)
+                total_available = all(value is not None and value >= 0 for value in total_sizes)
                 quotes.append(Quote(
                     symbol=sym,
-                    current_price=int(row.get("inter2_prpr", 0)),
-                    ask_price=int(row.get("inter2_askp", 0) or 0),
-                    bid_price=int(row.get("inter2_bidp", 0) or 0),
-                    cumulative_volume=int(row.get("inter2_acml_vol", 0) or 0),
+                    current_price=_integer(row.get("inter2_prpr")),
+                    timestamp=observed_at,
+                    ask_price=_integer(row.get("inter2_askp")),
+                    bid_price=_integer(row.get("inter2_bidp")),
+                    cumulative_volume=_integer(row.get("acml_vol")),
+                    cumulative_trade_amount=_integer(trade_amount),
+                    ask_size=top_sizes[0] if top_available else 0,
+                    bid_size=top_sizes[1] if top_available else 0,
+                    total_ask_size=total_sizes[0] if total_available else 0,
+                    total_bid_size=total_sizes[1] if total_available else 0,
+                    open_price=open_price,
+                    high_price=high_price,
+                    low_price=low_price,
+                    day_change_pct=_number(day_change_value),
                     book_available=True,
                     flow_available=False,
-                    book_depth_available=False,
+                    book_depth_available=top_available or total_available,
+                    day_summary_available=bool(
+                        day_change_value not in (None, "")
+                        and open_price > 0
+                        and high_price > 0
+                        and low_price > 0
+                    ),
                 ))
             except (ValueError, TypeError):
                 continue
         if quotes:
             self._multi_price_backoff_until = 0.0
-            self._multi_price_rate_limit_streak = 0
             self._multi_price_transport_error_streak = 0
         return quotes
 

@@ -1,12 +1,14 @@
 import json
 import logging
 import time
-from typing import Any, Dict
+from datetime import datetime
+from threading import RLock, local
+from typing import Any, Callable, Dict
 
 import requests
 
 from src.auth import TokenManager
-from src.config import Config
+from src.config import Config, PAPER_RATE_LIMIT_INTERVAL
 
 logger = logging.getLogger("kis_trader.api")
 
@@ -34,6 +36,7 @@ class APIResponse:
     def __init__(self, data: dict, headers: dict):
         self.data = data
         self.headers = headers
+        self.request_started_at: datetime | None = None
 
     @property
     def success(self) -> bool:
@@ -71,9 +74,22 @@ class KISClient:
     def __init__(self, config: Config, token_manager: TokenManager):
         self.config = config
         self.token_manager = token_manager
+        self._transport = local()
+        self._request_lock = RLock()
         self._session = requests.Session()
         self._last_call_time: float = 0
         self._rate_limit_backoff_until: float = 0.0
+
+    @property
+    def _session(self):
+        session = getattr(self._transport, "session", None)
+        if session is None:
+            session = self._transport.session = requests.Session()
+        return session
+
+    @_session.setter
+    def _session(self, session):
+        self._transport.session = session
 
     def _request_timeout(self) -> tuple[float, float]:
         return (
@@ -113,37 +129,44 @@ class KISClient:
         )
         if cooldown_seconds <= 0:
             return
-        self._rate_limit_backoff_until = max(
-            self._rate_limit_backoff_until,
-            time.time() + cooldown_seconds,
-        )
+        with self._request_lock:
+            self._rate_limit_backoff_until = max(
+                self._rate_limit_backoff_until,
+                time.time() + cooldown_seconds,
+            )
 
     def rate_limit_cooldown_remaining(self) -> float:
         return max(0.0, self._rate_limit_backoff_until - time.time())
 
-    def _rate_limit(self, api_url: str = ""):
+    def _rate_limit(self):
         """API 호출 간 최소 간격을 유지한다."""
-        cooldown_remaining = self.rate_limit_cooldown_remaining()
-        if cooldown_remaining > 0:
-            logger.debug("API 유량 제한 냉각 대기: %.2fs", cooldown_remaining)
-            time.sleep(cooldown_remaining)
-        configured_interval = max(0.0, float(self.config.rate_limit_interval or 0.0))
-        request_interval = configured_interval
-        if bool(self.config.is_paper) and configured_interval > 0.0:
-            # The paper server enforces its two-per-second window at the gateway.
-            # Calling exactly every 0.5s repeatedly lands on that boundary.
-            request_interval = max(0.60, configured_interval)
-            if "/trading/" in str(api_url or ""):
-                # Account/order endpoints were still rejected 0.8s after the
-                # previous request. Keep market-data polling responsive while
-                # giving the lower paper-account quota a separate margin.
-                request_interval = max(1.10, request_interval)
-        elapsed = time.time() - self._last_call_time
-        if elapsed < request_interval:
-            sleep_time = request_interval - elapsed
-            logger.debug("레이트 리미팅: %.2fs 대기", sleep_time)
-            time.sleep(sleep_time)
-        self._last_call_time = time.time()
+        request_interval = max(0.0, float(self.config.rate_limit_interval or 0.0))
+        if self.config.is_paper:
+            request_interval = max(PAPER_RATE_LIMIT_INTERVAL, request_interval)
+        while True:
+            with self._request_lock:
+                now = time.time()
+                wait = max(self._rate_limit_backoff_until,
+                           self._last_call_time + request_interval) - now
+                if wait <= 0:
+                    self._last_call_time = now
+                    return
+            # An in-flight response can extend cooldown while this caller waits.
+            # Recheck and reserve one slot atomically, without sleeping under the lock.
+            logger.debug("API 호출 간격/냉각 대기: %.2fs", wait)
+            time.sleep(wait)
+
+    def _prepare_request(self, tr_id: str, tr_cont: str, *, rejected_token: str | None = None) -> dict:
+        # Share authentication and rate slots, never the blocking HTTP call or
+        # mutable Session. A delayed old response must not revoke a new token.
+        with self._request_lock:
+            if rejected_token is not None and f"Bearer {self.token_manager.get_token()}" == rejected_token:
+                logger.warning("KIS 토큰이 API에서 만료/무효로 거부되어 캐시 삭제 후 1회 재발급합니다.")
+                self._invalidate_token_cache()
+            headers = self._build_headers(tr_id, tr_cont)
+            self._sync_token_issue_time()
+        self._rate_limit()
+        return headers
 
     def _sync_token_issue_time(self) -> None:
         """Treat a fresh OAuth issuance as an API call before the first account request."""
@@ -186,21 +209,23 @@ class KISClient:
         params: Dict[str, str],
         tr_cont: str = "",
         log_timeout: bool = True,
+        *,
+        timeout: tuple[float, float] | None = None,
     ) -> APIResponse:
         """GET 요청을 보낸다."""
+        request_timeout = timeout if timeout is not None else self._request_timeout()
         url = f"{self.config.base_url}{api_url}"
-        headers = self._build_headers(tr_id, tr_cont)
-        self._sync_token_issue_time()
-        self._rate_limit(api_url)
+        headers = self._prepare_request(tr_id, tr_cont)
         params = self._inject_account(params)
 
         logger.debug("GET %s tr_id=%s", api_url, headers["tr_id"])
         try:
+            request_started_at = datetime.fromtimestamp(time.time())
             res = self._session.get(
                 url,
                 headers=headers,
                 params=params,
-                timeout=self._request_timeout(),
+                timeout=request_timeout,
             )
         except requests.exceptions.Timeout:
             self._reset_session()
@@ -208,8 +233,8 @@ class KISClient:
                 logger.warning(
                     "GET timeout [%s]: connect=%.2fs read=%.2fs",
                     api_url,
-                    self._request_timeout()[0],
-                    self._request_timeout()[1],
+                    request_timeout[0],
+                    request_timeout[1],
                 )
             raise
         except requests.exceptions.RequestException:
@@ -217,17 +242,14 @@ class KISClient:
             raise
         parsed = self._parse_response(res, api_url)
         if self._is_token_invalid_response(parsed):
-            logger.warning("KIS 토큰이 API에서 만료/무효로 거부되어 캐시 삭제 후 1회 재발급합니다.")
-            self._invalidate_token_cache()
-            headers = self._build_headers(tr_id, tr_cont)
-            self._sync_token_issue_time()
-            self._rate_limit(api_url)
+            headers = self._prepare_request(tr_id, tr_cont, rejected_token=headers["authorization"])
             try:
+                request_started_at = datetime.fromtimestamp(time.time())
                 res = self._session.get(
                     url,
                     headers=headers,
                     params=params,
-                    timeout=self._request_timeout(),
+                    timeout=request_timeout,
                 )
             except requests.exceptions.Timeout:
                 self._reset_session()
@@ -235,15 +257,34 @@ class KISClient:
                     logger.warning(
                         "GET timeout [%s]: connect=%.2fs read=%.2fs",
                         api_url,
-                        self._request_timeout()[0],
-                        self._request_timeout()[1],
+                        request_timeout[0],
+                        request_timeout[1],
                     )
                 raise
             except requests.exceptions.RequestException:
                 self._reset_session()
                 raise
             parsed = self._parse_response(res, api_url)
+        parsed.request_started_at = request_started_at
         return parsed
+
+    @staticmethod
+    def _submission_error(
+        submit_before: float | None,
+        pre_submit: Callable[[], str | None] | None,
+    ) -> APIResponse | None:
+        if submit_before is not None and time.time() >= submit_before:
+            return APIResponse({"rt_cd": "1", "msg_cd": "LOCAL_ORDER_EXPIRED",
+                                "msg1": "시세 유효기간이 지나 매수를 제출하지 않았습니다."}, {})
+        if pre_submit is not None:
+            try:
+                reason = pre_submit()
+            except Exception:
+                logger.exception("주문 전송 직전 시세 확인 실패: 주문은 제출하지 않았습니다.")
+                reason = "최신 시세를 확인하지 못해 매수를 제출하지 않았습니다."
+            if reason:
+                return APIResponse({"rt_cd": "1", "msg_cd": "LOCAL_ORDER_INVALIDATED", "msg1": reason}, {})
+        return None
 
     def post(
         self,
@@ -252,14 +293,19 @@ class KISClient:
         body: Dict[str, str],
         tr_cont: str = "",
         log_timeout: bool = True,
+        submit_before: float | None = None,
+        pre_submit: Callable[[], str | None] | None = None,
     ) -> APIResponse:
         """POST 요청을 보낸다."""
         url = f"{self.config.base_url}{api_url}"
-        headers = self._build_headers(tr_id, tr_cont)
-        self._sync_token_issue_time()
-        self._rate_limit(api_url)
+        headers = self._prepare_request(tr_id, tr_cont)
         body = self._inject_account(body)
 
+        # Authentication and quota waits may outlive the quote that priced the
+        # order. A received order response must never be expired retroactively.
+        rejected = self._submission_error(submit_before, pre_submit)
+        if rejected is not None:
+            return rejected
         logger.debug("POST %s tr_id=%s", api_url, headers["tr_id"])
         try:
             res = self._session.post(
@@ -283,11 +329,10 @@ class KISClient:
             raise
         parsed = self._parse_response(res, api_url)
         if self._is_token_invalid_response(parsed):
-            logger.warning("KIS 토큰이 API에서 만료/무효로 거부되어 캐시 삭제 후 1회 재발급합니다.")
-            self._invalidate_token_cache()
-            headers = self._build_headers(tr_id, tr_cont)
-            self._sync_token_issue_time()
-            self._rate_limit(api_url)
+            headers = self._prepare_request(tr_id, tr_cont, rejected_token=headers["authorization"])
+            rejected = self._submission_error(submit_before, pre_submit)
+            if rejected is not None:
+                return rejected
             try:
                 res = self._session.post(
                     url,
@@ -324,7 +369,7 @@ class KISClient:
         api_resp = APIResponse(data, resp_headers)
 
         if not api_resp.success:
-            self._note_rate_limit(api_resp.error_message)
+            self._note_rate_limit(f"{api_resp.error_code} {api_resp.error_message}")
             logger.warning(
                 "API 실패 [%s]: %s - %s",
                 api_url,

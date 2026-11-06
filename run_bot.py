@@ -65,6 +65,7 @@ def _apply_real_money_stage(strategy_config, stage: int) -> tuple[int, float]:
 
 
 def get_strategy(runtime_config: Config):
+    from src.analytics.quote_archive import QuoteArchive
     from src.api_client import KISClient
     from src.auth import TokenManager
     from src.market_data import MarketDataAPI
@@ -74,7 +75,6 @@ def get_strategy(runtime_config: Config):
     )
 
     client = KISClient(runtime_config, TokenManager(runtime_config))
-    market_data = MarketDataAPI(client)
     if runtime_config.is_paper:
         commission_rate = 0.000142
         sell_tax_rate = 0.0015
@@ -92,10 +92,10 @@ def get_strategy(runtime_config: Config):
         dynamic_pool_quote_min_change_rate=0.0,
         pool_refresh_interval=120,
         quote_freshness_seconds=5,
-        forecast_outcome_root=os.path.join(
+        quote_archive_root=os.path.join(
             PROJECT_ROOT,
             "reports",
-            "forecast-outcomes",
+            "market-quotes",
         ),
         daily_state_path=os.path.join(
             PROJECT_ROOT,
@@ -118,6 +118,9 @@ def get_strategy(runtime_config: Config):
             _load_allowed_real_money_stage(),
         )
 
+    market_data = MarketDataAPI(
+        client, discovery_archive=QuoteArchive(strategy_config.quote_archive_root),
+    )
     strategy = MomentumScalpStrategy(market_data, strategy_config)
     strategy._real_money_stage = real_money_stage
     strategy._capital_scale = capital_scale

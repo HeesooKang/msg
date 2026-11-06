@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 
 from src.account import AccountAPI
 
@@ -25,6 +26,30 @@ class DummyClient:
 
 
 class AccountRealizedPnLTests(unittest.TestCase):
+    def test_balance_timeout_reaches_every_page_without_changing_later_requests(self):
+        first = DummyResponse(True, output1=[{"pdno": "005930", "hldg_qty": "2"}])
+        first.has_next = True
+        first.data = {"ctx_area_fk100": "next", "ctx_area_nk100": "page"}
+        last = DummyResponse(
+            True,
+            output1=[{"pdno": "000660", "hldg_qty": "1"}],
+            output2=[{"dnca_tot_amt": "1000000"}],
+        )
+        client = Mock(get=Mock(side_effect=[first, last, last]))
+        account = AccountAPI(client)
+
+        with patch("src.account.time.sleep"):
+            balance = account.get_balance(timeout=(10.0, 60.0))
+            account.get_balance()
+
+        self.assertEqual(balance.total_deposit, 1_000_000)
+        self.assertEqual([position.symbol for position in balance.positions], ["005930", "000660"])
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in client.get.call_args_list],
+            [(10.0, 60.0), (10.0, 60.0), None],
+        )
+        self.assertEqual(client.get.call_args_list[1].kwargs["tr_cont"], "N")
+
     def test_get_realized_profit_loss_reads_summary_output2(self):
         client = DummyClient(
             DummyResponse(

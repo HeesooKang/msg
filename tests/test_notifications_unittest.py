@@ -1,3 +1,7 @@
+import json
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -162,6 +166,77 @@ class NotificationTests(unittest.TestCase):
         self.assertFalse(second)
         self.assertEqual(mock_post.call_count, 1)
         self.assertEqual(mgr._kakao_auth_disabled_reason, "invalid_refresh_token")
+
+    def test_rotated_refresh_token_is_persisted_for_restart(self):
+        cfg = AlertConfig(
+            enabled=True,
+            channel="kakao",
+            kakao_rest_api_key="rest-key",
+            kakao_refresh_token="old-refresh-token",
+            kakao_message_web_url="https://example.com",
+            min_interval_seconds=0,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            token_path = Path(temp_dir) / "kakao_refresh_token.json"
+            with patch("src.notifications.KAKAO_REFRESH_TOKEN_STATE_PATH", token_path), patch(
+                "src.notifications.requests.post",
+                side_effect=[
+                    DummyResp(
+                        200,
+                        json_body={
+                            "access_token": "access-token",
+                            "expires_in": 3600,
+                            "refresh_token": "rotated-refresh-token",
+                        },
+                    ),
+                    DummyResp(200, json_body={"result_code": 0}),
+                ],
+            ):
+                self.assertTrue(AlertManager(cfg=cfg).send("rotation", "t", "m"))
+
+            stored = json.loads(token_path.read_text(encoding="utf-8"))
+            self.assertEqual(stored["refresh_token"], "rotated-refresh-token")
+            self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_persisted_token_falls_back_to_environment_token(self):
+        with TemporaryDirectory() as temp_dir:
+            token_path = Path(temp_dir) / "kakao_refresh_token.json"
+            token_path.write_text(
+                json.dumps({"refresh_token": "expired-cached-token"}),
+                encoding="utf-8",
+            )
+            env = {
+                "ALERTS_ENABLED": "true",
+                "ALERT_CHANNEL": "kakao",
+                "KAKAO_REST_API_KEY": "rest-key",
+                "KAKAO_REFRESH_TOKEN": "valid-environment-token",
+                "KAKAO_MESSAGE_WEB_URL": "https://example.com",
+                "ALERT_MIN_INTERVAL_SECONDS": "0",
+            }
+            with patch("src.notifications.KAKAO_REFRESH_TOKEN_STATE_PATH", token_path), patch.dict(
+                os.environ, env, clear=True
+            ):
+                cfg = AlertConfig.from_env()
+                mgr = AlertManager(cfg=cfg)
+                with patch(
+                    "src.notifications.requests.post",
+                    side_effect=[
+                        DummyResp(
+                            400,
+                            text='{"error":"invalid_grant","error_code":"KOE322"}',
+                        ),
+                        DummyResp(200, json_body={"access_token": "access-token", "expires_in": 3600}),
+                        DummyResp(200, json_body={"result_code": 0}),
+                    ],
+                ) as mock_post:
+                    self.assertTrue(mgr.send("fallback", "t", "m"))
+
+            refresh_calls = mock_post.call_args_list[:2]
+            self.assertEqual(refresh_calls[0].kwargs["data"]["refresh_token"], "expired-cached-token")
+            self.assertEqual(refresh_calls[1].kwargs["data"]["refresh_token"], "valid-environment-token")
+            stored = json.loads(token_path.read_text(encoding="utf-8"))
+            self.assertEqual(stored["refresh_token"], "valid-environment-token")
 
 
 if __name__ == "__main__":

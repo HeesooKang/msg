@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+from pathlib import Path
 from typing import Dict
 
 import requests
@@ -12,6 +13,47 @@ logger = logging.getLogger("kis_trader.notifications")
 
 KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 KAKAO_MEMO_SEND_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+KAKAO_REFRESH_TOKEN_STATE_PATH = (
+    Path(__file__).resolve().parents[1] / "state" / "kakao_refresh_token.json"
+)
+
+
+def _load_persisted_kakao_refresh_token() -> str:
+    path = KAKAO_REFRESH_TOKEN_STATE_PATH
+    if not path.is_file():
+        return ""
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+        return str(body.get("refresh_token", "") or "").strip()
+    except Exception as exc:
+        logger.warning("카카오 refresh_token 상태 파일을 읽지 못했습니다: %s", exc)
+        return ""
+
+
+def _persist_kakao_refresh_token(refresh_token: str) -> bool:
+    token = str(refresh_token or "").strip()
+    if not token:
+        return False
+
+    path = KAKAO_REFRESH_TOKEN_STATE_PATH
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"refresh_token": token}, handle, ensure_ascii=True)
+            handle.write("\n")
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+        return True
+    except Exception as exc:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+        logger.warning("카카오 refresh_token 상태 파일 저장 실패: %s", exc)
+        return False
 
 
 @dataclass
@@ -20,7 +62,8 @@ class AlertConfig:
     channel: str = "kakao"  # kakao|none
     kakao_rest_api_key: str = ""
     kakao_client_secret: str = ""
-    kakao_refresh_token: str = ""
+    kakao_refresh_token: str = field(default="", repr=False)
+    kakao_refresh_token_fallback: str = field(default="", repr=False)
     kakao_message_web_url: str = ""
     kakao_message_mobile_web_url: str = ""
     kakao_message_button_title: str = "상세 보기"
@@ -31,12 +74,19 @@ class AlertConfig:
         enabled = os.getenv("ALERTS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
         channel = os.getenv("ALERT_CHANNEL", "kakao").strip().lower() or "kakao"
         min_interval = int(os.getenv("ALERT_MIN_INTERVAL_SECONDS", "300"))
+        env_refresh_token = os.getenv("KAKAO_REFRESH_TOKEN", "").strip()
+        persisted_refresh_token = _load_persisted_kakao_refresh_token()
         return cls(
             enabled=enabled,
             channel=channel,
             kakao_rest_api_key=os.getenv("KAKAO_REST_API_KEY", "").strip(),
             kakao_client_secret=os.getenv("KAKAO_CLIENT_SECRET", "").strip(),
-            kakao_refresh_token=os.getenv("KAKAO_REFRESH_TOKEN", "").strip(),
+            kakao_refresh_token=persisted_refresh_token or env_refresh_token,
+            kakao_refresh_token_fallback=(
+                env_refresh_token
+                if persisted_refresh_token and env_refresh_token != persisted_refresh_token
+                else ""
+            ),
             kakao_message_web_url=os.getenv("KAKAO_MESSAGE_WEB_URL", "").strip(),
             kakao_message_mobile_web_url=os.getenv("KAKAO_MESSAGE_MOBILE_WEB_URL", "").strip(),
             kakao_message_button_title=os.getenv("KAKAO_MESSAGE_BUTTON_TITLE", "상세 보기").strip() or "상세 보기",
@@ -51,6 +101,7 @@ class AlertManager:
     _kakao_access_token: str = ""
     _kakao_access_token_expires_at: float = 0.0
     _kakao_auth_disabled_reason: str = ""
+    _using_kakao_refresh_token_fallback: bool = False
 
     def send(
         self,
@@ -116,10 +167,11 @@ class AlertManager:
         return self._refresh_kakao_access_token()
 
     def _refresh_kakao_access_token(self) -> str:
+        refresh_token = self.cfg.kakao_refresh_token
         payload = {
             "grant_type": "refresh_token",
             "client_id": self.cfg.kakao_rest_api_key,
-            "refresh_token": self.cfg.kakao_refresh_token,
+            "refresh_token": refresh_token,
         }
         if self.cfg.kakao_client_secret:
             payload["client_secret"] = self.cfg.kakao_client_secret
@@ -136,6 +188,15 @@ class AlertManager:
                         or "KOE322" in body_text
                     )
                 ):
+                    fallback = self.cfg.kakao_refresh_token_fallback
+                    if fallback and fallback != refresh_token:
+                        self.cfg.kakao_refresh_token = fallback
+                        self.cfg.kakao_refresh_token_fallback = ""
+                        self._using_kakao_refresh_token_fallback = True
+                        logger.warning(
+                            "저장된 카카오 refresh_token이 무효하여 환경 설정 토큰으로 한 번 재시도합니다."
+                        )
+                        return self._refresh_kakao_access_token()
                     self._kakao_auth_disabled_reason = "invalid_refresh_token"
                     logger.error(
                         "카카오 refresh_token이 만료/무효입니다. 새 KAKAO_REFRESH_TOKEN으로 갱신 후 재시작해야 알림이 재개됩니다: %s",
@@ -154,13 +215,24 @@ class AlertManager:
             expires_in = int(body.get("expires_in", 0) or 0)
             self._kakao_access_token = access_token
             self._kakao_access_token_expires_at = time.time() + max(expires_in, 300)
+            self._kakao_auth_disabled_reason = ""
 
             new_refresh_token = str(body.get("refresh_token", "")).strip()
+            token_to_persist = ""
             if new_refresh_token and new_refresh_token != self.cfg.kakao_refresh_token:
                 self.cfg.kakao_refresh_token = new_refresh_token
-                logger.warning(
-                    "카카오 refresh_token이 재발급되었습니다. .env의 KAKAO_REFRESH_TOKEN 값을 갱신해 주십시오."
-                )
+                token_to_persist = new_refresh_token
+            elif self._using_kakao_refresh_token_fallback:
+                token_to_persist = self.cfg.kakao_refresh_token
+
+            self._using_kakao_refresh_token_fallback = False
+            if token_to_persist:
+                if _persist_kakao_refresh_token(token_to_persist):
+                    logger.info("카카오 refresh_token 갱신 상태를 안전하게 저장했습니다.")
+                else:
+                    logger.warning(
+                        "카카오 refresh_token은 갱신됐지만 재시작용 상태 저장에 실패했습니다."
+                    )
             return access_token
         except Exception as e:
             logger.warning("카카오 토큰 갱신 예외: %s", e)
